@@ -341,10 +341,9 @@ def _format_args(args: dict, max_len: int = 60) -> str:
 
 
 def _call_str(name: str, args) -> str:
-    emoji = _emoji_for(name)
     if args is None:
-        return f"{emoji} {name}(<malformed arguments>)"
-    return f"{emoji} [bold]{name}[/bold]({_format_args(args)})"
+        return f"{name}(<malformed arguments>)"
+    return f"[bold]{name}[/bold]({_format_args(args)})"
 
 
 async def request_approval(name: str, args: dict, client) -> bool:
@@ -406,12 +405,11 @@ def step_display(calls: list):
     """`calls` is an ordered list of dicts with name, args (None if the
     model sent malformed JSON), result, ok, duration (seconds, absent for
     calls that never executed) — every tool call the model made this turn,
-    already executed. Each prints as its own bullet (⏺ call, indented ⎿
-    result), flat and sequential regardless of how many ran in parallel —
-    no step numbering or boxed grouping, matching how Claude Code shows a
-    stream of tool calls."""
+    already executed. Each call prints its call line then an indented ⎿
+    result line, flat and sequential regardless of how many ran in
+    parallel — no step numbering or boxed grouping."""
     for c in calls:
-        console.print(f"[{ACCENT}]⏺[/{ACCENT}] {_call_str(c['name'], c['args'])}")
+        console.print(f"[{ACCENT}]{_call_str(c['name'], c['args'])}[/{ACCENT}]")
         line, diff_body = _result_line(c["name"], c["args"], str(c["result"]), c["ok"], c.get("duration"))
         console.print(f"  [dim]⎿[/dim]  {line}")
         if diff_body is not None:
