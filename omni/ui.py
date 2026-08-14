@@ -341,9 +341,10 @@ def _format_args(args: dict, max_len: int = 60) -> str:
 
 
 def _call_str(name: str, args) -> str:
+    emoji = _emoji_for(name)
     if args is None:
-        return f"{name}(<malformed arguments>)"
-    return f"[bold]{name}[/bold]({_format_args(args)})"
+        return f"{emoji} {name}(<malformed arguments>)"
+    return f"{emoji} [bold]{name}[/bold]({_format_args(args)})"
 
 
 async def request_approval(name: str, args: dict, client) -> bool:
