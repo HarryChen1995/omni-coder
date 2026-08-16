@@ -171,6 +171,10 @@ MCP prompt exposed by a connected server. Special inputs:
 - `/model` — opens an interactive picker (↑/↓ to move, Enter to select, Esc to
   cancel) of models available on the LLM server, defaulting to the current one
 - `/model <name>` — switch the active model directly, without the picker
+- `/resources` — list resources published by connected MCP servers (the MCP
+  "Resources" capability — readable context addressed by URI);
+  `/resources <uri>` prints one. See
+  [MCP resources](#-mcp-resources) — the model can read these too
 - `/server:prompt [param1] [param2] ...` — resolve an MCP prompt template (the
   MCP "Prompts" capability — user-invocable templates a server exposes,
   distinct from tools) exposed by a connected server, and run it as the task.
@@ -338,8 +342,12 @@ omni --add-mcp-server "weather=python -m weather_mcp_server"     # local, stdio
 omni --add-mcp-server "weather=https://example.com/mcp/sse"      # remote, SSE
 omni "what's the forecast?"   # picked up automatically
 ```
-Saved to `~/.omni-coder/mcp.json` and auto-loaded whenever `--mcp-config`
-isn't explicitly passed. Manage the registry with:
+Saved under the `mcpServers` key of `~/.omni-coder/omni-coder-settings.json`
+and auto-loaded whenever `--mcp-config` isn't explicitly passed. Any other
+top-level key in that file is left untouched when servers are registered or
+removed, so it can hold unrelated settings too. (A pre-existing
+`~/.omni-coder/mcp.json` from before this rename is migrated automatically
+on first use.) Manage the registry with:
 ```bash
 omni --list-mcp-servers
 omni --remove-mcp-server weather
@@ -356,11 +364,15 @@ handy when servers need env vars/auth headers or there are a lot of them):
 ```json
 {
   "mcpServers": {
-    "weather": { "command": "python", "args": ["-m", "weather_mcp_server"] },
+    "weather": {
+      "command": "python",
+      "args": ["-m", "weather_mcp_server"],
+      "env": { "WEATHER_API_KEY": "$WEATHER_API_KEY" }
+    },
     "docs": {
       "url": "https://example.com/mcp/sse",
       "transport": "sse",
-      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+      "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" }
     }
   }
 }
@@ -368,6 +380,35 @@ handy when servers need env vars/auth headers or there are a lot of them):
 ```bash
 omni --mcp-config ./mcp.json "task"
 ```
+
+### Secrets: bearer tokens and env vars
+
+Both `headers` and `env` values support `$VAR` / `${VAR}` references,
+resolved from your environment when the server is connected — so the file
+stores only the *name* of the secret, never the secret itself, and stays
+safe to commit. A referenced variable that isn't set is reported as a clear
+error naming it, rather than silently sending the literal `$VAR` as your
+credential and failing later as a puzzling 401.
+
+For a remote server, the compact CLI format takes the token directly via a
+`,bearer=<token>` suffix, which expands to an `Authorization: Bearer`
+header:
+```bash
+# reference an env var — nothing secret in shell history or on disk
+export DOCS_TOKEN="sk-..."
+omni --add-mcp-server 'docs=https://example.com/mcp/sse,bearer=$DOCS_TOKEN'
+
+# combine with other suffixes, in either order
+omni --mcp-server 'docs=https://example.com/mcp,streamable_http,bearer=$DOCS_TOKEN,defer' "task"
+```
+Note the **single quotes** — they're what keep `$DOCS_TOKEN` intact for this
+agent to resolve later. In double quotes your shell would expand it first,
+so `--add-mcp-server` would persist the real token to the settings file in
+plaintext, which is exactly what the `$VAR` form avoids. (Pasting a literal
+token instead of a reference works, with that same caveat.)
+
+`,bearer=` is rejected for local (stdio) servers, which have no request
+headers — pass secrets to those through `env` instead.
 
 All three sources can be combined; `--mcp-server` wins over `--mcp-config`
 on a name clash, and an explicit `--mcp-config` wins over the auto-loaded
@@ -385,9 +426,58 @@ global registry.
   path** for a script file — it's resolved relative to wherever you happen
   to run `omni` from (not `--project-root`), so a relative path
   breaks the moment you run the command from a different directory.
-- The compact `--mcp-server`/`--add-mcp-server` string format doesn't
-  support auth headers — use `--mcp-config` with a JSON file when the
-  remote server needs them.
+- The compact `--mcp-server`/`--add-mcp-server` string format covers bearer
+  auth via `,bearer=<token>` (see above). For any *other* header, or to set
+  `env` on a local server, use a JSON config file.
+
+## 📚 MCP resources
+
+Besides tools (callable) and prompts (user-invocable templates), an MCP
+server can publish **resources** — readable context addressed by URI: coding
+standards, an API schema, a changelog, records from a system the agent
+otherwise can't see. Any connected server's resources are picked up
+automatically; nothing to configure.
+
+**From the REPL**, `/resources` lists what's available and `/resources <uri>`
+prints one (tab-completion is populated with the live URIs):
+```
+❯ /resources
+                                   MCP Resources
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ uri                         ┃ server ┃ type             ┃ description           ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━┩
+│ file:///coding-standards.md │ docs   │ text/markdown    │ Team coding standards │
+│ file:///api-spec.json       │ docs   │ application/json │ Public API schema     │
+│ file:///logs/{date}.log     │ docs   │ template         │ Daily log             │
+└─────────────────────────────┴────────┴──────────────────┴───────────────────────┘
+
+❯ /resources file:///api-spec.json
+╭────── 📖 file:///api-spec.json ──────╮
+│ {"endpoints": ["/users", "/orders"]} │
+╰──────────────────────────────────────╯
+```
+
+**The model can read them too.** When at least one connected server publishes
+a resource, two extra read-only tools appear in its toolset — `list_resources`
+and `read_resource(uri)` — both auto-approved, since neither can modify
+anything. The known URIs are inlined into `read_resource`'s description, so
+for a handful of resources the model can go straight to reading one without
+a discovery round trip. Just refer to them in a task:
+```bash
+omni "read the coding standards resource, then fix utils.py to match"
+```
+`read_resource` is deliberately distinct from `read_file`: the former reads
+MCP-published context by URI, the latter reads a path inside
+`--project-root`.
+
+Notes:
+- **Templates** (parameterized URIs like `file:///logs/{date}.log`) are listed
+  and marked `template`, but can't be read until the placeholders are filled
+  in — they're excluded from what's offered to the model.
+- **Binary resources** aren't dumped into context as base64; they read back as
+  a short `[binary image/png, 108 bytes — not shown]` marker.
+- If two servers publish the **same URI**, the first-connected one wins and
+  the other is noted in the listing.
 
 ## 🔍 Deferred tool loading & search_tools
 

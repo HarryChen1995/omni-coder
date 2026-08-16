@@ -74,6 +74,12 @@ Run `omni --help` for the full option list.
   a synthesized `search_tools` tool loads matching ones on demand, ranked by
   on-device embeddings (`nomic-local`, default) or a remote OpenAI-compatible
   embedding model, with automatic keyword-match fallback.
+- **MCP resources** — readable context a server publishes by URI (coding
+  standards, API schemas, records). Browse them with `/resources` and read
+  one with `/resources <uri>`; the model gets matching read-only
+  `list_resources`/`read_resource` tools automatically whenever a connected
+  server publishes any, so you can just say "read the coding standards
+  resource, then fix utils.py to match".
 
 ## 🏗️ Architecture
 
@@ -128,11 +134,28 @@ omni --add-mcp-server "weather=python -m weather_mcp_server"     # local, stdio
 omni --add-mcp-server "weather=https://example.com/mcp/sse"      # remote, SSE
 omni "what's the forecast?"   # picked up automatically, every run from here on
 ```
+Registrations are saved under the `mcpServers` key of
+`~/.omni-coder/omni-coder-settings.json`, leaving any other key in that file
+untouched.
+
 A value after `name=` starting with `http://`/`https://` is treated as a
 remote server (SSE by default, append `,streamable_http` for that transport
 instead); anything else is a local command spawned over stdio — it doesn't
 need to be `-m`-invokable, a standalone script's absolute path works too
 (e.g. `"myserver=python C:/absolute/path/to/mcp_server.py"`).
+
+**Authenticated remote servers** take a bearer token via a `,bearer=<token>`
+suffix, which becomes an `Authorization: Bearer` header:
+```bash
+export DOCS_TOKEN="sk-..."
+omni --add-mcp-server 'docs=https://example.com/mcp/sse,bearer=$DOCS_TOKEN'
+```
+Prefer that `$VAR` form over a literal token — `headers` and `env` values
+(both in the settings file and in `--mcp-config` JSON) are resolved from the
+environment at connect time, so only the variable *name* is written to disk,
+never the secret. Use **single quotes** so your shell doesn't expand the
+variable before this agent sees it. An unset variable is reported as a clear
+error instead of being sent as a literal `$VAR`.
 
 Append `,defer` (or pass `--defer` with `--add-mcp-server`) to keep a
 server's tools out of the model's default tool list — it discovers them on

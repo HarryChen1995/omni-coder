@@ -12,8 +12,10 @@ so they can't collide with the built-ins or with each other.
 """
 
 import asyncio
+import base64
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -64,17 +66,79 @@ class EmbeddingUnavailable(Exception):
     keyword matching rather than breaking the tool call."""
 
 
+_LEGACY_MCP_CONFIG_NAME = "mcp.json"  # pre-0.5.x name, auto-migrated by default_mcp_config_path()
+
+_ENV_REF_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _expand_env_values(server_name: str, mapping: dict, kind: str) -> dict:
+    """Resolve `$VAR` / `${VAR}` references in a server spec's `headers` or
+    `env` values from the surrounding environment, so the settings file (or
+    an `--add-mcp-server ,bearer=$VAR` registration) can reference a secret
+    by name without storing it on disk.
+
+    Raises ValueError naming the unset variable rather than letting
+    os.path.expandvars silently pass an unexpanded "$VAR" through as the
+    literal value — which would fail later as a confusing 401 or a server
+    that misbehaves on a nonsense credential."""
+    if not mapping:
+        return mapping
+    expanded = {}
+    for key, value in mapping.items():
+        if isinstance(value, str):
+            missing = [
+                m.group(1) or m.group(2)
+                for m in _ENV_REF_RE.finditer(value)
+                if (m.group(1) or m.group(2)) not in os.environ
+            ]
+            if missing:
+                raise ValueError(
+                    f"MCP server {server_name!r} {kind} {key!r} references unset environment "
+                    f"variable(s): {', '.join(sorted(set(missing)))}"
+                )
+            value = os.path.expandvars(value)
+        expanded[key] = value
+    return expanded
+
+
 def default_mcp_config_path() -> str:
-    """Global, cross-session MCP server registry — ~/.omni-coder/mcp.json.
-    Servers registered here (via `--add-mcp-server`) are available on every
-    future run automatically, without passing --mcp-config/--mcp-server."""
-    return os.path.join(os.path.expanduser("~"), ".omni-coder", "mcp.json")
+    """Global, cross-session settings file — ~/.omni-coder/omni-coder-settings.json.
+    MCP servers registered here (via `--add-mcp-server`) live under its
+    `mcpServers` key and are available on every future run automatically,
+    without passing --mcp-config/--mcp-server. Other top-level keys are left
+    alone by save_mcp_config, so this file can hold non-MCP settings too.
+
+    Migrates a pre-existing `mcp.json` (this file's old name) to the new
+    name on first use, so servers registered before the rename keep working
+    with no user action."""
+    directory = os.path.join(os.path.expanduser("~"), ".omni-coder")
+    path = os.path.join(directory, "omni-coder-settings.json")
+    legacy = os.path.join(directory, _LEGACY_MCP_CONFIG_NAME)
+    if not os.path.exists(path) and os.path.exists(legacy):
+        try:
+            os.rename(legacy, path)
+        except OSError:
+            return legacy  # couldn't migrate (permissions, etc.) — keep using the old file
+    return path
 
 
 def save_mcp_config(path: str, servers: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Write `servers` to the file's `mcpServers` key, preserving every other
+    top-level key already in it — this is a general settings file, so
+    registering an MCP server must not clobber unrelated settings."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}  # unreadable/corrupt — rewrite rather than refusing to register
+    data["mcpServers"] = servers
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"mcpServers": servers}, f, indent=2)
+        json.dump(data, f, indent=2)
         f.write("\n")
 
 
@@ -107,6 +171,14 @@ def parse_mcp_server_specs(specs: list) -> dict:
     Either form may end with a trailing ",defer" to mark the server for
     deferred tool loading (see MCPToolClient) — e.g.
     "docs=node docs-server.js,defer" or "weather=http://host/mcp,streamable_http,defer".
+
+    A remote (URL) form may also carry ",bearer=<token>", which becomes an
+    `Authorization: Bearer <token>` header on every request to that server.
+    The value may be an environment-variable reference ("$TOKEN" or
+    "${TOKEN}"), resolved at connect time rather than here — so
+    `--add-mcp-server` persists only the reference, keeping the real secret
+    out of both the settings file and your shell history. ",defer" and
+    ",bearer=" may appear in either order.
     """
     servers = {}
     for spec in specs or []:
@@ -117,10 +189,22 @@ def parse_mcp_server_specs(specs: list) -> dict:
         if not name:
             raise ValueError(f'Invalid --mcp-server value {spec!r} — expected "name=command args..."')
 
-        defer = False
-        if rest.lower().endswith(",defer"):
-            rest = rest[: -len(",defer")].strip()
-            defer = True
+        # Strip the trailing ",defer" / ",bearer=..." suffixes in whichever
+        # order they were given, leaving `rest` as just the command or URL.
+        defer, bearer = False, None
+        while True:
+            if rest.lower().endswith(",defer"):
+                rest = rest[: -len(",defer")].strip()
+                defer = True
+                continue
+            marker = rest.rfind(",bearer=")
+            if marker != -1 and "," not in rest[marker + len(",bearer="):]:
+                bearer = rest[marker + len(",bearer="):].strip()
+                rest = rest[:marker].strip()
+                if not bearer:
+                    raise ValueError(f'Empty ",bearer=" token for MCP server {name!r}')
+                continue
+            break
 
         if rest.startswith("http://") or rest.startswith("https://"):
             if "," in rest:
@@ -130,7 +214,13 @@ def parse_mcp_server_specs(specs: list) -> dict:
             if transport not in _TRANSPORTS:
                 raise ValueError(f"Invalid --mcp-server transport {transport!r} for {name!r} — expected one of {_TRANSPORTS}")
             servers[name] = {"url": url, "transport": transport, "defer": defer}
+            if bearer:
+                servers[name]["headers"] = {"Authorization": f"Bearer {bearer}"}
         else:
+            if bearer:
+                raise ValueError(
+                    f'",bearer=" is only valid for remote (http/https) MCP servers — {name!r} is a local command'
+                )
             parts = _split_command(rest)
             if not parts:
                 raise ValueError(f'Invalid --mcp-server value {spec!r} — expected "name=command args..."')
@@ -222,6 +312,61 @@ def _search_tools_schema() -> dict:
     }
 
 
+_LIST_RESOURCES_NAME = "list_resources"
+_READ_RESOURCE_NAME = "read_resource"
+
+
+def _resource_tool_schemas(resources: dict) -> list:
+    """Model-facing tools for the MCP "Resources" capability — readable
+    context a server publishes by URI. Only offered when a connected server
+    actually publishes at least one resource (see list_llm_tools), so a
+    setup with no resource-providing servers pays nothing for them.
+
+    A short catalog of the known URIs goes straight into read_resource's
+    description, so the common case (a handful of resources) needs no
+    list_resources round trip at all."""
+    readable = [uri for uri, info in resources.items() if not info.get("template")]
+    catalog = ", ".join(readable[:20])
+    if len(readable) > 20:
+        catalog += f", … ({len(readable) - 20} more — call {_LIST_RESOURCES_NAME})"
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": _LIST_RESOURCES_NAME,
+                "description": (
+                    "List readable resources published by the connected MCP servers — "
+                    "files, docs, or records exposed as context, addressed by URI. Use "
+                    "this to discover what's available, then read one with read_resource. "
+                    "Takes no arguments."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": _READ_RESOURCE_NAME,
+                "description": (
+                    "Read the contents of an MCP resource by its URI. This reads context "
+                    "published by an MCP server — unrelated to read_file, which reads a "
+                    f"path in the project directory. Currently available: {catalog or '(none)'}."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "uri": {
+                            "type": "string",
+                            "description": 'Resource URI exactly as listed, e.g. "file:///readme.md".',
+                        },
+                    },
+                    "required": ["uri"],
+                },
+            },
+        },
+    ]
+
+
 class MCPToolClient:
     """Use as an async context manager, one instance per agent run:
 
@@ -264,6 +409,8 @@ class MCPToolClient:
         self._sessions: dict = {}     # server name -> ClientSession (only successfully-connected ones)
         self._tool_owner: dict = {}   # exposed tool name -> (server name, real tool name)
         self._prompt_owner: dict = {}  # exposed prompt name ("server:prompt") -> (server name, real prompt name)
+        self._resource_owner: dict = {}  # resource uri -> server name that published it (see list_resources)
+        self._resources: dict = {}       # cached list_resources() catalog, filled on connect
         self._deferred_servers: set = set()  # server names registered with "defer": true
         self._deferred_tools: dict = {}       # exposed name -> schema, still hidden from the model
         self._revealed: set = set()           # exposed names of deferred tools search_tools has surfaced
@@ -276,7 +423,7 @@ class MCPToolClient:
         try:
             if "url" in spec:
                 transport = spec.get("transport", "sse")
-                headers = spec.get("headers")
+                headers = _expand_env_values(name, spec.get("headers"), "header")
                 if transport == "streamable_http":
                     read, write, _ = await self._stack.enter_async_context(
                         streamablehttp_client(spec["url"], headers=headers)
@@ -288,7 +435,7 @@ class MCPToolClient:
             else:
                 params = StdioServerParameters(
                     command=spec["command"], args=spec.get("args", []),
-                    env={**os.environ, **(spec.get("env") or {})},
+                    env={**os.environ, **(_expand_env_values(name, spec.get("env"), "env var") or {})},
                 )
                 self._server_log_file.write(
                     f"\n=== [{name}] {time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -334,6 +481,16 @@ class MCPToolClient:
                     self._deferred_servers.add(name)
             except RuntimeError as e:
                 self._connect_errors[name] = str(e)
+
+        # Catalog resources once here rather than on every list_llm_tools()
+        # call (which runs per turn) — it decides whether the resource tools
+        # are offered to the model at all, and populates read_resource()'s
+        # uri -> server routing. The list_resources tool re-reads it live, so
+        # a server publishing resources later is still reachable that way.
+        try:
+            self._resources = await self.list_resources()
+        except Exception:
+            self._resources = {}
         return self
 
     async def __aexit__(self, *exc_info):
@@ -397,6 +554,8 @@ class MCPToolClient:
                     schemas.append(schema)
         if self._deferred_tools:
             schemas.append(_search_tools_schema())
+        if self._resources:
+            schemas.extend(_resource_tool_schemas(self._resources))
         return schemas
 
     @staticmethod
@@ -554,9 +713,119 @@ class MCPToolClient:
             parts.append(text)
         return "\n\n".join(parts)
 
+    async def list_resources(self, include_templates: bool = False) -> dict:
+        """Resources exposed by every connected MCP server — the MCP
+        "Resources" capability: readable context (files, docs, records) a
+        server publishes by URI, distinct from tools (callable) and prompts
+        (user-invocable templates). Servers that don't implement
+        resources/list — including the built-in tool server — are skipped
+        rather than raising.
+
+        Keyed by the resource's own URI, since that's how MCP identifies one
+        and how read_resource() takes it. If two servers publish the same
+        URI the first connected wins and the collision is recorded in that
+        entry's "shadowed_by" — read_resource(uri, server=...) can still
+        reach the other one explicitly.
+
+        With `include_templates=True`, also returns parameterized resource
+        templates (URI patterns like "file:///logs/{date}.log"), marked
+        `"template": True`. Those can't be passed to read_resource() as-is —
+        the caller has to fill in the placeholders first.
+
+        Returns {uri: {"server", "name", "description", "mime_type", "size",
+        "template", "shadowed_by"}}.
+        """
+        resources = {}
+        self._resource_owner = {}
+        for server_name, session in self._sessions.items():
+            listings = [("list_resources", "resources", False)]
+            if include_templates:
+                listings.append(("list_resource_templates", "resourceTemplates", True))
+            for method, attr, is_template in listings:
+                try:
+                    result = await getattr(session, method)()
+                except Exception:
+                    continue
+                for r in getattr(result, attr, []) or []:
+                    # Templates carry uriTemplate; concrete resources carry uri.
+                    uri = str(getattr(r, "uriTemplate", None) or getattr(r, "uri", ""))
+                    if not uri:
+                        continue
+                    if uri in resources:
+                        resources[uri].setdefault("shadowed_by", []).append(server_name)
+                        continue
+                    if not is_template:
+                        self._resource_owner[uri] = server_name
+                    resources[uri] = {
+                        "server": server_name,
+                        "name": getattr(r, "name", "") or "",
+                        "description": getattr(r, "description", "") or "",
+                        "mime_type": getattr(r, "mimeType", None) or "",
+                        "size": getattr(r, "size", None),
+                        "template": is_template,
+                        "shadowed_by": [],
+                    }
+        return resources
+
+    async def read_resource(self, uri: str, server: str = None) -> str:
+        """Read a resource by URI and flatten its contents to text, ready to
+        feed to the model. `server` forces which connected server to ask,
+        for the rare case where two publish the same URI; otherwise the URI
+        is routed to whichever server listed it (call list_resources() first
+        to populate that routing table).
+
+        Binary (blob) contents aren't base64-dumped into the returned text —
+        that would flood the model's context with unusable bytes — they're
+        replaced by a short marker naming the mime type and decoded size.
+        """
+        if server is not None:
+            if server not in self._sessions:
+                raise ValueError(f"Unknown MCP server {server!r} — connected: {sorted(self._sessions)}")
+            server_name = server
+        elif uri in self._resource_owner:
+            server_name = self._resource_owner[uri]
+        else:
+            raise ValueError(
+                f"Unknown resource {uri!r} — call list_resources() first, or pass server= explicitly."
+            )
+
+        result = await self._sessions[server_name].read_resource(uri)
+        parts = []
+        for content in result.contents:
+            if hasattr(content, "text"):
+                parts.append(content.text)
+            elif hasattr(content, "blob"):
+                mime = getattr(content, "mimeType", None) or "application/octet-stream"
+                try:
+                    size = len(base64.b64decode(content.blob))
+                    parts.append(f"[binary {mime}, {size} bytes — not shown]")
+                except (ValueError, TypeError):
+                    parts.append(f"[binary {mime} — not shown]")
+        return "\n\n".join(parts)
+
     async def call_tool(self, name: str, args: dict) -> str:
         if name == _SEARCH_TOOLS_NAME:
             return await self.search_mcp_tools(args.get("query", ""))
+        if name == _LIST_RESOURCES_NAME:
+            self._resources = await self.list_resources()  # refresh; servers may publish more over time
+            if not self._resources:
+                return "(no resources published by the connected MCP servers)"
+            lines = []
+            for uri, info in self._resources.items():
+                detail = " — ".join(p for p in (info["name"], info["description"]) if p)
+                mime = f" [{info['mime_type']}]" if info["mime_type"] else ""
+                lines.append(f"{uri}{mime}{f' — {detail}' if detail else ''}")
+            return "\n".join(lines)
+        if name == _READ_RESOURCE_NAME:
+            uri = args.get("uri", "")
+            if not uri:
+                return "ERROR: read_resource requires a 'uri' argument."
+            try:
+                return await self.read_resource(uri)
+            except ValueError as e:
+                return f"ERROR: {e}"
+            except Exception as e:
+                return f"ERROR: reading resource {uri!r} failed: {e}"
         if name in self._deferred_tools:
             return f"ERROR: tool {name!r} isn't loaded yet — call search_tools with a matching query first."
         # Internal built-in tools (_preview_edit, etc.) are never registered

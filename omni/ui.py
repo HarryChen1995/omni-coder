@@ -107,7 +107,8 @@ def _read_summary(result: str) -> str:
     lines = result.splitlines()
     return f"{len(lines)} line{'s' if len(lines) != 1 else ''} ({len(result)} chars)"
 
-_STATUS_COLOR = {"done": "green", "running": "yellow", "max_steps": "yellow", "error": "red"}
+_STATUS_COLOR = {"done": "green", "running": "yellow", "max_steps": "yellow",
+                 "interrupted": "yellow", "error": "red"}
 
 
 def banner(task: str, model: str):
@@ -307,6 +308,7 @@ _TOOL_EMOJI = {
     "git_branch": "🌿", "git_fetch": "📥", "git_add": "➕", "git_commit": "💾",
     "git_pull": "⬇️", "git_push": "⬆️",
     "save_memory": "🧠", "search_tools": "🧰",
+    "list_resources": "📚", "read_resource": "📖",
 }
 _DEFAULT_TOOL_EMOJI = "🧩"  # fallback for an unnamespaced tool this map doesn't know
 
@@ -464,6 +466,36 @@ def sessions_table(sessions: list):
                       s["updated_at"], s["model"], task)
 
     console.print(table)
+
+
+def resources_table(resources: dict):
+    """Table for the /resources REPL command — one row per resource
+    published by a connected MCP server. `resources` is
+    MCPToolClient.list_resources()'s {uri: {...}} mapping."""
+    if not resources:
+        console.print("[dim]No resources published by the connected MCP servers.[/dim]")
+        return
+
+    table = Table(title="MCP Resources", expand=False)
+    table.add_column("uri", style=f"bold {ACCENT}")
+    table.add_column("server", style="bold")
+    table.add_column("type", style="dim")
+    table.add_column("description")
+
+    for uri, info in resources.items():
+        kind = "template" if info.get("template") else (info.get("mime_type") or "-")
+        detail = info.get("description") or info.get("name") or ""
+        if info.get("shadowed_by"):
+            detail = f"{detail} [dim](also on: {', '.join(info['shadowed_by'])})[/dim]".strip()
+        table.add_row(uri, info.get("server", ""), kind, detail)
+
+    console.print(table)
+    console.print("[dim]Read one with /resources <uri>[/dim]")
+
+
+def resource_content(uri: str, content: str):
+    """A single resource's contents, for `/resources <uri>`."""
+    console.print(Panel(content or "(empty)", title=f"📖 {uri}", border_style=ACCENT, expand=False))
 
 
 def mcp_status(entries: list):

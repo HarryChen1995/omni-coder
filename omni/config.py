@@ -21,6 +21,7 @@ class AgentConfig:
         "read_file", "list_dir", "search_files", "glob_files",
         "git_diff", "git_status", "git_log", "git_show", "git_branch", "git_fetch",
         "save_memory", "search_tools",
+        "list_resources", "read_resource",   # MCP Resources capability — read-only
     )
 
     auto_approve: bool = False        # True = never prompt (use in CI with care)

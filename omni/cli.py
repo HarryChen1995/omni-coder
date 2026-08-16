@@ -60,6 +60,7 @@ _STATIC_COMMANDS = {
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
+    "/resources": "list resources published by connected MCP servers — /resources <uri> reads one",
 }
 
 app = typer.Typer(add_completion=False, help="Coding agent (Qwen Coder or any OpenAI-compatible model)")
@@ -156,13 +157,18 @@ def main(
              "Repeatable for multiple servers. Merged with --mcp-config if both are given "
              "(this flag wins on a name clash). Its tools appear to the model as <name>__<tool>. "
              'Append ",defer" (e.g. "name=command args...,defer") to keep this server\'s tools '
-             "out of the model's default tool list — it discovers them on demand via search_tools.",
+             "out of the model's default tool list — it discovers them on demand via search_tools. "
+             'For a remote (http/https) server, append ",bearer=<token>" to send an '
+             "Authorization: Bearer header; the value may be an env reference like "
+             '"$DOCS_TOKEN", resolved at connect time so the secret stays out of shell history.',
     ),
     add_mcp_server: Optional[str] = typer.Option(
         None, "--add-mcp-server",
         help='Register a custom MCP server permanently (format "name=command arg1 arg2 ..."), '
-             "then exit. Saved to ~/.omni-coder/mcp.json and auto-loaded on every future run "
-             "— no need to pass --mcp-server/--mcp-config again.",
+             "then exit. Saved to the mcpServers key of ~/.omni-coder/omni-coder-settings.json and "
+             "auto-loaded on every future run — no need to pass --mcp-server/--mcp-config again. "
+             'Supports the same ",defer" and ",bearer=<token>" suffixes as --mcp-server (prefer '
+             '",bearer=$ENV_VAR" so the token itself is never written to the settings file).',
     ),
     defer: bool = typer.Option(
         False, "--defer",
@@ -239,7 +245,7 @@ def main(
         raise typer.Exit(code=1)
 
     # Explicit --mcp-config wins; otherwise auto-load the global registry
-    # (~/.omni-coder/mcp.json) if it exists, so servers added once via
+    # (~/.omni-coder/omni-coder-settings.json) if it exists, so servers added once via
     # --add-mcp-server are available on every run without any flags.
     effective_mcp_config_path = mcp_config or (
         default_mcp_config_path() if os.path.exists(default_mcp_config_path()) else ""
@@ -312,13 +318,28 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
             return f"{resume} (resumed)"
         return session_name or session_id or "(new)"
 
+    shown_header = {}  # what the on-screen header last displayed — see refresh_header
+
+    def refresh_header():
+        """Redraw the header box only when the model or session label it
+        shows has actually changed. The session gains its real DB id after
+        its first turn, which would otherwise redraw the box directly above
+        that turn's result every time — visible as a duplicate header above
+        the final "done" panel, and identical to the one already on screen
+        whenever --session-name pins the label."""
+        state = (cfg.model, session_label())
+        if state == shown_header.get("state"):
+            return
+        shown_header["state"] = state
+        _print_header(cfg, state[1])
+
     commands = dict(_STATIC_COMMANDS)  # mutated in place below once MCP prompts are discovered
 
     try:
         from . import ui
         from prompt_toolkit import PromptSession
         from prompt_toolkit.patch_stdout import patch_stdout
-        ui.header(cfg.model, session_label())
+        refresh_header()
         prompt_session = PromptSession(completer=ui.SlashCommandCompleter(commands), complete_while_typing=True)
         # raw=True: pass Rich's ANSI-coded output straight through instead of
         # patch_stdout()'s default write() path, which sanitizes/escapes text
@@ -408,6 +429,35 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 if task == "/mcp":
                     _print_mcp_status(client.server_status())
                     continue
+                if task == "/resources" or task.startswith("/resources "):
+                    target = task[len("/resources "):].strip() if task.startswith("/resources ") else ""
+                    try:
+                        resources = await client.list_resources(include_templates=True)
+                    except Exception as e:
+                        typer.echo(f"Error listing resources: {e}", err=True)
+                        continue
+                    # Keep "/resources <uri>" completions in sync with what's
+                    # actually published right now, not just at startup.
+                    for stale in [c for c in commands if c.startswith("/resources ")]:
+                        del commands[stale]
+                    for uri, info in resources.items():
+                        if not info.get("template"):
+                            commands[f"/resources {uri}"] = info.get("description") or "read this resource"
+
+                    if not target:
+                        _print_resources(resources)
+                        continue
+                    try:
+                        content = await client.read_resource(target)
+                    except Exception as e:
+                        typer.echo(f"Error reading resource {target!r}: {e}", err=True)
+                        continue
+                    try:
+                        from . import ui
+                        ui.resource_content(target, content)
+                    except ImportError:
+                        typer.echo(f"--- {target} ---\n{content}")
+                    continue
                 if task == "/btw" or task.startswith("/btw "):
                     # Also handled inline while a task is running (the
                     # side-reader loop below) — this covers /btw typed at
@@ -447,12 +497,12 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     if selected and selected != cfg.model:
                         cfg.model = selected
                         typer.echo(f"Switched to model {cfg.model!r}.")
-                        _print_header(cfg, session_label())
+                        refresh_header()
                     continue
                 if task.startswith("/model "):
                     cfg.model = task[len("/model "):].strip()
                     typer.echo(f"Switched to model {cfg.model!r}.")
-                    _print_header(cfg, session_label())
+                    refresh_header()
                     continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
@@ -516,7 +566,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
 
                 if agent.session_id != session_id:
                     session_id = agent.session_id
-                    _print_header(cfg, session_label())
+                    refresh_header()
 
                 try:
                     from . import ui
@@ -601,6 +651,20 @@ def _print_sessions(sessions: list):
     except ImportError:
         for s in sessions:
             typer.echo(f"{s['id']}  {s.get('name') or '-'}  [{s['status']}]  {s['updated_at']}  {s['task'][:70]}")
+
+
+def _print_resources(resources: dict):
+    try:
+        from . import ui
+        ui.resources_table(resources)
+    except ImportError:
+        if not resources:
+            typer.echo("No resources published by the connected MCP servers.")
+            return
+        for uri, info in resources.items():
+            kind = "template" if info.get("template") else (info.get("mime_type") or "-")
+            typer.echo(f"{uri}  [{info.get('server', '')}]  {kind}  {info.get('description', '')}")
+        typer.echo("Read one with /resources <uri>")
 
 
 def _print_mcp_status(entries: list):

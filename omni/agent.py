@@ -351,6 +351,13 @@ class CodingAgent:
                                       llm_api_key=self.cfg.llm_api_key or None,
                                       mcp_log_path=self.cfg.mcp_log_path) as owned_client:
                 return await self._run_loop(task, session_id, messages, persisted, resuming, owned_client)
+        except asyncio.CancelledError:
+            # Ctrl+C during a turn. CancelledError derives from BaseException,
+            # not Exception, so without this the session would keep its
+            # initial "running" status forever — still listed as in-flight by
+            # /sessions and --list-sessions long after the process exited.
+            self.store.finish_session(session_id, "interrupted", "Interrupted by user (Ctrl+C).")
+            raise
         except Exception as e:
             self.store.finish_session(session_id, "error", str(e))
             raise
