@@ -60,6 +60,7 @@ _STATIC_COMMANDS = {
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
+    "/mcp restart ": "reconnect an MCP server after changing it — /mcp restart <name|all>",
     "/resources": "list resources published by connected MCP servers — /resources <uri> reads one",
 }
 
@@ -378,12 +379,31 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
             if not e["connected"]:
                 typer.echo(f"Warning: MCP server {e['name']!r} failed to connect: {e['error']}", err=True)
 
-        prompts = await client.list_prompts()
-        for name, info in prompts.items():
-            arg_hint = " ".join(
-                f"<{a['name']}>" if a["required"] else f"[{a['name']}]" for a in info["arguments"]
-            )
-            commands[f"/{name} "] = f"{info['description']} {arg_hint}".strip()
+        prompts = {}
+        prompt_command_keys = set()  # which `commands` entries came from MCP prompts
+
+        async def refresh_prompt_commands():
+            """(Re)build the /-menu entries for MCP prompts. Called at startup
+            and again after a restart, since a restarted server may expose a
+            different set. Tracks its own keys so it never disturbs the other
+            dynamic completions (/model <name>, /resources <uri>)."""
+            nonlocal prompts
+            prompts = await client.list_prompts()
+            for stale in prompt_command_keys:
+                commands.pop(stale, None)
+            prompt_command_keys.clear()
+            for prompt_name, info in prompts.items():
+                arg_hint = " ".join(
+                    f"<{a['name']}>" if a["required"] else f"[{a['name']}]" for a in info["arguments"]
+                )
+                key = f"/{prompt_name} "
+                commands[key] = f"{info['description']} {arg_hint}".strip()
+                prompt_command_keys.add(key)
+
+        await refresh_prompt_commands()
+        for server in client.server_names():
+            commands[f"/mcp restart {server}"] = "reconnect this MCP server"
+        commands["/mcp restart all"] = "reconnect every MCP server"
 
         try:
             # Best-effort: some LLM servers don't expose /v1/models. Register
@@ -427,6 +447,28 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         typer.echo(await agent.compact_history(session_id))
                     continue
                 if task == "/mcp":
+                    _print_mcp_status(client.server_status())
+                    continue
+                if task.startswith("/mcp restart"):
+                    target = task[len("/mcp restart"):].strip()
+                    if not target:
+                        typer.echo("Usage: /mcp restart <name|all>  —  names: "
+                                   f"{', '.join(client.server_names())}", err=True)
+                        continue
+                    targets = client.server_names() if target == "all" else [target]
+                    for name in targets:
+                        try:
+                            entry = await _restart_mcp_server(client, name)
+                        except ValueError as e:
+                            typer.echo(f"Error: {e}", err=True)
+                            continue
+                        if entry["connected"]:
+                            typer.echo(f"Restarted MCP server {entry['name']!r} "
+                                       f"({entry['tool_count']} tools).")
+                        else:
+                            typer.echo(f"MCP server {entry['name']!r} failed to reconnect: "
+                                       f"{entry['error']}", err=True)
+                    await refresh_prompt_commands()  # a restarted server may expose different prompts
                     _print_mcp_status(client.server_status())
                     continue
                 if task == "/resources" or task.startswith("/resources "):
@@ -651,6 +693,19 @@ def _print_sessions(sessions: list):
     except ImportError:
         for s in sessions:
             typer.echo(f"{s['id']}  {s.get('name') or '-'}  [{s['status']}]  {s['updated_at']}  {s['task'][:70]}")
+
+
+async def _restart_mcp_server(client: MCPToolClient, name: str) -> dict:
+    """Restart one server, with a spinner — reconnecting spawns a subprocess
+    (or reopens a remote connection) and re-lists its tools, so it isn't
+    instant. Returns that server's status entry."""
+    try:
+        from . import ui
+        spinner = ui.thinking(f"Restarting {name}…")
+    except ImportError:
+        spinner = nullcontext()
+    with spinner:
+        return await client.restart_server(name)
 
 
 def _print_resources(resources: dict):

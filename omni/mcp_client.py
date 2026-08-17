@@ -418,49 +418,105 @@ class MCPToolClient:
         self._server_specs: dict = {}   # server name -> spec, EVERY configured server (for /mcp, even ones that failed)
         self._connected_at: dict = {}   # server name -> time.monotonic() at successful connect
         self._connect_errors: dict = {}  # server name -> error message, for servers that failed to connect
+        self._server_tasks: dict = {}    # server name -> (owning task, shutdown Event); see _serve/_stop_server
+
+    async def _serve(self, name: str, spec: dict, ready: asyncio.Future, shutdown: asyncio.Event) -> None:
+        """Own one server's transport + session for its whole lifetime, in a
+        task of its own.
+
+        Each connection has to be opened AND closed inside a single dedicated
+        task: the transports (stdio_client, sse_client) are built on anyio
+        task groups, whose cancel scopes are task-scoped and must unwind in
+        LIFO order *within* that task. Holding several servers' contexts in
+        one task — even in separate exit stacks — means closing any but the
+        most recently opened corrupts that unwind (it surfaces as a stray
+        CancelledError from an unrelated cancel scope). One task per server
+        makes each independently closable, which is what restart_server needs.
+
+        Resolves `ready` with the live session, or with the connect error;
+        then parks until `shutdown` is set and tears the connection down."""
+        try:
+            async with AsyncExitStack() as stack:
+                try:
+                    if "url" in spec:
+                        transport = spec.get("transport", "sse")
+                        headers = _expand_env_values(name, spec.get("headers"), "header")
+                        if transport == "streamable_http":
+                            read, write, _ = await stack.enter_async_context(
+                                streamablehttp_client(spec["url"], headers=headers)
+                            )
+                        else:
+                            read, write = await stack.enter_async_context(
+                                sse_client(spec["url"], headers=headers)
+                            )
+                    else:
+                        params = StdioServerParameters(
+                            command=spec["command"], args=spec.get("args", []),
+                            env={**os.environ, **(_expand_env_values(name, spec.get("env"), "env var") or {})},
+                        )
+                        self._server_log_file.write(
+                            f"\n=== [{name}] {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"starting: {spec['command']} {' '.join(spec.get('args', []))} ===\n"
+                        )
+                        self._server_log_file.flush()
+                        read, write = await stack.enter_async_context(
+                            stdio_client(params, errlog=self._server_log_file)
+                        )
+                    session = await stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
+                except Exception as e:
+                    desc = spec.get("url") or f"{spec.get('command')} {' '.join(spec.get('args', []))}"
+                    if not ready.done():
+                        ready.set_exception(
+                            RuntimeError(f"Failed to start MCP server {name!r} ({desc}): {e}")
+                        )
+                    return  # the `async with` closes whatever opened before the failure
+                if not ready.done():
+                    ready.set_result(session)
+                await shutdown.wait()
+        except BaseException as e:
+            # A failure after the session was handed over (transport dropped,
+            # or the benign teardown race) can't be reported through `ready`
+            # anymore — record it for /mcp instead of crashing the REPL.
+            if not _is_benign_shutdown_race(e):
+                self._connect_errors[name] = f"MCP server {name!r} connection ended: {e}"
+            if not ready.done():
+                ready.set_exception(RuntimeError(f"Failed to start MCP server {name!r}: {e}"))
 
     async def _connect(self, name: str, spec: dict) -> ClientSession:
+        """Start `name`'s owning task and wait for its session (see _serve).
+        Raises RuntimeError if it couldn't connect."""
+        ready: asyncio.Future = asyncio.get_running_loop().create_future()
+        shutdown = asyncio.Event()
+        task = asyncio.ensure_future(self._serve(name, spec, ready, shutdown))
+        self._server_tasks[name] = (task, shutdown)
         try:
-            if "url" in spec:
-                transport = spec.get("transport", "sse")
-                headers = _expand_env_values(name, spec.get("headers"), "header")
-                if transport == "streamable_http":
-                    read, write, _ = await self._stack.enter_async_context(
-                        streamablehttp_client(spec["url"], headers=headers)
-                    )
-                else:
-                    read, write = await self._stack.enter_async_context(
-                        sse_client(spec["url"], headers=headers)
-                    )
-            else:
-                params = StdioServerParameters(
-                    command=spec["command"], args=spec.get("args", []),
-                    env={**os.environ, **(_expand_env_values(name, spec.get("env"), "env var") or {})},
-                )
-                self._server_log_file.write(
-                    f"\n=== [{name}] {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"starting: {spec['command']} {' '.join(spec.get('args', []))} ===\n"
-                )
-                self._server_log_file.flush()
-                read, write = await self._stack.enter_async_context(
-                    stdio_client(params, errlog=self._server_log_file)
-                )
-            session = await self._stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            return session
-        except Exception as e:
-            desc = spec.get("url") or f"{spec.get('command')} {' '.join(spec.get('args', []))}"
-            raise RuntimeError(f"Failed to start MCP server {name!r} ({desc}): {e}") from e
+            return await ready
+        except BaseException:
+            await self._stop_server(name)
+            raise
+
+    async def _stop_server(self, name: str) -> None:
+        """Signal one server's owning task to tear its connection down, and
+        wait for it — so a restart never leaves the old subprocess running
+        alongside its replacement."""
+        entry = self._server_tasks.pop(name, None)
+        if entry is None:
+            return
+        task, shutdown = entry
+        shutdown.set()
+        try:
+            await task
+        except BaseException as e:
+            if not _is_benign_shutdown_race(e):
+                raise
 
     async def __aenter__(self):
         # Opened once per client and reused across every stdio server's
         # errlog= — closed automatically via self._stack on __aexit__.
         self._server_log_file = self._stack.enter_context(open(self.mcp_log_path, "a", encoding="utf-8"))
 
-        builtin_spec = {
-            "command": sys.executable, "args": self.server_args,
-            "env": {"AGENT_PROJECT_ROOT": self.project_root},
-        }
+        builtin_spec = self._builtin_spec()
         # The built-in server provides the core file/shell tools — a failure
         # there is fatal, so it still raises. Custom servers are optional
         # add-ons: one failing shouldn't take down the whole session, so
@@ -494,11 +550,94 @@ class MCPToolClient:
         return self
 
     async def __aexit__(self, *exc_info):
+        # Servers first: stdio ones write to the log file held by self._stack,
+        # so that has to outlive them. Reverse order so the built-in server
+        # (started first) is torn down last.
+        for name in reversed(list(self._server_tasks)):
+            await self._stop_server(name)
         try:
             await self._stack.aclose()
         except BaseException as e:
             if not _is_benign_shutdown_race(e):
                 raise
+
+    def _builtin_spec(self) -> dict:
+        return {
+            "command": sys.executable, "args": self.server_args,
+            "env": {"AGENT_PROJECT_ROOT": self.project_root},
+        }
+
+    def _resolve_spec(self, name: str) -> dict:
+        """Re-read a server's spec from its original source, so a restart
+        picks up edits to the settings file too — not just changes to the
+        server's own code. Falls back to the spec this client started with if
+        the entry is gone or the file no longer parses. Same precedence as
+        __aenter__: --mcp-server beats the config file."""
+        if name == _BUILTIN:
+            return self._builtin_spec()
+        if name in self.extra_servers:
+            return self.extra_servers[name]
+        if self.mcp_config_path:
+            try:
+                servers = load_mcp_config(self.mcp_config_path)
+            except ValueError:
+                servers = {}
+            if name in servers:
+                return servers[name]
+        return self._server_specs.get(name, {})
+
+    async def restart_server(self, name: str) -> dict:
+        """Disconnect and reconnect one MCP server, for picking up changes to
+        its code (or its spec in the settings file) without leaving the REPL.
+        Also the way to retry a server that failed to connect at startup.
+
+        Accepts the display name ("built-in") or the internal one. Reconnect
+        failures are recorded like they are at startup rather than raised, so
+        a server whose code is currently broken doesn't take the session down
+        — the returned status entry carries the error. Tool ownership and the
+        resource catalog are refreshed afterward, and the next turn picks up
+        the new schemas (agent._run_loop re-lists tools each turn).
+
+        Returns this server's server_status() entry."""
+        key = _BUILTIN if name in (_BUILTIN, "built-in", "builtin") else name
+        if key not in self._server_specs:
+            known = ["built-in"] + [n for n in self._server_specs if n != _BUILTIN]
+            raise ValueError(f"Unknown MCP server {name!r} — configured: {', '.join(known)}")
+
+        await self._stop_server(key)
+        self._sessions.pop(key, None)
+        self._connected_at.pop(key, None)
+        self._connect_errors.pop(key, None)
+        # Cached embeddings key off tool name + description, both of which may
+        # have just changed — drop this server's so search_tools re-embeds.
+        for exposed in [k for k in self._tool_embeddings if k.startswith(f"{key}__")]:
+            del self._tool_embeddings[exposed]
+
+        spec = self._resolve_spec(key)
+        self._server_specs[key] = spec
+        try:
+            self._sessions[key] = await self._connect(key, spec)
+            self._connected_at[key] = time.monotonic()
+            if spec.get("defer"):
+                self._deferred_servers.add(key)
+            else:
+                self._deferred_servers.discard(key)
+        except RuntimeError as e:
+            self._connect_errors[key] = str(e)
+
+        await self.list_llm_tools()  # rebuild _tool_owner/_deferred_tools for the new session
+        try:
+            self._resources = await self.list_resources()
+        except Exception:
+            self._resources = {}
+
+        display = "built-in" if key == _BUILTIN else key
+        return next(e for e in self.server_status() if e["name"] == display)
+
+    def server_names(self) -> list:
+        """Configured server names as the REPL should show them (built-in
+        first), for `/mcp restart <name>` completion."""
+        return ["built-in"] + [n for n in self._server_specs if n != _BUILTIN]
 
     def server_status(self) -> list:
         """One entry per configured server (built-in + every custom one),

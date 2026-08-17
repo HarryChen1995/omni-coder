@@ -69,6 +69,10 @@ Run `omni --help` for the full option list.
   one per run (`--mcp-server`/`--mcp-config`). One server failing to
   connect doesn't take down the session — check `/mcp` for live ✅/❌
   status per server, and `--mcp-log-path` for their stderr output.
+- **Hot-restart a server you're editing** — `/mcp restart <name>` (or
+  `all`) reconnects just that server without leaving the REPL, picking up
+  code *and* config changes and re-listing its tools/prompts/resources. Also
+  how you retry a server that failed to connect, once you've fixed it.
 - **Deferred tool loading + semantic search_tools** — register a custom MCP
   server with `--defer` and its tools stay out of the model's context until
   a synthesized `search_tools` tool loads matching ones on demand, ranked by

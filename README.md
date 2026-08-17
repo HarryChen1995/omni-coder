@@ -168,6 +168,13 @@ MCP prompt exposed by a connected server. Special inputs:
   and command/URL (or the connection error, for a ❌ one). A custom server
   failing to connect no longer aborts startup — it just shows ❌ here
   instead of the whole session refusing to start
+- `/mcp restart <name>` — reconnect one server (`/mcp restart all` for every
+  one) after editing its code, without leaving the REPL. Also how you retry
+  a ❌ server once you've fixed it. It re-reads that server's spec from the
+  settings file too, so edits to its `command`/`args`/`env`/`headers` are
+  picked up as well; the next turn sees its new tool list, prompts, and
+  resources. Works on the `built-in` server too, for when you change
+  `tools.py`
 - `/model` — opens an interactive picker (↑/↓ to move, Enter to select, Esc to
   cancel) of models available on the LLM server, defaulting to the current one
 - `/model <name>` — switch the active model directly, without the picker
@@ -413,6 +420,24 @@ headers — pass secrets to those through `env` instead.
 All three sources can be combined; `--mcp-server` wins over `--mcp-config`
 on a name clash, and an explicit `--mcp-config` wins over the auto-loaded
 global registry.
+
+### Iterating on a server you're writing
+
+Editing an MCP server used to mean restarting the whole session to pick up
+the change. From the REPL, reconnect just that server instead:
+```
+❯ /mcp restart docs          # after editing docs-server.js
+Restarted MCP server 'docs' (7 tools).
+
+❯ /mcp restart all           # every server, built-in included
+```
+The old subprocess is stopped before the replacement starts (no orphans),
+the server's spec is re-read from the settings file so `command`/`args`/
+`env`/`headers` edits apply too, and its tools, prompts, and resources are
+re-listed — the next turn sees the new set. Other servers keep their
+existing connections. A server that's currently broken reports the failure
+in `/mcp` instead of taking the session down, so you can fix it and
+`/mcp restart` again.
 
 **Local commands vs. remote URLs:**
 - Anything after `name=` that starts with `http://` or `https://` is treated
