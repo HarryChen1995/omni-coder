@@ -80,8 +80,13 @@ class Intent:
 
 
 def _coerce(data: dict) -> Intent:
-    task_type = data.get("task_type") if data.get("task_type") in _VALID_TASK_TYPES else "other"
-    risk_level = data.get("risk_level") if data.get("risk_level") in _VALID_RISK else "medium"
+    # isinstance(str) first: a model can return a list/dict here, and an
+    # unhashable value raises TypeError on `in <set>` — which would burn
+    # every retry and degrade to the low-confidence fallback for a payload
+    # whose other fields were perfectly usable.
+    raw_type, raw_risk = data.get("task_type"), data.get("risk_level")
+    task_type = raw_type if isinstance(raw_type, str) and raw_type in _VALID_TASK_TYPES else "other"
+    risk_level = raw_risk if isinstance(raw_risk, str) and raw_risk in _VALID_RISK else "medium"
 
     target_files = data.get("target_files") or []
     if not isinstance(target_files, list):

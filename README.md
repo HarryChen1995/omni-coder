@@ -1,5 +1,10 @@
 # 🐙 Omni Coder
 
+[![tests](https://img.shields.io/badge/tests-634%20passed-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 ## ⚙️ Setup
 ```bash
 ollama pull qwen3-coder:30b   # example: pulling the default model via Ollama
@@ -57,8 +62,9 @@ one-shot run — see [Session management](#session-management) below.
 3. **Rate/step limits per user** if this is exposed to a team, not just you.
 4. **Swap the char-based context trimming for a real tokenizer** if you hit
    context issues in practice — it's a rough approximation.
-5. **Add tests for the tools module** (`tools.py`) in your CI — the
-   path-scope check is the one thing you really don't want to regress silently.
+5. **Wire the test suite into CI** — it ships with the repo (see
+   [Tests](#-tests)); `tests/test_tools.py` pins the path-scope check, which
+   is the one thing you really don't want to regress silently.
 6. Qwen3-Coder's native tool-calling is solid but not perfect at this size —
    watch the log for `BAD ARGS` entries; if they're frequent, consider a
    larger quant or `qwen2.5-coder:32b` (dense, less agentic-tuned but very
@@ -566,6 +572,49 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 - Any embedding failure (dependency missing, model not pulled, network
   error) falls back to keyword matching for that call rather than erroring
   out — `search_tools` still answers, just less precisely.
+
+## 🧪 Tests
+
+634 tests, 95% branch coverage. Install the dev extra and run them:
+```bash
+pip install -e ".[dev]"
+pytest                          # whole suite
+pytest --cov=omni               # with a coverage report
+pytest -m "not live"            # skip the subprocess-spawning tests (fast)
+pytest tests/test_tools.py -v   # one module
+```
+
+Almost everything is mocked at the process boundary — `httpx` via
+`MockTransport`, `subprocess.run` for the git tools, `ClientSession` for MCP,
+and `chat()` for the model — so the suite is hermetic and needs no server,
+model, or network. Each test gets its own `tmp_path` project root, SQLite
+file, and `$HOME`, so your real `~/.omni-coder` settings and
+`agent_sessions.db` are never touched.
+
+| File | Covers |
+|---|---|
+| `test_tools.py` | Path scoping (the security boundary), file IO, ripgrep search, shell policy |
+| `test_tools_git.py` | Every git tool's argv, exit codes, timeouts, missing binary |
+| `test_session_store.py` | SQLite persistence, resume/rename/delete, compaction rewrites |
+| `test_intent.py` | JSON coercion of malformed model output, retry + fallback |
+| `test_llm_client.py` | Request shaping, auth headers, every error path |
+| `test_mcp_client_pure.py` | Spec parsing, settings file + migration, env-var expansion |
+| `test_mcp_client_class.py` | Tool routing, deferred loading, prompts, resources, restart |
+| `test_mcp_client_live.py` | Real stdio servers: connect, restart, reap (`live` marker) |
+| `test_mcp_server.py` | The exposed MCP tool surface and its delegation to `tools.py` |
+| `test_agent_helpers.py` | Tool-call recovery, history trimming, approval policy |
+| `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits |
+| `test_ui.py` | Diff rendering, summaries, completer, every renderer |
+| `test_cli.py` / `test_cli_interactive.py` | Flags, MCP registry, and every REPL slash command |
+| `test_cli_no_rich.py` | The degraded path when rich/prompt_toolkit aren't installed |
+| `test_config.py` | `AgentConfig` defaults that encode policy (what's auto-approved) |
+| `test_embeddings_and_entrypoint.py` | Embedding backends and `python -m omni` |
+
+The `live`-marked tests spawn real MCP server subprocesses over stdio. They
+exist because `_serve`/`_stop_server` are about anyio task-group lifetimes —
+cancel scopes are task-scoped, which is *why* each server gets its own task —
+and a mock can't exercise that. They also assert no subprocess is orphaned
+across restarts.
 
 ## 📁 Files
 All modules live under `omni/`:

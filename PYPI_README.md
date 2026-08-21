@@ -1,5 +1,10 @@
 # 🐙 Omni Coder
 
+[![tests](https://img.shields.io/badge/tests-634%20passed-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 An AI coding agent that plans, edits, and tests code by driving Qwen Coder
 (or any OpenAI-compatible model) through a scoped set of file and shell
 tools, with human approval on every write, edit, or shell command.
@@ -177,6 +182,18 @@ Point at any OpenAI-compatible host with `--llm-host` or the
 key doesn't end up in shell history. Seeing repeated retries in the
 terminal? That's usually a client-side timeout, not a dead server — raise
 it with `--llm-timeout <seconds>` (default `300`).
+
+## 🧪 Tests
+
+634 tests, 95% branch coverage — hermetic (no model, server, or network
+needed; every external boundary is mocked):
+```bash
+pip install -e ".[dev]"
+pytest                 # whole suite
+pytest --cov=omni      # with coverage
+pytest -m "not live"   # skip the subprocess-spawning tests
+```
+See the full README for the per-module breakdown.
 
 ## 🔗 Links
 

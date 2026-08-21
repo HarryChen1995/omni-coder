@@ -9,7 +9,7 @@ dist/
 venv/
 .venv/
 env/
-
+.coverage
 # Runtime artifacts from running the agent
 agent_run.log
 *.log
