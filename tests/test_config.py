@@ -2,6 +2,9 @@
 them is a behaviour change worth catching."""
 
 import dataclasses
+import json
+
+import pytest
 
 from omni.config import AgentConfig
 
@@ -78,3 +81,63 @@ def test_every_field_is_overridable():
     cfg = AgentConfig(model="m", project_root="/p", max_steps=1, auto_approve=True)
     assert cfg.model == "m" and cfg.max_steps == 1 and cfg.auto_approve is True
     assert "safe_tools" in fields and "denied_shell_patterns" in fields
+
+
+# ---------------- tool_server_env round trip ----------------
+#
+# The tools run in a separate process (mcp_server.py), so anything below
+# that governs tool behaviour has to cross that boundary explicitly. These
+# pin the mapping in both directions: a knob that stops being exported is a
+# knob the built-in server silently ignores.
+
+def test_tool_server_env_exports_every_tool_side_knob():
+    cfg = AgentConfig(project_root="/repo", shell_timeout_s=7, max_output_chars=99,
+                      memory_path="notes/mem.md", denied_shell_patterns=("boom",))
+    env = cfg.tool_server_env()
+    assert env["AGENT_PROJECT_ROOT"] == "/repo"
+    assert env["AGENT_SHELL_TIMEOUT_S"] == "7"
+    assert env["AGENT_MAX_OUTPUT_CHARS"] == "99"
+    assert env["AGENT_MEMORY_PATH"] == "notes/mem.md"
+    assert json.loads(env["AGENT_DENIED_SHELL_PATTERNS"]) == ["boom"]
+    assert all(isinstance(v, str) for v in env.values())   # subprocess env must be strings
+
+
+def test_from_tool_server_env_restores_what_was_exported():
+    cfg = AgentConfig(project_root="/repo", shell_timeout_s=7, max_output_chars=99,
+                      memory_path="notes/mem.md", denied_shell_patterns=("boom", "kaboom"))
+    restored = AgentConfig.from_tool_server_env(cfg.tool_server_env())
+    assert restored.project_root == "/repo"
+    assert restored.shell_timeout_s == 7
+    assert restored.max_output_chars == 99
+    assert restored.memory_path == "notes/mem.md"
+    assert restored.denied_shell_patterns == ("boom", "kaboom")
+
+
+def test_from_tool_server_env_falls_back_to_defaults_when_empty():
+    restored = AgentConfig.from_tool_server_env({})
+    defaults = AgentConfig()
+    assert restored.project_root == defaults.project_root
+    assert restored.shell_timeout_s == defaults.shell_timeout_s
+    assert restored.denied_shell_patterns == defaults.denied_shell_patterns
+
+
+@pytest.mark.parametrize("env", [
+    {"AGENT_SHELL_TIMEOUT_S": "not-a-number"},
+    {"AGENT_MAX_OUTPUT_CHARS": ""},
+    {"AGENT_DENIED_SHELL_PATTERNS": "{not json"},
+    {"AGENT_DENIED_SHELL_PATTERNS": '"a string, not a list"'},
+])
+def test_from_tool_server_env_ignores_malformed_values(env):
+    """A garbled variable must not stop the tool server from starting."""
+    restored = AgentConfig.from_tool_server_env(env)
+    defaults = AgentConfig()
+    assert restored.shell_timeout_s == defaults.shell_timeout_s
+    assert restored.max_output_chars == defaults.max_output_chars
+    assert restored.denied_shell_patterns == defaults.denied_shell_patterns
+
+
+def test_from_tool_server_env_reads_os_environ_by_default(monkeypatch):
+    monkeypatch.setenv("AGENT_PROJECT_ROOT", "/from/environ")
+    monkeypatch.setenv("AGENT_SHELL_TIMEOUT_S", "3")
+    restored = AgentConfig.from_tool_server_env()
+    assert restored.project_root == "/from/environ" and restored.shell_timeout_s == 3

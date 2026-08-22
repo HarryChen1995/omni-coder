@@ -87,9 +87,14 @@ class Tools:
         directories (.git, node_modules, __pycache__, build output, etc.) and
         anything .gitignore'd. `glob` optionally restricts which filenames are
         searched (e.g. "*.py")."""
+        root_abs = os.path.realpath(self.cfg.project_root)
         p = _resolve_in_scope(self.cfg.project_root, path)
         rg_pattern = f"(?i){pattern}" if case_insensitive else pattern
         globs = ([glob] if glob else []) + _IGNORE_GLOBS
+        # ripgrep prefixes each match with its filename only when it was
+        # handed a directory — given a single file it emits "<lineno>:<text>",
+        # so the path has to come from the resolved argument instead.
+        single_file = os.path.isfile(p)
 
         max_matches = 1000
         try:
@@ -103,8 +108,15 @@ class Tools:
             for raw_line in chunk.splitlines():
                 if not raw_line:
                     continue
-                fpath, lineno, content = raw_line.split(":", 2)
-                rel = os.path.relpath(fpath, self.cfg.project_root)
+                head, _, rest = raw_line.partition(":")
+                if single_file and head.isdigit():
+                    fpath, lineno, content = p, head, rest
+                else:
+                    parts = raw_line.split(":", 2)
+                    if len(parts) != 3:
+                        continue  # not a "path:lineno:text" match line
+                    fpath, lineno, content = parts
+                rel = os.path.relpath(fpath, root_abs)
                 results.append(f"{rel}:{lineno}:{content}")
                 if len(results) >= max_matches:
                     break
@@ -122,6 +134,7 @@ class Tools:
         """Find files by glob pattern (supports ** for recursive matching),
         e.g. "**/*.tsx" or "src/**/test_*.py". Results are sorted newest
         first, like Claude Code's Glob tool, skipping noise directories."""
+        root_abs = os.path.realpath(self.cfg.project_root)
         root = _resolve_in_scope(self.cfg.project_root, path)
         matches = globmod.glob(os.path.join(root, pattern), recursive=True)
 
@@ -129,7 +142,7 @@ class Tools:
         for m in matches:
             if not os.path.isfile(m):
                 continue
-            rel = os.path.relpath(m, self.cfg.project_root)
+            rel = os.path.relpath(m, root_abs)
             if any(part in _IGNORE_DIRS for part in rel.split(os.sep)):
                 continue
             files.append((m, rel))
@@ -226,7 +239,7 @@ class Tools:
         note = " ".join(note.split())
         if not note:
             return "ERROR: note cannot be empty"
-        path = os.path.join(self.cfg.project_root, self.cfg.memory_path)
+        path = _resolve_in_scope(self.cfg.project_root, self.cfg.memory_path)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         line = f"- [{datetime.now().strftime('%Y-%m-%d')}] {note}\n"
         with open(path, "a", encoding="utf-8") as f:
@@ -392,6 +405,16 @@ class Tools:
         return f"Edited {path}.\n{_truncate(diff, self.cfg.max_output_chars)}"
 
     def run_shell(self, command: str) -> str:
+        """Run `command` through the shell, rooted at project_root.
+
+        NOT a sandbox. The denylist below is a typo/footgun guard, not a
+        security boundary: it is plain substring matching, so trivial
+        variations slip past it ("rm  -rf /" with two spaces, "rm -rf $HOME",
+        a tab after "sudo"), and `cwd=project_root` scopes nothing — the
+        command is free to `cd /`. Treat this tool as arbitrary code
+        execution by the model and contain it at the OS level (container,
+        VM), exactly as the README says.
+        """
         for bad in self.cfg.denied_shell_patterns:
             if bad in command:
                 return f"ERROR: command blocked by policy (matched pattern: '{bad}')"

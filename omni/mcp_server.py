@@ -3,21 +3,26 @@
 Run standalone to test with any MCP client:
     AGENT_PROJECT_ROOT=/path/to/repo python -m omni.mcp_server
 
+The rest of the tool-side policy comes from the environment too
+(AGENT_SHELL_TIMEOUT_S, AGENT_MAX_OUTPUT_CHARS, AGENT_MEMORY_PATH,
+AGENT_DENIED_SHELL_PATTERNS) — see AgentConfig.tool_server_env().
+
 Any MCP-compatible client (not just this agent) can now use these tools —
 Claude Desktop, another agent framework, etc. — all sharing the same
 project-scope/approval-preview logic in tools.py.
 """
-
-import os
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import AgentConfig
 from .tools import Tools
 
-PROJECT_ROOT = os.environ.get("AGENT_PROJECT_ROOT", ".")
-
-cfg = AgentConfig(project_root=PROJECT_ROOT)
+# The tool-side knobs (project root, shell timeout, output truncation,
+# memory file, shell denylist) come from the environment the client set up
+# for this subprocess — see AgentConfig.tool_server_env(). Anything absent
+# falls back to AgentConfig's own default, so running this module by hand
+# (`AGENT_PROJECT_ROOT=/repo python -m omni.mcp_server`) still works.
+cfg = AgentConfig.from_tool_server_env()
 impl = Tools(cfg)
 
 mcp = FastMCP("omni-tools")
@@ -139,8 +144,9 @@ def edit_file(path: str, old_str: str, new_str: str) -> str:
 
 @mcp.tool()
 def run_shell(command: str) -> str:
-    """Run a shell command in the project root. Dangerous commands are
-    blocked by policy."""
+    """Run a shell command in the project root. A few catastrophic command
+    patterns are refused outright; everything else runs, so the caller (and
+    its human) is the real check on what this does."""
     return impl.run_shell(command)
 
 

@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+from omni.config import AgentConfig
 from omni.mcp_client import _BUILTIN, MCPToolClient
 
 pytestmark = pytest.mark.live
@@ -82,6 +83,35 @@ async def test_builtin_tool_call_round_trips(make_client, tmp_path):
     async with make_client() as client:
         await client.list_llm_tools()
         assert "hello from disk" in await client.call_tool("read_file", {"path": "probe.txt"})
+
+
+async def test_builtin_server_honors_the_tool_config_it_is_given(make_client, tmp_path):
+    """The tools run in a subprocess, so these knobs only take effect if they
+    are handed across that boundary — set on AgentConfig alone they used to
+    be silently ignored by the code that actually runs."""
+    cfg = AgentConfig(project_root=str(tmp_path), memory_path="notes/mem.md",
+                      max_output_chars=60, denied_shell_patterns=("echo forbidden",))
+    async with make_client(builtin_env=cfg.tool_server_env()) as client:
+        await client.list_llm_tools()
+
+        blocked = await client.call_tool("run_shell", {"command": "echo forbidden"})
+        assert "blocked by policy" in blocked
+
+        truncated = await client.call_tool("run_shell", {"command": "seq 1 400"})
+        assert "truncated" in truncated
+
+        await client.call_tool("save_memory", {"note": "remember this"})
+        assert "remember this" in (tmp_path / "notes" / "mem.md").read_text()
+
+
+async def test_builtin_server_falls_back_to_defaults_without_the_extra_env(make_client, tmp_path):
+    """A bare MCPToolClient(root) — the shape every other test and any
+    third-party embedder uses — must still work on AgentConfig's defaults."""
+    async with make_client() as client:
+        await client.list_llm_tools()
+        assert "blocked by policy" in await client.call_tool("run_shell", {"command": "sudo rm x"})
+        await client.call_tool("save_memory", {"note": "default path"})
+        assert (tmp_path / AgentConfig.memory_path).exists()
 
 
 async def test_custom_server_tools_are_namespaced_and_callable(make_client, tmp_path):

@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-662%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-713%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -188,7 +188,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-662 tests, 95% branch coverage — hermetic (no model, server, or network
+713 tests, 95% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

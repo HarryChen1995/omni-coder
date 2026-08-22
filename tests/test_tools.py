@@ -140,6 +140,42 @@ def test_search_files_invalid_regex(tools):
     assert tools.search_files("(unclosed").startswith("ERROR: invalid regex")
 
 
+def test_search_files_accepts_a_single_file_as_the_path(tools):
+    """ripgrep drops the filename prefix when handed one file, so the result
+    line is "<lineno>:<text>" — unpacking it as path:lineno:text used to raise
+    ValueError on the very common "search within this file" call."""
+    out = tools.search_files("def hello", path="hello.py")
+    assert out == "hello.py:1:def hello():"
+
+
+def test_search_files_single_file_tolerates_a_path_prefixed_line(tools, mocker):
+    """Defensive: if ripgrep ever does prefix the filename for a single file,
+    fall back to the path:lineno:text shape rather than mangling the output."""
+    target = os.path.join(os.path.realpath(tools.cfg.project_root), "hello.py")
+    mocker.patch("omni.tools._rg_search", return_value=[f"{target}:1:def hello():"])
+    assert tools.search_files("def hello", path="hello.py") == "hello.py:1:def hello():"
+
+
+def test_search_files_single_file_no_match(tools):
+    assert tools.search_files("zzz-not-here-zzz", path="hello.py") == "(no matches)"
+
+
+def test_search_and_glob_stay_relative_through_a_symlinked_root(tmp_path):
+    """A project root reached through a symlink (/tmp on macOS, a symlinked
+    checkout) used to yield paths like ../../../private/tmp/... because the
+    match was made relative to the raw root while ripgrep reported the
+    resolved one."""
+    real = tmp_path / "real"
+    (real / "pkg").mkdir(parents=True)
+    (real / "pkg" / "mod.py").write_text("MARKER = 1\n")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    t = Tools(AgentConfig(project_root=str(link)))
+    assert t.search_files("MARKER") == "pkg/mod.py:1:MARKER = 1"
+    assert t.glob_files("**/*.py") == "pkg/mod.py"
+
+
 def test_search_files_skips_noise_dirs(tools, project_root):
     noisy = project_root / "node_modules" / "dep"
     noisy.mkdir(parents=True)
@@ -243,6 +279,14 @@ def test_preview_write_new_vs_overwrite(tools, project_root):
 
 
 # ---------------- save_memory ----------------
+
+def test_save_memory_is_confined_to_the_project_root(cfg):
+    """memory_path is config, not model input — but it's still a path, and it
+    was the one path in this module that skipped the scope check."""
+    cfg.memory_path = "../escaped-memory.md"
+    with pytest.raises(PathScopeError):
+        Tools(cfg).save_memory("a note")
+
 
 def test_save_memory_appends_dated_bullets(tools, project_root):
     tools.save_memory("uses pytest")

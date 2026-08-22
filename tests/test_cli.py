@@ -82,11 +82,57 @@ def test_embedding_model_defaults_when_flag_omitted(mocker, tmp_path):
     assert captured["cfg"].embedding_model == AgentConfig.embedding_model
 
 
+def test_safe_tool_flag_extends_the_auto_approved_set(mocker, tmp_path):
+    captured = {}
+    mocker.patch.object(cli_mod.CodingAgent, "__init__", lambda self, cfg: captured.update(cfg=cfg))
+    mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock(return_value="ok"))
+    invoke("t", "--safe-tool", "docs__search", "--safe-tool", "docs__lookup",
+           "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    safe = captured["cfg"].safe_tools
+    assert "docs__search" in safe and "docs__lookup" in safe
+    assert "read_file" in safe          # the built-in read-only set is kept
+
+
+def test_defer_applies_to_inline_mcp_servers(mocker, tmp_path):
+    captured = {}
+    mocker.patch.object(cli_mod.CodingAgent, "__init__", lambda self, cfg: captured.update(cfg=cfg))
+    mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock(return_value="ok"))
+    invoke("t", "--mcp-server", "docs=node srv.js", "--defer",
+           "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].mcp_servers["docs"]["defer"] is True
+
+
+def test_defer_without_any_server_says_so(mocker, tmp_path):
+    """It used to be silently ignored unless paired with --add-mcp-server."""
+    mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock(return_value="ok"))
+    r = invoke("t", "--defer", "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 0 and "--defer had no effect" in r.output
+
+
 def test_run_value_error_exits_nonzero(mocker, tmp_path):
     mocker.patch.object(cli_mod.CodingAgent, "run",
                         mocker.AsyncMock(side_effect=ValueError("no session found")))
     r = invoke("t", "--db-path", str(tmp_path / "s.db"), "--log-path", str(tmp_path / "l.log"))
     assert r.exit_code == 1 and "no session found" in r.output
+
+
+def test_unreachable_llm_server_is_one_line_not_a_traceback(mocker, tmp_path):
+    """What _call_model raises once its retries are spent — the single most
+    common failure mode, and previously an uncaught stack trace."""
+    mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock(
+        side_effect=RuntimeError("Model call failed after 3 attempts: Could not reach the LLM server")))
+    r = invoke("t", "--db-path", str(tmp_path / "s.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1
+    assert "Could not reach the LLM server" in r.output
+    assert "Traceback" not in r.output
+
+
+def test_llm_error_from_a_run_exits_nonzero(mocker, tmp_path):
+    mocker.patch.object(cli_mod.CodingAgent, "run",
+                        mocker.AsyncMock(side_effect=LLMError("bad gateway")))
+    r = invoke("t", "--db-path", str(tmp_path / "s.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "bad gateway" in r.output
 
 
 def test_no_task_enters_interactive(no_interactive, tmp_path):
@@ -98,7 +144,8 @@ def test_no_task_enters_interactive(no_interactive, tmp_path):
 def test_help_lists_the_key_flags():
     out = invoke("--help").output
     for flag in ("--project-root", "--model", "--llm-host", "--llm-timeout",
-                 "--auto-approve", "--resume", "--add-mcp-server", "--mcp-log-path"):
+                 "--auto-approve", "--safe-tool", "--resume", "--add-mcp-server",
+                 "--mcp-log-path"):
         assert flag in out
 
 

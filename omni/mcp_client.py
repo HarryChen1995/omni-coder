@@ -382,8 +382,13 @@ class MCPToolClient:
     def __init__(self, project_root: str, server_path: str = None,
                  mcp_config_path: str = None, extra_servers: dict = None,
                  embedding_model: str = "", llm_host: str = None, llm_api_key: str = None,
-                 mcp_log_path: str = "mcp_servers.log"):
+                 mcp_log_path: str = "mcp_servers.log", builtin_env: dict = None):
         self.project_root = project_root
+        # Environment for the built-in server subprocess, carrying the
+        # tool-side config knobs across the process boundary (see
+        # AgentConfig.tool_server_env). Defaults to project root only, so a
+        # bare MCPToolClient(root) still behaves as before.
+        self.builtin_env = dict(builtin_env) if builtin_env else {"AGENT_PROJECT_ROOT": project_root}
         # stderr from every stdio-transport server (built-in + custom) is
         # redirected here instead of the terminal — opened lazily in
         # __aenter__ and closed via self._stack on exit.
@@ -564,7 +569,7 @@ class MCPToolClient:
     def _builtin_spec(self) -> dict:
         return {
             "command": sys.executable, "args": self.server_args,
-            "env": {"AGENT_PROJECT_ROOT": self.project_root},
+            "env": dict(self.builtin_env),
         }
 
     def _resolve_spec(self, name: str) -> dict:

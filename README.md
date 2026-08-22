@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-662%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-713%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -38,7 +38,7 @@ one-shot run — see [Session management](#session-management) below.
 |---|---|---|
 | Editing existing files | Only full overwrite via `write_file` | `edit_file` does exact unique-match replace + shows a unified diff, `write_file` refuses to clobber existing files |
 | Path safety | None — agent could read/write anywhere | Every path resolved and checked against `project_root`; escapes raise `PathScopeError` |
-| Shell safety | Ran anything, unbounded | Denylist for destructive patterns (`rm -rf /`, `sudo`, fork bombs, etc.), timeout, output truncation |
+| Shell safety | Ran anything, unbounded | Denylist for destructive patterns (`rm -rf /`, `sudo`, fork bombs, etc.), timeout, output truncation — a footgun guard, not a sandbox (see [below](#-still-recommended-before-real-production-use)) |
 | Human oversight | None | Write/edit/shell calls pause for approval unless the tool is in `safe_tools` or `auto_approve=True` |
 | Model reliability | Assumed clean tool-call JSON | Retries with backoff on API errors; malformed tool-call args are caught and reported back to the model instead of crashing |
 | Context window | Unbounded growth | Once the conversation exceeds `--context-char-budget` (default 200k chars), it's compacted via an LLM-written summary instead of growing forever |
@@ -55,7 +55,10 @@ one-shot run — see [Session management](#session-management) below.
 1. **Run it in a container**, not on your host. The path-scope check and shell
    denylist reduce risk but are not a substitute for OS-level isolation —
    treat `run_shell` as "can execute arbitrary code" and contain the blast
-   radius accordingly (Docker, gVisor, a disposable VM).
+   radius accordingly (Docker, gVisor, a disposable VM). The denylist in
+   particular is plain substring matching: it catches a fat-fingered
+   `rm -rf /`, not a determined variant spelling (`rm  -rf /`, `rm -rf $HOME`),
+   and nothing stops a command from `cd`-ing out of the project root.
 2. **Version control everything.** Require the project root to be a git repo
    and commit before each run, so any agent change is a reviewable diff you
    can revert.
@@ -337,8 +340,9 @@ remote (SSE / Streamable HTTP), can be added, and its tools show up to the
 model automatically, in the same `tools` list the built-ins use, with no
 other wiring needed. They're namespaced as `<server_name>__<tool_name>` so
 they can't collide with the built-ins or each other, and go through the same
-human-approval flow as every other tool unless added to `safe_tools` or run
-with `--auto-approve`.
+human-approval flow as every other tool unless run with `--auto-approve`
+or marked auto-approved individually with `--safe-tool <name>` (repeatable,
+using the namespaced name the model sees, e.g. `--safe-tool docs__search`).
 
 A custom server failing to connect doesn't take down the whole session —
 only the built-in server (which provides the core file/shell tools) is
@@ -596,7 +600,8 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-662 tests, 95% branch coverage. Install the dev extra and run them:
+713 tests, 95% branch coverage (the badge numbers are the full suite,
+`live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
 pytest                          # whole suite

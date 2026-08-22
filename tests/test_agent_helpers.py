@@ -5,9 +5,9 @@ import pytest
 
 from omni import agent as agent_mod
 from omni.agent import (
-    _approve, _compact_messages, _find_json_objects, _format_elapsed,
-    _load_project_memory, _recover_text_tool_calls, _render_for_summary,
-    _setup_logger, _trim_history,
+    _approve, _compact_messages, _ensure_tool_call_ids, _find_json_objects,
+    _format_elapsed, _load_project_memory, _protected_head_len,
+    _recover_text_tool_calls, _render_for_summary, _setup_logger, _trim_history,
 )
 from omni.llm_client import LLMError
 
@@ -287,3 +287,103 @@ async def test_compact_logs_and_reports_elapsed(cfg, mocker):
     assert "compacted" in str(logger.info.call_args)
     ui_mock.assert_called_once()
     assert ui_mock.call_args.args[0] == 8   # messages folded into the summary
+
+
+# ---------------- _recover_text_tool_calls: narration guard ----------------
+
+def test_recover_ignores_a_call_merely_described_in_a_final_answer():
+    """The recovery path executes what it finds, so a summary that quotes the
+    call it already made must not be re-run as a fresh one."""
+    text = (
+        "All done. I fixed the off-by-one in the loop bound, added a regression "
+        "test for the empty-input case, and re-ran the suite (42 passed). The "
+        "only tool call that touched disk was "
+        '{"name": "write_file", "arguments": {"path": "x.py", "content": "boom"}}'
+        " — everything else was read-only. To verify, run `pytest -q tests/test_x.py`; "
+        "if it fails, check that the fixture still seeds three rows."
+    )
+    assert _recover_text_tool_calls(text, NAMES) == []
+
+
+def test_recover_still_fires_with_a_short_lead_in():
+    text = 'Reading that now.\n{"name": "read_file", "arguments": {"path": "a"}}'
+    assert len(_recover_text_tool_calls(text, NAMES)) == 1
+
+
+def test_recover_still_fires_inside_a_json_fence():
+    text = '```json\n{"name": "read_file", "arguments": {"path": "a"}}\n```'
+    assert len(_recover_text_tool_calls(text, NAMES)) == 1
+
+
+# ---------------- _ensure_tool_call_ids ----------------
+
+def test_ensure_tool_call_ids_fills_only_missing_ones():
+    calls = [{"id": "abc", "function": {}}, {"function": {}}, {"id": "", "function": {}}]
+    _ensure_tool_call_ids(calls, step=3)
+    assert calls[0]["id"] == "abc"                    # server-supplied id untouched
+    assert calls[1]["id"] == "call_3_1"
+    assert calls[2]["id"] == "call_3_2"
+    assert len({c["id"] for c in calls}) == 3
+
+
+# ---------------- _protected_head_len ----------------
+
+def test_protected_head_covers_the_injected_intent_block():
+    """The regression this exists for: with intent parsing on, the task sits
+    at index 2, so a fixed head of 2 summarized away the task itself."""
+    m = [{"role": "system"}, {"role": "system"}, {"role": "user"}, {"role": "assistant"}]
+    assert _protected_head_len(m) == 3
+
+
+def test_protected_head_without_an_intent_block():
+    assert _protected_head_len([{"role": "system"}, {"role": "user"}, {"role": "tool"}]) == 2
+
+
+def test_protected_head_with_no_system_prompt():
+    assert _protected_head_len([{"role": "user"}, {"role": "assistant"}]) == 1
+
+
+def test_protected_head_of_system_only_and_empty():
+    assert _protected_head_len([{"role": "system"}]) == 1
+    assert _protected_head_len([]) == 0
+
+
+def test_trim_history_keeps_the_task_behind_an_intent_block():
+    m = ([{"role": "system", "content": "s" * 50}, {"role": "system", "content": "intent" * 20},
+          {"role": "user", "content": "THE TASK"}]
+         + [{"role": "assistant", "content": "x" * 200} for _ in range(20)])
+    out = _trim_history(m, 500)
+    assert [x["content"] for x in out[:3]] == ["s" * 50, "intent" * 20, "THE TASK"]
+    assert len(out) < len(m)
+
+
+async def test_compact_keeps_the_task_behind_an_intent_block(cfg, mocker):
+    cfg.compact_keep_last = 3
+    mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(return_value={"content": "SUM"}))
+    history = ([{"role": "system", "content": "sys"}, {"role": "system", "content": "[Parsed intent]"},
+                {"role": "user", "content": "THE TASK"}]
+               + [{"role": "assistant", "content": f"step {i}"} for i in range(20)])
+    out = await _compact_messages(history, "model", cfg, mocker.Mock())
+    assert [m["content"] for m in out[:3]] == ["sys", "[Parsed intent]", "THE TASK"]
+    assert "SUM" in out[3]["content"]
+    assert out[-3:] == history[-3:]
+    assert len(out) == 3 + 1 + 3
+
+
+async def test_compact_with_keep_last_zero_summarizes_everything_after_the_head(cfg, mocker):
+    """messages[-0:] is the whole list, so a zero here used to duplicate the
+    entire history behind the summary instead of dropping it."""
+    cfg.compact_keep_last = 0
+    mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(return_value={"content": "SUM"}))
+    history = ([{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+               + [{"role": "assistant", "content": f"step {i}"} for i in range(10)])
+    out = await _compact_messages(history, "model", cfg, mocker.Mock())
+    assert len(out) == 3 and "SUM" in out[2]["content"]
+
+
+# ---------------- _approve: interrupt at the prompt ----------------
+
+@pytest.mark.parametrize("boom", [KeyboardInterrupt(), EOFError()])
+async def test_approve_treats_an_interrupted_prompt_as_denial(cfg, mocker, boom):
+    mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock(side_effect=boom))
+    assert await _approve("write_file", {}, cfg, mocker.AsyncMock()) is False

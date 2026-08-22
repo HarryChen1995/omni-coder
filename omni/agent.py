@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import time
 from contextlib import nullcontext
@@ -59,6 +58,8 @@ def _load_project_memory(project_root: str, memory_path: str) -> str:
 def _setup_logger(log_path: str) -> logging.Logger:
     logger = logging.getLogger("omni")
     logger.setLevel(logging.INFO)
+    for handler in logger.handlers:
+        handler.close()   # clear() alone drops the reference and leaks the open file
     logger.handlers.clear()
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
@@ -71,12 +72,19 @@ async def _approve(tool_name: str, args: dict, cfg: AgentConfig, client: MCPTool
         return True
     if cfg.auto_approve and not force_approval:
         return True
-    if _HAS_UI:
-        return await ui.request_approval(tool_name, args, client)
-    print(f"\n--- Approval needed: {tool_name} ---")
-    print(json.dumps(args, indent=2)[:2000])
-    answer = input("Proceed? [y/N] ").strip().lower()
-    return answer == "y"
+    # Both paths below read stdin synchronously, which blocks the event loop
+    # until answered — deliberate (approvals are serialized anyway), but it
+    # does mean a Ctrl+C typed at the prompt isn't acted on until the line is
+    # submitted. Treat an interrupt or EOF there as "no".
+    try:
+        if _HAS_UI:
+            return await ui.request_approval(tool_name, args, client)
+        print(f"\n--- Approval needed: {tool_name} ---")
+        print(json.dumps(args, indent=2)[:2000])
+        return input("Proceed? [y/N] ").strip().lower() == "y"
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
 
 
 def _find_json_objects(text: str) -> list:
@@ -113,14 +121,26 @@ def _find_json_objects(text: str) -> list:
     return objs
 
 
+# How much prose may surround recovered JSON tool calls before the message
+# is read as narration rather than as an attempted call (non-whitespace
+# characters). A lead-in like "Sure, reading that file now." stays under it.
+_MAX_RECOVERY_PROSE_CHARS = 200
+
+
 def _recover_text_tool_calls(content: str, tool_names: set) -> list:
     """Some models print a tool call as plain-text JSON (`{"name": ...,
     "arguments": {...}}`) instead of using the tool-calling API, which would
     otherwise look like a final answer and silently end the run without the
-    tool ever executing. Recover any such calls from `content`."""
+    tool ever executing. Recover any such calls from `content`.
+
+    Only when the message is essentially nothing *but* those objects: a
+    final summary that merely describes a call it already made ("then I sent
+    {"name": "write_file", ...}") must not be re-executed, so anything with
+    more than _MAX_RECOVERY_PROSE_CHARS of surrounding prose is left alone
+    and treated as the plain-text answer it looks like."""
     if not content or "{" not in content:
         return []
-    calls = []
+    calls, matched = [], []
     for raw in _find_json_objects(content):
         try:
             obj = json.loads(raw)
@@ -128,6 +148,7 @@ def _recover_text_tool_calls(content: str, tool_names: set) -> list:
             continue
         name, args = obj.get("name"), obj.get("arguments")
         if name in tool_names and isinstance(args, dict):
+            matched.append(raw)
             calls.append({
                 "id": f"fallback_{len(calls)}",
                 "type": "function",
@@ -136,7 +157,24 @@ def _recover_text_tool_calls(content: str, tool_names: set) -> list:
                     "arguments": json.dumps(args, ensure_ascii=False),
                 },
             })
+    if not calls:
+        return []
+    leftover = content
+    for raw in matched:
+        leftover = leftover.replace(raw, "", 1)
+    leftover = leftover.replace("```json", "").replace("```", "")
+    if len("".join(leftover.split())) > _MAX_RECOVERY_PROSE_CHARS:
+        return []
     return calls
+
+
+def _ensure_tool_call_ids(tool_calls: list, step: int) -> None:
+    """Give every tool call an id, in place, so each result message can name
+    the call it answers (see the tool_call_id note in _run_loop). Servers
+    normally supply one; a few OpenAI-compatible backends don't."""
+    for i, call in enumerate(tool_calls):
+        if isinstance(call, dict) and not call.get("id"):
+            call["id"] = f"call_{step}_{i}"
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -153,6 +191,21 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m {secs:02d}s"
 
 
+def _protected_head_len(messages: list) -> int:
+    """How many leading messages compaction must never touch: the whole
+    leading run of system messages plus the user task that follows them.
+
+    Not a fixed 2 — _run_loop inserts the parsed-intent block as a second
+    system message, which pushed the actual task to index 2 and made it
+    eligible for summarizing away, exactly the message that must survive."""
+    head = 0
+    while head < len(messages) and messages[head].get("role") == "system":
+        head += 1
+    if head < len(messages) and messages[head].get("role") == "user":
+        head += 1
+    return head
+
+
 def _trim_history(messages: list, budget: int) -> list:
     """Keep the system + user task message plus the most recent turns
     within a rough character budget. Crude but effective without pulling
@@ -161,7 +214,8 @@ def _trim_history(messages: list, budget: int) -> list:
     total = sum(len(str(m.get("content", ""))) for m in messages)
     if total <= budget:
         return messages
-    head, tail = messages[:2], messages[2:]
+    head_len = _protected_head_len(messages)
+    head, tail = messages[:head_len], messages[head_len:]
     while tail and total > budget:
         removed = tail.pop(0)
         total -= len(str(removed.get("content", "")))
@@ -200,11 +254,14 @@ async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger
     messages verbatim. Returns `messages` unchanged if there's nothing worth
     compacting (short history, or no middle to summarize). Falls back to the
     crude drop-oldest trim (_trim_history) if the summarization call fails."""
-    keep_last = cfg.compact_keep_last
-    if len(messages) <= 2 + keep_last:
+    keep_last = max(cfg.compact_keep_last, 0)
+    head_len = _protected_head_len(messages)
+    if len(messages) <= head_len + keep_last:
         return messages
 
-    head, middle, tail = messages[:2], messages[2:-keep_last], messages[-keep_last:]
+    # keep_last=0 has to slice as "nothing", not messages[-0:] (everything).
+    tail = messages[-keep_last:] if keep_last else []
+    head, middle = messages[:head_len], messages[head_len:len(messages) - keep_last]
     if not middle:
         return messages
 
@@ -349,7 +406,8 @@ class CodingAgent:
                                       embedding_model=self.cfg.embedding_model or None,
                                       llm_host=self.cfg.llm_host or None,
                                       llm_api_key=self.cfg.llm_api_key or None,
-                                      mcp_log_path=self.cfg.mcp_log_path) as owned_client:
+                                      mcp_log_path=self.cfg.mcp_log_path,
+                                      builtin_env=self.cfg.tool_server_env()) as owned_client:
                 return await self._run_loop(task, session_id, messages, persisted, resuming, owned_client)
         except asyncio.CancelledError:
             # Ctrl+C during a turn. CancelledError derives from BaseException,
@@ -367,7 +425,16 @@ class CodingAgent:
         tool_schemas = await client.list_llm_tools()
         tool_names = {t["function"]["name"] for t in tool_schemas}
 
-        if not resuming and self.cfg.parse_intent:
+        # Every new instruction gets parsed, including later turns of an
+        # interactive session (which all arrive with resuming=True). Doing
+        # this only on turn 1 meant a "delete the migrations and force-push"
+        # typed at turn 5 was never risk-classified, so --auto-approve sailed
+        # straight past the one gate that exists for it.
+        if task and self.cfg.parse_intent:
+            # Re-evaluated per instruction rather than latched for the
+            # process: a high-risk turn must not leave every later turn
+            # prompting, and a low-risk turn 1 must not disarm turn 5.
+            self.force_approval = False
             intent_model = self.cfg.intent_model or self.cfg.model
             spinner = ui.thinking("Parsing intent…") if _HAS_UI else nullcontext()
             with spinner:
@@ -377,7 +444,15 @@ class CodingAgent:
 
             existing = {f: await client.file_exists(f) for f in intent.target_files}
             context_block = intent.as_context_block(existing)
-            messages.insert(1, {"role": "system", "content": context_block})
+            # Immediately before the instruction it describes — index 1 for a
+            # fresh session, just before the freshly appended task for a
+            # resumed one. Anything already persisted stays put, so the
+            # messages[persisted:] write-out below keeps DB order intact.
+            insert_at = max(
+                (i for i, m in enumerate(messages) if m.get("role") == "user"),
+                default=len(messages),
+            )
+            messages.insert(insert_at, {"role": "system", "content": context_block})
 
             if _HAS_UI:
                 ui.intent_panel(intent, existing)
@@ -400,9 +475,18 @@ class CodingAgent:
         for step in range(1, self.cfg.max_steps + 1):
             total_chars = sum(len(str(m.get("content", ""))) for m in messages)
             if total_chars > self.cfg.context_char_budget:
-                messages = await _compact_messages(
+                compacted = await _compact_messages(
                     messages, self.cfg.compact_model or self.cfg.model, self.cfg, self.logger,
                 )
+                if compacted is not messages:
+                    # Mirror the compaction into the store, the way the manual
+                    # /compact command does. Without this the DB keeps the full
+                    # pre-compaction history, so resuming this session reloads
+                    # everything that was just summarized away and blows the
+                    # budget again on the first turn.
+                    messages = compacted
+                    self.store.replace_messages(session_id, messages)
+                    persisted = len(messages)
             msg = await self._call_model(messages, tool_schemas)
 
             tool_calls = msg.get("tool_calls")
@@ -415,6 +499,9 @@ class CodingAgent:
                         f"[step {step}] model printed tool call as plain text; "
                         f"recovered {len(recovered)} call(s) via fallback parsing"
                     )
+
+            if tool_calls:
+                _ensure_tool_call_ids(tool_calls, step)
 
             messages.append(msg)
             self.store.append_message(session_id, persisted, msg)
@@ -441,7 +528,7 @@ class CodingAgent:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = None
-                calls.append({"name": name, "args": args, "raw": raw_args})
+                calls.append({"name": name, "args": args, "raw": raw_args, "id": call.get("id")})
 
             for c in calls:
                 if c["args"] is None:
@@ -543,7 +630,15 @@ class CodingAgent:
 
             for c in calls:
                 self.logger.info(f"[step {step}] {c['name']}({c['args']}) -> {str(c['result'])[:500]}")
-                messages.append({"role": "tool", "content": str(c["result"])})
+                # tool_call_id pairs this result with the call it answers.
+                # Required by the OpenAI chat-completions schema for role
+                # "tool": Ollama tolerates its absence, but a strict server
+                # (OpenAI, vLLM, OpenRouter) rejects the next request with a
+                # 400 the moment a run reaches its second step.
+                tool_msg = {"role": "tool", "content": str(c["result"])}
+                if c.get("id"):
+                    tool_msg["tool_call_id"] = c["id"]
+                messages.append(tool_msg)
                 self.store.append_message(session_id, persisted, messages[-1])
                 persisted += 1
 

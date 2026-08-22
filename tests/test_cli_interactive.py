@@ -123,12 +123,33 @@ def test_turn_value_error_is_reported_and_the_loop_survives(repl, capsys):
     assert "nope" in capsys.readouterr().err
 
 
+def test_turn_runtime_error_is_reported_and_the_loop_survives(repl, capsys):
+    """_call_model gives up with a RuntimeError when the LLM server is
+    unreachable; that used to unwind past the loop and end the REPL, taking
+    the MCP connections with it."""
+    agent_run = repl(["first", "second"],
+                     run_side_effect=[RuntimeError("Model call failed after 3 attempts"), "ok"])
+    assert agent_run.await_count == 2
+    assert "Model call failed" in capsys.readouterr().err
+
+
+
 def test_cancelled_turn_keeps_the_repl_alive(repl, mocker):
     interrupted = mocker.patch("omni.ui.interrupted")
     agent_run = repl(["long task", "next task"],
                      run_side_effect=[asyncio.CancelledError(), "done"])
     interrupted.assert_called_once()
     assert agent_run.await_count == 2
+
+
+def test_the_repl_client_carries_the_tool_side_config(repl, cfg):
+    """The built-in server is a subprocess; its shell timeout, truncation
+    limit, memory file and denylist only reach it through this env."""
+    repl([])
+    env = cli_mod.MCPToolClient.call_args.kwargs["builtin_env"]
+    assert env["AGENT_PROJECT_ROOT"] == cfg.project_root
+    assert env["AGENT_SHELL_TIMEOUT_S"] == str(cfg.shell_timeout_s)
+    assert env["AGENT_MEMORY_PATH"] == cfg.memory_path
 
 
 # ---------------- /sessions, /delete, /compact ----------------

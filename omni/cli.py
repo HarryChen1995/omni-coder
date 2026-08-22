@@ -92,6 +92,12 @@ def main(
              "local model — that's usually a client-side timeout, not the server being unreachable.",
     ),
     max_steps: int = typer.Option(100, "--max-steps", help="Hard cap on agent loop iterations"),
+    safe_tool: List[str] = typer.Option(
+        [], "--safe-tool",
+        help="Auto-approve one extra tool, named as the model sees it (a custom server's "
+             'tools are namespaced, e.g. "docs__search"). Repeatable. The built-in read-only '
+             "tools are auto-approved already; everything else prompts unless --auto-approve.",
+    ),
     auto_approve: bool = typer.Option(
         False, "--auto-approve",
         help="Skip human approval for write/edit/shell tools. Only use in an "
@@ -174,7 +180,8 @@ def main(
     ),
     defer: bool = typer.Option(
         False, "--defer",
-        help="With --add-mcp-server: don't expose this server's tools to the model up front. "
+        help="With --add-mcp-server or --mcp-server: don't expose this server's tools to the "
+             "model up front. "
              "Instead a search_tools tool is offered; the model calls it with a query to load "
              "matching tools on demand, keeping unused tool schemas out of context. Default: false "
              '(equivalent to appending ",defer" to the --add-mcp-server / --mcp-server spec).',
@@ -246,6 +253,15 @@ def main(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
 
+    if defer:
+        # --defer used to be honored only by --add-mcp-server (handled above,
+        # which exits), so pairing it with --mcp-server silently did nothing.
+        for spec in extra_mcp_servers.values():
+            spec["defer"] = True
+        if not extra_mcp_servers:
+            typer.echo("Warning: --defer had no effect — it applies to a server registered with "
+                       "--add-mcp-server or passed with --mcp-server.", err=True)
+
     # Explicit --mcp-config wins; otherwise auto-load the global registry
     # (~/.omni-coder/omni-coder-settings.json) if it exists, so servers added once via
     # --add-mcp-server are available on every run without any flags.
@@ -271,7 +287,8 @@ def main(
         db_path=db_path,
         mcp_config_path=effective_mcp_config_path,
         mcp_servers=extra_mcp_servers,
-        # None (flag omitted) -> AgentConfig's own default ("nomic-embed-text");
+        safe_tools=AgentConfig.safe_tools + tuple(safe_tool),
+        # None (flag omitted) -> AgentConfig's own default ("nomic-local");
         # "" (--embedding-model "" explicitly) -> disabled.
         embedding_model=embedding_model if embedding_model is not None else AgentConfig.embedding_model,
     )
@@ -286,7 +303,10 @@ def main(
     agent = CodingAgent(cfg)
     try:
         result = asyncio.run(agent.run(task, resume_session_id=resume, session_name=session_name))
-    except ValueError as e:
+    except (ValueError, RuntimeError, LLMError) as e:
+        # RuntimeError is what _call_model raises once its retries are spent
+        # — i.e. "the LLM server is down", by far the most common failure
+        # here. It deserves one line, not a stack trace.
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
 
@@ -374,7 +394,8 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                               embedding_model=cfg.embedding_model or None,
                               llm_host=cfg.llm_host or None,
                               llm_api_key=cfg.llm_api_key or None,
-                              mcp_log_path=cfg.mcp_log_path) as client:
+                              mcp_log_path=cfg.mcp_log_path,
+                              builtin_env=cfg.tool_server_env()) as client:
         await client.list_llm_tools()  # populate tool counts for /mcp before any task runs
         for e in client.server_status():
             if not e["connected"]:
@@ -516,10 +537,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         typer.echo(f"--- {target} ---\n{content}")
                     continue
                 if task == "/btw" or task.startswith("/btw "):
-                    # Also handled inline while a task is running (the
-                    # side-reader loop below) — this covers /btw typed at
-                    # the idle top-level prompt, which used to fall through
-                    # and get submitted as a literal task to the agent.
+                    # A one-off question at the idle prompt: answered by its
+                    # own stateless chat() call, never submitted to the agent
+                    # as a task and never added to this session's history.
                     question = task[len("/btw"):].strip()
                     if question:
                         await _handle_btw(cfg, question)
@@ -615,7 +635,15 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     except ImportError:
                         typer.echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
                     continue
-                except ValueError as e:
+                except (ValueError, RuntimeError, LLMError) as e:
+                    # A turn failing (bad session id, or _call_model giving up
+                    # after its retries because the LLM server is unreachable)
+                    # used to unwind past this loop and end the whole REPL —
+                    # dropping the MCP connections and the session over what
+                    # is usually a transient hiccup. Report it and stay put;
+                    # session_id is carried forward so a retry continues the
+                    # same conversation.
+                    session_id = agent.session_id or session_id
                     typer.echo(f"Error: {e}", err=True)
                     continue
                 finally:

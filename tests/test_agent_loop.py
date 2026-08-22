@@ -312,7 +312,9 @@ async def test_high_risk_intent_forces_approval(agent, client, mocker):
     approval.assert_awaited()          # prompted despite --auto-approve
 
 
-async def test_intent_parsing_is_skipped_on_resume(agent, client, mocker):
+async def test_intent_is_parsed_for_every_new_instruction(agent, client, mocker):
+    """Including later turns of an interactive session, which all arrive as
+    resumes — that's where high-risk detection used to go dark."""
     agent.cfg.parse_intent = True
     from omni.intent import Intent
     extract = mocker.patch.object(agent_mod, "extract_intent",
@@ -323,7 +325,20 @@ async def test_intent_parsing_is_skipped_on_resume(agent, client, mocker):
     assert extract.await_count == 1
     replies(mocker, text_reply("b"))
     await agent.run("second", resume_session_id=agent.session_id, client=client)
-    assert extract.await_count == 1    # not re-parsed
+    assert extract.await_count == 2
+
+
+async def test_intent_parsing_is_skipped_when_resuming_with_no_new_task(agent, client, mocker):
+    agent.cfg.parse_intent = True
+    from omni.intent import Intent
+    extract = mocker.patch.object(agent_mod, "extract_intent",
+                                  mocker.AsyncMock(return_value=Intent()))
+    mocker.patch.object(agent_mod.ui, "intent_panel")
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client)
+    replies(mocker, text_reply("b"))
+    await agent.run("", resume_session_id=agent.session_id, client=client)
+    assert extract.await_count == 1    # nothing new to parse
 
 
 # ---------------- budget / compaction / limits ----------------
@@ -386,8 +401,10 @@ async def test_cancellation_marks_session_interrupted(agent, client, mocker):
 async def test_compact_history_persists_the_shrunk_history(agent, mocker):
     agent.cfg.compact_keep_last = 2
     sid = agent.store.create_session("/p", "m", "t")
-    for i in range(20):
-        agent.store.append_message(sid, i, {"role": "user", "content": f"m{i}"})
+    agent.store.append_message(sid, 0, {"role": "system", "content": "sys"})
+    agent.store.append_message(sid, 1, {"role": "user", "content": "the task"})
+    for i in range(18):
+        agent.store.append_message(sid, i + 2, {"role": "user", "content": f"m{i}"})
     mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(return_value={"content": "BRIEFING"}))
     mocker.patch.object(agent_mod.ui, "compacted")
 
@@ -395,6 +412,8 @@ async def test_compact_history_persists_the_shrunk_history(agent, mocker):
     assert "Compacted 20 messages down to 5" in out
     reloaded = agent.store.load_messages(sid)
     assert len(reloaded) == 5 and "BRIEFING" in reloaded[2]["content"]
+    # system prompt + the task itself are the protected head
+    assert [m["content"] for m in reloaded[:2]] == ["sys", "the task"]
 
 
 async def test_compact_history_noop_for_short_history(agent, mocker):
@@ -402,3 +421,141 @@ async def test_compact_history_noop_for_short_history(agent, mocker):
     agent.store.append_message(sid, 0, {"role": "user", "content": "x"})
     assert "Nothing to compact" in await agent.compact_history(sid)
     assert len(agent.store.load_messages(sid)) == 1
+
+
+# ---------------- tool_call_id pairing ----------------
+
+def tool_reply_without_ids(*names):
+    """Some OpenAI-compatible servers hand back tool calls with no id."""
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"type": "function", "function": {"name": n, "arguments": "{}"}} for n in names]}
+
+
+def sent_pairs(snapshot):
+    """(assistant tool_call ids, tool-result tool_call_ids) from one snapshot
+    of the messages list as it was handed to chat()."""
+    call_ids = [c["id"] for m in snapshot if m.get("tool_calls") for c in m["tool_calls"]]
+    result_ids = [m.get("tool_call_id") for m in snapshot if m["role"] == "tool"]
+    return call_ids, result_ids
+
+
+async def test_tool_results_name_the_call_they_answer(agent, client, mocker):
+    """role="tool" without tool_call_id is rejected outright by a strict
+    OpenAI-compatible server (vLLM, OpenAI, OpenRouter) — Ollama's tolerance
+    was the only reason multi-step runs worked."""
+    m = replies(mocker, tool_reply(("read_file", '{"path": "a"}')), text_reply("done"))
+    await agent.run("t", client=client)
+    call_ids, result_ids = sent_pairs(m.sent[1])
+    assert call_ids == result_ids == ["c0"]
+
+
+async def test_every_parallel_call_gets_its_own_pairing(agent, client, mocker):
+    m = replies(mocker,
+                tool_reply(("read_file", '{"path": "a"}'), ("list_dir", '{"path": "."}')),
+                text_reply("done"))
+    await agent.run("t", client=client)
+    call_ids, result_ids = sent_pairs(m.sent[1])
+    assert call_ids == result_ids == ["c0", "c1"]
+
+
+async def test_ids_are_synthesized_when_the_server_omits_them(agent, client, mocker):
+    m = replies(mocker, tool_reply_without_ids("read_file", "list_dir"), text_reply("done"))
+    await agent.run("t", client=client)
+    call_ids, result_ids = sent_pairs(m.sent[1])
+    assert call_ids == result_ids == ["call_1_0", "call_1_1"]
+
+
+async def test_a_malformed_call_still_gets_a_paired_result(agent, client, mocker):
+    """The error report goes back as a tool message like any other result, so
+    it needs the id too or the whole request is rejected."""
+    m = replies(mocker, tool_reply(("read_file", "{not json")), text_reply("done"))
+    await agent.run("t", client=client)
+    call_ids, result_ids = sent_pairs(m.sent[1])
+    assert call_ids == result_ids == ["c0"]
+    assert "malformed arguments" in [x for x in m.sent[1] if x["role"] == "tool"][0]["content"]
+
+
+async def test_recovered_text_tool_calls_are_paired_too(agent, client, mocker):
+    m = replies(mocker,
+                text_reply('{"name": "read_file", "arguments": {"path": "a"}}'),
+                text_reply("done"))
+    await agent.run("t", client=client)
+    call_ids, result_ids = sent_pairs(m.sent[1])
+    assert call_ids == result_ids == ["fallback_0"]
+
+
+async def test_tool_call_ids_survive_a_resume(agent, client, mocker):
+    replies(mocker, tool_reply(("read_file", '{"path": "a"}')), text_reply("a"))
+    await agent.run("first", client=client)
+    m = replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id=agent.session_id, client=client)
+    call_ids, result_ids = sent_pairs(m.sent[0])
+    assert call_ids == result_ids == ["c0"]
+
+
+# ---------------- per-turn intent / force_approval ----------------
+
+async def test_force_approval_is_re_evaluated_every_turn(agent, client, mocker):
+    """Latched for the process, one high-risk turn made every later turn
+    prompt — and a low-risk turn 1 left a high-risk turn 5 ungated."""
+    from omni.intent import Intent
+    agent.cfg.parse_intent = True
+    mocker.patch.object(agent_mod.ui, "intent_panel")
+    mocker.patch.object(agent_mod.ui, "high_risk_warning")
+    mocker.patch.object(agent_mod, "extract_intent", mocker.AsyncMock(
+        side_effect=[Intent(risk_level="high"), Intent(risk_level="low")]))
+
+    replies(mocker, text_reply("a"))
+    await agent.run("drop the tables", client=client)
+    assert agent.force_approval is True
+
+    replies(mocker, text_reply("b"))
+    await agent.run("add a docstring", resume_session_id=agent.session_id, client=client)
+    assert agent.force_approval is False
+
+
+async def test_intent_block_is_inserted_before_the_new_instruction(agent, client, mocker):
+    from omni.intent import Intent
+    agent.cfg.parse_intent = True
+    mocker.patch.object(agent_mod.ui, "intent_panel")
+    mocker.patch.object(agent_mod, "extract_intent",
+                        mocker.AsyncMock(return_value=Intent(summary="parsed")))
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client)
+    replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id=agent.session_id, client=client)
+
+    stored = agent.store.load_messages(agent.session_id)
+    # Turn 1's messages keep their positions; the new block lands directly
+    # before the instruction it describes rather than at index 1, ahead of
+    # history that was already written out.
+    assert [m["role"] for m in stored[:4]] == ["system", "system", "user", "assistant"]
+    at = next(i for i, m in enumerate(stored) if m["content"] == "second")
+    assert stored[at]["role"] == "user"
+    assert stored[at - 1]["role"] == "system" and "Parsed intent" in stored[at - 1]["content"]
+
+
+# ---------------- automatic compaction is persisted ----------------
+
+async def test_automatic_compaction_is_written_back_to_the_store(agent, client, mocker):
+    """Otherwise the DB keeps the full pre-compaction history and resuming
+    reloads everything that was just summarized away."""
+    agent.cfg.context_char_budget = 10
+    mocker.patch.object(agent_mod, "_compact_messages", mocker.AsyncMock(
+        side_effect=lambda msgs, *a: [msgs[0], {"role": "system", "content": "BRIEFING"}]))
+    replies(mocker, text_reply("fin"))
+    await agent.run("a task long enough to exceed the tiny budget", client=client)
+
+    stored = agent.store.load_messages(agent.session_id)
+    assert [m["content"] for m in stored[1:]] == ["BRIEFING", "fin"]
+    assert len(stored) == 3   # renumbered from scratch, not appended after the old rows
+
+
+async def test_a_no_op_compaction_leaves_the_store_alone(agent, client, mocker):
+    agent.cfg.context_char_budget = 10
+    mocker.patch.object(agent_mod, "_compact_messages",
+                        mocker.AsyncMock(side_effect=lambda msgs, *a: msgs))
+    replace = mocker.spy(agent.store, "replace_messages")
+    replies(mocker, text_reply("fin"))
+    await agent.run("a task long enough to exceed the tiny budget", client=client)
+    replace.assert_not_called()

@@ -1,6 +1,9 @@
 """SessionStore — real SQLite against a tmp_path file (the DB *is* the unit
 under test here, so mocking it would assert nothing)."""
 
+import sqlite3
+from contextlib import closing
+
 import pytest
 
 from omni.session_store import SessionStore, _now
@@ -169,3 +172,73 @@ def test_list_sessions_exposes_expected_columns(store):
     assert {"id", "created_at", "updated_at", "project_root",
             "model", "task", "status", "summary", "name"} <= set(row)
     assert row["project_root"] == "/proj" and row["model"] == "qwen"
+
+
+# ---------------- tool_call_id ----------------
+
+def test_tool_call_id_round_trips(store):
+    """A tool result has to name the call it answers, or replaying a resumed
+    history sends role="tool" messages a strict OpenAI-compatible server
+    rejects with a 400."""
+    sid = store.create_session("/p", "m", "t")
+    store.append_message(sid, 0, {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1_0", "type": "function",
+         "function": {"name": "read_file", "arguments": "{}"}}]})
+    store.append_message(sid, 1, {"role": "tool", "content": "file body", "tool_call_id": "call_1_0"})
+
+    loaded = store.load_messages(sid)
+    assert loaded[0]["tool_calls"][0]["id"] == "call_1_0"
+    assert loaded[1]["tool_call_id"] == "call_1_0"
+
+
+def test_messages_without_a_tool_call_id_stay_clean(store):
+    sid = store.create_session("/p", "m", "t")
+    store.append_message(sid, 0, {"role": "user", "content": "hi"})
+    assert "tool_call_id" not in store.load_messages(sid)[0]
+
+
+def test_replace_messages_preserves_tool_call_ids(store):
+    sid = store.create_session("/p", "m", "t")
+    store.replace_messages(sid, [
+        {"role": "system", "content": "s"},
+        {"role": "tool", "content": "out", "tool_call_id": "abc"},
+    ])
+    assert store.load_messages(sid)[1]["tool_call_id"] == "abc"
+
+
+def test_pre_existing_db_without_the_column_is_migrated(tmp_path):
+    """Opening a database written by an older version must add the column
+    rather than fail every read — same contract as the earlier `name` column."""
+    path = str(tmp_path / "old.db")
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, "
+                     "updated_at TEXT NOT NULL, project_root TEXT NOT NULL, model TEXT NOT NULL, "
+                     "task TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', summary TEXT)")
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, "
+                     "content TEXT, tool_calls TEXT, created_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO sessions VALUES ('old1', 'x', 'x', '/p', 'm', 't', 'done', 's')")
+        conn.execute("INSERT INTO messages VALUES (1, 'old1', 0, 'user', 'legacy', NULL, 'x')")
+        conn.commit()
+
+    store = SessionStore(path)
+    assert store.load_messages("old1") == [{"role": "user", "content": "legacy"}]
+    store.append_message("old1", 1, {"role": "tool", "content": "new", "tool_call_id": "zzz"})
+    assert store.load_messages("old1")[1]["tool_call_id"] == "zzz"
+
+
+def test_writes_are_committed_not_just_left_open(tmp_path):
+    """_connect() closes rather than commits, so every writer commits itself —
+    a missed commit would silently discard the write on close."""
+    path = str(tmp_path / "s.db")
+    sid = SessionStore(path).create_session("/p", "m", "t", name="nm")
+    store = SessionStore(path)
+    store.append_message(sid, 0, {"role": "user", "content": "persisted?"})
+    store.finish_session(sid, "done", "summary")
+
+    fresh = SessionStore(path)   # separate connection: only committed data is visible
+    assert fresh.resolve_session_id("nm") == sid
+    assert fresh.load_messages(sid) == [{"role": "user", "content": "persisted?"}]
+    assert fresh.list_sessions()[0]["status"] == "done"
+    assert fresh.delete_session(sid) is True
+    assert SessionStore(path).session_exists(sid) is False

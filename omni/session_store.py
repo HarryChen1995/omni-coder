@@ -6,6 +6,7 @@ history, so a run can be resumed later (`--resume <id>`) or browsed
 import json
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 
 
@@ -13,10 +14,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
+def _connect(db_path: str):
+    """`with _connect(path) as conn:` closes the connection on the way out.
+
+    sqlite3's own connection context manager commits but never closes, so
+    every call here used to leave the handle for the garbage collector (a
+    pile of "unclosed database" ResourceWarnings under -W default). Closing
+    instead of committing means each writer below commits explicitly."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    return conn
+    return closing(conn)
 
 
 class SessionStore:
@@ -48,6 +55,7 @@ class SessionStore:
                     role TEXT NOT NULL,
                     content TEXT,
                     tool_calls TEXT,
+                    tool_call_id TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
@@ -55,6 +63,14 @@ class SessionStore:
             if "name" not in existing_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN name TEXT")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name)")
+            message_cols = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "tool_call_id" not in message_cols:
+                # Added after the fact: a tool result has to name the call it
+                # answers when the history is replayed to the model, or a
+                # resumed session sends role="tool" messages a strict
+                # OpenAI-compatible server rejects.
+                conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT")
+            conn.commit()
 
     def create_session(self, project_root: str, model: str, task: str, name: str = None) -> str:
         session_id = uuid.uuid4().hex[:8]
@@ -66,6 +82,7 @@ class SessionStore:
                     "VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
                     (session_id, now, now, project_root, model, task, name),
                 )
+                conn.commit()
         except sqlite3.IntegrityError:
             raise ValueError(f"Session name {name!r} is already in use — pick another with --session-name.")
         return session_id
@@ -87,7 +104,8 @@ class SessionStore:
     def load_messages(self, session_id: str) -> list:
         with _connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT role, content, tool_calls FROM messages WHERE session_id = ? ORDER BY seq",
+                "SELECT role, content, tool_calls, tool_call_id FROM messages "
+                "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
         messages = []
@@ -95,6 +113,8 @@ class SessionStore:
             msg = {"role": row["role"], "content": row["content"]}
             if row["tool_calls"]:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
+            if row["tool_call_id"]:
+                msg["tool_call_id"] = row["tool_call_id"]
             messages.append(msg)
         return messages
 
@@ -103,14 +123,16 @@ class SessionStore:
         now = _now()
         with _connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO messages (session_id, seq, role, content, tool_calls, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id, seq, message.get("role", ""), message.get("content"),
-                    json.dumps(tool_calls) if tool_calls else None, now,
+                    json.dumps(tool_calls) if tool_calls else None,
+                    message.get("tool_call_id"), now,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
+            conn.commit()
 
     def replace_messages(self, session_id: str, messages: list) -> None:
         """Overwrite a session's full message history (used by /compact):
@@ -123,14 +145,16 @@ class SessionStore:
             for seq, message in enumerate(messages):
                 tool_calls = message.get("tool_calls")
                 conn.execute(
-                    "INSERT INTO messages (session_id, seq, role, content, tool_calls, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_id, seq, message.get("role", ""), message.get("content"),
-                        json.dumps(tool_calls) if tool_calls else None, now,
+                        json.dumps(tool_calls) if tool_calls else None,
+                        message.get("tool_call_id"), now,
                     ),
                 )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
+            conn.commit()
 
     def finish_session(self, session_id: str, status: str, summary: str) -> None:
         with _connect(self.db_path) as conn:
@@ -138,6 +162,7 @@ class SessionStore:
                 "UPDATE sessions SET status = ?, summary = ?, updated_at = ? WHERE id = ?",
                 (status, summary, _now(), session_id),
             )
+            conn.commit()
 
     def delete_session(self, id_or_name: str) -> bool:
         """Delete a session and its full message history. Returns False if
@@ -149,6 +174,7 @@ class SessionStore:
         with _connect(self.db_path) as conn:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
         return True
 
     def list_sessions(self, limit: int = 20) -> list:

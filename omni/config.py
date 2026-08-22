@@ -1,5 +1,7 @@
 """Configuration for the coding agent."""
 
+import json
+import os
 from dataclasses import dataclass, field
 
 
@@ -80,7 +82,67 @@ class AgentConfig:
     embedding_model: str = "nomic-local"
 
     # Commands the agent is never allowed to run, regardless of approval.
+    # A footgun guard, NOT a security boundary — plain substring matching,
+    # trivially sidestepped by a variant spelling (see Tools.run_shell).
+    # Real isolation has to come from the OS (container/VM).
     denied_shell_patterns: tuple = field(default_factory=lambda: (
         "rm -rf /", "rm -rf /*", ":(){ :|:& };:", "mkfs", "dd if=",
         "> /dev/sda", "shutdown", "reboot", "sudo ", "curl | sh", "wget | sh",
     ))
+
+    # ---- tool-side knobs -> built-in MCP server subprocess ----
+    #
+    # The tools themselves run inside the built-in MCP server, a separate
+    # process (see mcp_server.py). Anything below that governs tool
+    # behaviour rather than the agent loop — the shell timeout, output
+    # truncation, the memory file, the shell denylist — therefore has to be
+    # handed across that process boundary explicitly, or the server falls
+    # back to these defaults and silently ignores whatever the caller
+    # configured. These two methods are the one place that mapping lives.
+
+    def tool_server_env(self) -> dict:
+        """Env vars carrying the tool-side knobs to the built-in server."""
+        return {
+            "AGENT_PROJECT_ROOT": self.project_root,
+            "AGENT_SHELL_TIMEOUT_S": str(self.shell_timeout_s),
+            "AGENT_MAX_OUTPUT_CHARS": str(self.max_output_chars),
+            "AGENT_MEMORY_PATH": self.memory_path,
+            "AGENT_DENIED_SHELL_PATTERNS": json.dumps(list(self.denied_shell_patterns)),
+        }
+
+    @classmethod
+    def from_tool_server_env(cls, env: dict = None) -> "AgentConfig":
+        """Rebuild the tool-relevant slice of a config inside the built-in
+        server process, from what tool_server_env() exported. Every field
+        falls back to this class's default if the variable is missing or
+        unparseable — a malformed value must not stop the server from
+        starting, and the defaults are the same ones the agent assumes."""
+        env = os.environ if env is None else env
+        defaults = cls()
+
+        def _num(name, cast, default):
+            raw = env.get(name)
+            if raw is None:
+                return default
+            try:
+                return cast(raw)
+            except (TypeError, ValueError):
+                return default
+
+        denied = defaults.denied_shell_patterns
+        raw_denied = env.get("AGENT_DENIED_SHELL_PATTERNS")
+        if raw_denied is not None:
+            try:
+                parsed = json.loads(raw_denied)
+                if isinstance(parsed, list):
+                    denied = tuple(str(x) for x in parsed)
+            except json.JSONDecodeError:
+                pass
+
+        return cls(
+            project_root=env.get("AGENT_PROJECT_ROOT", defaults.project_root),
+            shell_timeout_s=_num("AGENT_SHELL_TIMEOUT_S", lambda v: int(float(v)), defaults.shell_timeout_s),
+            max_output_chars=_num("AGENT_MAX_OUTPUT_CHARS", int, defaults.max_output_chars),
+            memory_path=env.get("AGENT_MEMORY_PATH", defaults.memory_path),
+            denied_shell_patterns=denied,
+        )
