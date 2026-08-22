@@ -468,6 +468,80 @@ async def test_server_status_reports_connected_and_failed(client, mocker):
     assert by_name["dead"]["connected_for"] is None
 
 
+async def test_server_tools_lists_one_servers_tools(client, mocker):
+    client._server_specs["docs"] = {"command": "x"}
+    client._sessions["docs"] = fake_session(mocker, [tool("search", "Search the docs")])
+    (entry,) = await client.server_tools("docs")
+    assert entry["name"] == "docs__search"          # as the model calls it
+    assert entry["real_name"] == "search"           # as it goes on the wire
+    assert entry["description"] == "Search the docs"
+    assert entry["deferred"] is False and entry["revealed"] is False
+    assert entry["internal"] is False
+
+
+async def test_server_tools_flags_builtin_internal_tools(client, mocker):
+    """Underscore built-ins are filtered out of what the model sees, so the
+    listing has to say so rather than implying they're callable."""
+    client._server_specs[_BUILTIN] = {}
+    client._sessions[_BUILTIN] = fake_session(
+        mocker, [tool("read_file"), tool("_preview_edit")])
+    by_name = {t["name"]: t for t in await client.server_tools("built-in")}
+    assert by_name["read_file"]["internal"] is False
+    assert by_name["_preview_edit"]["internal"] is True
+
+
+async def test_server_tools_marks_deferred_and_revealed(client, mocker):
+    client._server_specs["docs"] = {"command": "x", "defer": True}
+    client._sessions["docs"] = fake_session(mocker, [tool("a"), tool("b")])
+    client._deferred_servers.add("docs")
+    await client.list_llm_tools()
+    by_name = {t["name"]: t for t in await client.server_tools("docs")}
+    assert by_name["docs__a"]["deferred"] is True
+
+    await client.search_mcp_tools("")               # reveal everything
+    await client.list_llm_tools()
+    by_name = {t["name"]: t for t in await client.server_tools("docs")}
+    assert by_name["docs__a"]["revealed"] is True and by_name["docs__a"]["deferred"] is False
+
+
+async def test_server_tools_reflects_the_live_server(client, mocker):
+    """Read from the server, not the cached routing map, so a restarted
+    server's new tools show up."""
+    client._server_specs["docs"] = {"command": "x"}
+    client._sessions["docs"] = fake_session(mocker, [tool("old")])
+    assert [t["real_name"] for t in await client.server_tools("docs")] == ["old"]
+
+    client._sessions["docs"] = fake_session(mocker, [tool("new"), tool("extra")])
+    assert [t["real_name"] for t in await client.server_tools("docs")] == ["new", "extra"]
+
+
+@pytest.mark.parametrize("alias", ["built-in", "builtin", _BUILTIN])
+async def test_server_tools_accepts_builtin_aliases(client, mocker, alias):
+    client._server_specs[_BUILTIN] = {}
+    client._sessions[_BUILTIN] = fake_session(mocker, [tool("read_file")])
+    assert len(await client.server_tools(alias)) == 1
+
+
+async def test_server_tools_unknown_server_lists_the_known_ones(client):
+    client._server_specs.update({_BUILTIN: {}, "docs": {}})
+    with pytest.raises(ValueError, match="built-in, docs"):
+        await client.server_tools("ghost")
+
+
+async def test_server_tools_unconnected_server_points_at_restart(client):
+    """Configured but failed to connect — the message must name the fix."""
+    client._server_specs["docs"] = {"command": "x"}
+    client._connect_errors["docs"] = "boom on startup"
+    with pytest.raises(ValueError, match="isn't connected.*boom on startup.*restart docs"):
+        await client.server_tools("docs")
+
+
+async def test_server_tools_empty_server(client, mocker):
+    client._server_specs["docs"] = {"command": "x"}
+    client._sessions["docs"] = fake_session(mocker, [])
+    assert await client.server_tools("docs") == []
+
+
 def test_server_names_puts_builtin_first(client):
     client._server_specs.update({_BUILTIN: {}, "z": {}, "a": {}})
     assert client.server_names() == ["built-in", "z", "a"]

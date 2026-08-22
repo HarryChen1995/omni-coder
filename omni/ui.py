@@ -498,6 +498,48 @@ def resource_content(uri: str, content: str):
     console.print(Panel(content or "(empty)", title=f"📖 {uri}", border_style=ACCENT, expand=False))
 
 
+def server_tools_table(server: str, tools: list):
+    """Table for `/mcp tools <name>` — one row per tool that server exposes.
+    `tools` is MCPToolClient.server_tools()'s list. The name column shows the
+    name the model calls (namespaced for custom servers); a "status" column
+    only appears when there's something worth saying, so the common case
+    stays a plain two-column list."""
+    if not tools:
+        console.print(f"[dim]{server} exposes no tools.[/dim]")
+        return
+
+    def status(t):
+        if t["internal"]:
+            return "[dim]internal[/dim]"
+        if t["deferred"]:
+            return "[yellow]deferred[/yellow]"
+        if t["revealed"]:
+            return f"[{ACCENT}]revealed[/{ACCENT}]"
+        return ""
+
+    interesting = any(status(t) for t in tools)
+    table = Table(title=f"Tools on {server}", expand=False)
+    table.add_column("tool", style=f"bold {ACCENT}")
+    if interesting:
+        table.add_column("status")
+    table.add_column("description")
+
+    for t in tools:
+        desc = t["description"].splitlines()[0] if t["description"] else ""
+        row = [f"{_emoji_for(t['name'])} {t['name']}"]
+        if interesting:
+            row.append(status(t))
+        row.append(desc[:80])
+        table.add_row(*row)
+
+    console.print(table)
+    shown = sum(1 for t in tools if not t["internal"] and not t["deferred"])
+    note = f"{shown} of {len(tools)} callable by the model right now"
+    if any(t["deferred"] for t in tools):
+        note += " — deferred ones load via search_tools"
+    console.print(f"[dim]{note}[/dim]")
+
+
 def mcp_status(entries: list):
     """Table for the /mcp REPL command — one row per configured MCP server
     (built-in + custom), whether or not it actually connected. `entries` is

@@ -397,6 +397,60 @@ def test_resource_content_empty(cap):
     assert "(empty)" in flat(cap)
 
 
+def tool_entry(name, description="", **flags):
+    base = {"name": name, "real_name": name.split("__")[-1], "description": description,
+            "deferred": False, "revealed": False, "internal": False}
+    base.update(flags)
+    return base
+
+
+def test_server_tools_table_lists_tools_with_emoji_and_description(cap):
+    ui.server_tools_table("built-in", [
+        tool_entry("read_file", "Read a file, optionally a line range."),
+        tool_entry("write_file", "Create a NEW file with content."),
+    ])
+    out = flat(cap)
+    assert "read_file" in out and "Read a file" in out
+    assert "🔍" in out and "📝" in out
+    assert "2 of 2 callable" in out
+
+
+def test_server_tools_table_omits_status_column_when_nothing_notable(cap):
+    ui.server_tools_table("docs", [tool_entry("docs__a", "does a")])
+    assert "status" not in flat(cap)
+
+
+def test_server_tools_table_shows_deferred_and_revealed(cap):
+    ui.server_tools_table("docs", [
+        tool_entry("docs__a", "hidden one", deferred=True),
+        tool_entry("docs__b", "surfaced one", revealed=True),
+    ])
+    out = flat(cap)
+    assert "deferred" in out and "revealed" in out
+    assert "1 of 2 callable" in out
+    assert "search_tools" in out          # explains how deferred ones load
+
+
+def test_server_tools_table_flags_internal_tools(cap):
+    ui.server_tools_table("built-in", [
+        tool_entry("read_file", "public"),
+        tool_entry("_preview_edit", "internal helper", internal=True),
+    ])
+    out = flat(cap)
+    assert "internal" in out and "1 of 2 callable" in out
+
+
+def test_server_tools_table_uses_only_the_first_description_line(cap):
+    ui.server_tools_table("d", [tool_entry("d__a", "first line\nsecond line")])
+    out = flat(cap)
+    assert "first line" in out and "second line" not in out
+
+
+def test_server_tools_table_empty(cap):
+    ui.server_tools_table("docs", [])
+    assert "no tools" in flat(cap)
+
+
 def test_mcp_status_shows_connected_and_failed(cap):
     ui.mcp_status([
         {"name": "built-in", "connected": True, "connected_for": 12.0, "error": None,

@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-634%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-662%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -74,6 +74,9 @@ Run `omni --help` for the full option list.
   one per run (`--mcp-server`/`--mcp-config`). One server failing to
   connect doesn't take down the session — check `/mcp` for live ✅/❌
   status per server, and `--mcp-log-path` for their stderr output.
+- **Inspect a server's tools** — `/mcp tools <name>` lists what one server
+  exposes (the name the model calls each by, plus its description), flagging
+  tools that are `deferred`, `revealed`, or `internal`.
 - **Hot-restart a server you're editing** — `/mcp restart <name>` (or
   `all`) reconnects just that server without leaving the REPL, picking up
   code *and* config changes and re-listing its tools/prompts/resources. Also
@@ -185,7 +188,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-634 tests, 95% branch coverage — hermetic (no model, server, or network
+662 tests, 95% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

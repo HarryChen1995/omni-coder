@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-634%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-662%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -174,6 +174,12 @@ MCP prompt exposed by a connected server. Special inputs:
   and command/URL (or the connection error, for a ❌ one). A custom server
   failing to connect no longer aborts startup — it just shows ❌ here
   instead of the whole session refusing to start
+- `/mcp tools <name>` — list the tools one server exposes, with the name the
+  model calls each by and its description. Flags anything the model *can't*
+  currently call: `deferred` (held back until `search_tools` loads it),
+  `revealed` (a deferred tool since surfaced), and `internal` (the built-in
+  `_preview_*` helpers the agent uses for approval previews). Re-read from
+  the server each time, so it reflects a server you just restarted
 - `/mcp restart <name>` — reconnect one server (`/mcp restart all` for every
   one) after editing its code, without leaving the REPL. Also how you retry
   a ❌ server once you've fixed it. It re-reads that server's spec from the
@@ -429,6 +435,21 @@ global registry.
 
 ### Iterating on a server you're writing
 
+Check what a server is actually serving with `/mcp tools <name>`:
+```
+❯ /mcp tools docs
+                            Tools on docs
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ tool             ┃ status   ┃ description                                    ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 🪄 docs__search  │ revealed │ Search the documentation index for a phrase.   │
+│ 🪄 docs__publish │ deferred │ Publish the docs site to a target environment. │
+└──────────────────┴──────────┴────────────────────────────────────────────────┘
+1 of 2 callable by the model right now — deferred ones load via search_tools
+```
+The `status` column only appears when there's something to report, so a
+plain server just lists its tools and descriptions.
+
 Editing an MCP server used to mean restarting the whole session to pick up
 the change. From the REPL, reconnect just that server instead:
 ```
@@ -575,7 +596,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-634 tests, 95% branch coverage. Install the dev extra and run them:
+662 tests, 95% branch coverage. Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
 pytest                          # whole suite

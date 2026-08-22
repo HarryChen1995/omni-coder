@@ -639,6 +639,47 @@ class MCPToolClient:
         first), for `/mcp restart <name>` completion."""
         return ["built-in"] + [n for n in self._server_specs if n != _BUILTIN]
 
+    async def server_tools(self, name: str) -> list:
+        """The tools one server currently exposes, for `/mcp tools <name>`.
+
+        Re-listed from the server rather than read out of the cached
+        _tool_owner map, so it reflects what the server is serving right now
+        (including after an edit + `/mcp restart`) and carries the
+        descriptions the model sees, which the routing map doesn't keep.
+
+        Each entry: {name (as the model calls it), real_name (on the wire),
+        description, deferred (held back from the model's tool list),
+        revealed (a deferred tool search_tools has since surfaced),
+        internal (a built-in underscore tool the model never sees)}.
+
+        Raises ValueError for an unknown or unconnected server — the latter
+        naming the restart command, since that's the fix."""
+        key = _BUILTIN if name in (_BUILTIN, "built-in", "builtin") else name
+        if key not in self._server_specs:
+            known = ["built-in"] + [n for n in self._server_specs if n != _BUILTIN]
+            raise ValueError(f"Unknown MCP server {name!r} — configured: {', '.join(known)}")
+        if key not in self._sessions:
+            raise ValueError(
+                f"MCP server {name!r} isn't connected"
+                f"{f' ({self._connect_errors[key]})' if key in self._connect_errors else ''}"
+                f" — fix it, then /mcp restart {name}"
+            )
+
+        result = await self._sessions[key].list_tools()
+        tools = []
+        for tool in result.tools:
+            internal = key == _BUILTIN and tool.name.startswith("_")
+            exposed_name = tool.name if key == _BUILTIN else f"{key}__{tool.name}"
+            tools.append({
+                "name": exposed_name,
+                "real_name": tool.name,
+                "description": (tool.description or "").strip(),
+                "deferred": exposed_name in self._deferred_tools,
+                "revealed": key in self._deferred_servers and exposed_name in self._revealed,
+                "internal": internal,
+            })
+        return tools
+
     def server_status(self) -> list:
         """One entry per configured server (built-in + every custom one),
         regardless of whether it actually connected, for the /mcp REPL

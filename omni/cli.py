@@ -61,6 +61,7 @@ _STATIC_COMMANDS = {
     "/model": "list models available on the LLM server (also populates /model <name> below)",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
     "/mcp restart ": "reconnect an MCP server after changing it — /mcp restart <name|all>",
+    "/mcp tools ": "list the tools one MCP server exposes — /mcp tools <name>",
     "/resources": "list resources published by connected MCP servers — /resources <uri> reads one",
 }
 
@@ -403,6 +404,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         await refresh_prompt_commands()
         for server in client.server_names():
             commands[f"/mcp restart {server}"] = "reconnect this MCP server"
+            commands[f"/mcp tools {server}"] = "list the tools this MCP server exposes"
         commands["/mcp restart all"] = "reconnect every MCP server"
 
         try:
@@ -448,6 +450,19 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     continue
                 if task == "/mcp":
                     _print_mcp_status(client.server_status())
+                    continue
+                if task.startswith("/mcp tools"):
+                    target = task[len("/mcp tools"):].strip()
+                    if not target:
+                        typer.echo("Usage: /mcp tools <name>  —  names: "
+                                   f"{', '.join(client.server_names())}", err=True)
+                        continue
+                    try:
+                        tools = await client.server_tools(target)
+                    except ValueError as e:
+                        typer.echo(f"Error: {e}", err=True)
+                        continue
+                    _print_server_tools(target, tools)
                     continue
                 if task.startswith("/mcp restart"):
                     target = task[len("/mcp restart"):].strip()
@@ -720,6 +735,20 @@ def _print_resources(resources: dict):
             kind = "template" if info.get("template") else (info.get("mime_type") or "-")
             typer.echo(f"{uri}  [{info.get('server', '')}]  {kind}  {info.get('description', '')}")
         typer.echo("Read one with /resources <uri>")
+
+
+def _print_server_tools(server: str, tools: list):
+    try:
+        from . import ui
+        ui.server_tools_table(server, tools)
+    except ImportError:
+        if not tools:
+            typer.echo(f"{server} exposes no tools.")
+            return
+        for t in tools:
+            tags = " ".join(k for k in ("internal", "deferred", "revealed") if t.get(k))
+            desc = t["description"].splitlines()[0] if t["description"] else ""
+            typer.echo(f"{t['name']}  {f'[{tags}]  ' if tags else ''}{desc[:80]}")
 
 
 def _print_mcp_status(entries: list):

@@ -108,3 +108,21 @@ async def test_read_task_falls_back_to_input(mocker):
     """prompt_session is None when prompt_toolkit is missing."""
     mocker.patch("builtins.input", return_value="typed plainly")
     assert await cli_mod._read_task(None) == "typed plainly"
+
+
+def test_server_tools_fall_back_to_plain_lines(no_ui, capsys):
+    cli_mod._print_server_tools("docs", [
+        {"name": "docs__search", "real_name": "search", "description": "Search the docs",
+         "deferred": True, "revealed": False, "internal": False},
+        {"name": "docs__publish", "real_name": "publish", "description": "Publish",
+         "deferred": False, "revealed": False, "internal": False},
+    ])
+    out = capsys.readouterr().out
+    assert "docs__search" in out and "Search the docs" in out
+    assert "[deferred]" in out
+    assert "docs__publish" in out
+
+
+def test_empty_server_tools_fall_back_to_a_notice(no_ui, capsys):
+    cli_mod._print_server_tools("docs", [])
+    assert "no tools" in capsys.readouterr().out

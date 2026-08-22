@@ -266,6 +266,14 @@ def test_print_resources_delegates_to_ui(mocker):
     table.assert_called_once()
 
 
+def test_print_server_tools_delegates_to_ui(mocker):
+    table = mocker.patch("omni.ui.server_tools_table")
+    tools = [{"name": "docs__search", "real_name": "search", "description": "d",
+              "deferred": False, "revealed": False, "internal": False}]
+    cli_mod._print_server_tools("docs", tools)
+    table.assert_called_once_with("docs", tools)
+
+
 def test_print_mcp_status_delegates_to_ui(mocker):
     status = mocker.patch("omni.ui.mcp_status")
     cli_mod._print_mcp_status([{"name": "built-in", "connected": True}])

@@ -197,6 +197,47 @@ async def test_restart_of_a_still_broken_server_reports_without_raising(make_cli
         assert await client.call_tool("list_dir", {"path": "."})
 
 
+async def test_server_tools_over_the_wire(make_client, tmp_path):
+    spec = server_script(tmp_path / "srv.py", '''
+        @mcp.tool()
+        def alpha() -> str:
+            """First tool."""
+            return "a"
+
+        @mcp.tool()
+        def beta() -> str:
+            """Second tool."""
+            return "b"
+    ''')
+    async with make_client(extra_servers={"toy": spec}) as client:
+        await client.list_llm_tools()
+        tools = await client.server_tools("toy")
+        assert [t["name"] for t in tools] == ["toy__alpha", "toy__beta"]
+        assert tools[0]["description"] == "First tool."
+        assert not any(t["deferred"] or t["internal"] for t in tools)
+
+        builtin = await client.server_tools("built-in")
+        assert any(t["internal"] for t in builtin)          # the _preview_* helpers
+        assert any(t["name"] == "read_file" for t in builtin)
+
+
+async def test_server_tools_sees_new_tools_after_a_restart(make_client, tmp_path):
+    path = tmp_path / "srv.py"
+    spec = server_script(path, PING)
+    async with make_client(extra_servers={"toy": spec}) as client:
+        await client.list_llm_tools()
+        assert [t["real_name"] for t in await client.server_tools("toy")] == ["ping"]
+
+        server_script(path, PING + '''
+@mcp.tool()
+def pong() -> str:
+    """Added later."""
+    return "ping"
+''')
+        await client.restart_server("toy")
+        assert {t["real_name"] for t in await client.server_tools("toy")} == {"ping", "pong"}
+
+
 # ---------------- prompts & resources over the wire ----------------
 
 async def test_prompts_round_trip(make_client, tmp_path):

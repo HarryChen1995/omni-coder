@@ -259,6 +259,62 @@ def test_mcp_restart_refreshes_prompt_completions(repl, client):
     assert client.list_prompts.await_count >= 2      # re-listed after the restart
 
 
+def test_mcp_tools_lists_one_servers_tools(repl, client, mocker):
+    client.server_tools.return_value = [
+        {"name": "docs__search", "real_name": "search", "description": "Search",
+         "deferred": False, "revealed": False, "internal": False}]
+    printed = mocker.patch.object(cli_mod, "_print_server_tools")
+    repl(["/mcp tools docs"])
+    client.server_tools.assert_awaited_with("docs")
+    assert printed.call_args.args[0] == "docs"
+    assert printed.call_args.args[1][0]["name"] == "docs__search"
+
+
+def test_mcp_tools_without_a_name_shows_usage(repl, client, capsys):
+    repl(["/mcp tools"])
+    client.server_tools.assert_not_awaited()
+    err = capsys.readouterr().err
+    assert "Usage" in err and "built-in" in err        # lists valid names
+
+
+def test_mcp_tools_unknown_server_is_reported(repl, client, capsys):
+    client.server_tools.side_effect = ValueError("Unknown MCP server 'ghost'")
+    repl(["/mcp tools ghost"])
+    assert "ghost" in capsys.readouterr().err
+
+
+def test_mcp_tools_unconnected_server_is_reported(repl, client, capsys):
+    client.server_tools.side_effect = ValueError("MCP server 'docs' isn't connected")
+    repl(["/mcp tools docs"])
+    assert "isn't connected" in capsys.readouterr().err
+
+
+def test_mcp_tools_does_not_run_a_turn(repl, client, mocker):
+    client.server_tools.return_value = []
+    mocker.patch.object(cli_mod, "_print_server_tools")
+    agent_run = repl(["/mcp tools docs"])
+    agent_run.assert_not_awaited()
+
+
+def test_bare_mcp_still_shows_status_not_tools(repl, client, mocker):
+    """The `/mcp tools` branch must not swallow the plain `/mcp` command."""
+    status = mocker.patch.object(cli_mod, "_print_mcp_status")
+    tools = mocker.patch.object(cli_mod, "_print_server_tools")
+    repl(["/mcp"])
+    status.assert_called()
+    tools.assert_not_called()
+
+
+def test_mcp_tools_completions_are_registered_per_server(repl, client, mocker):
+    client.server_names.return_value = ["built-in", "docs"]
+    captured = {}
+    mocker.patch("omni.ui.SlashCommandCompleter",
+                 side_effect=lambda commands: captured.setdefault("commands", commands))
+    repl([])
+    assert "/mcp tools built-in" in captured["commands"]
+    assert "/mcp tools docs" in captured["commands"]
+
+
 # ---------------- /resources ----------------
 
 def test_resources_command_lists(repl, client, mocker):
