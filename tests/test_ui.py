@@ -116,7 +116,7 @@ def test_read_summary_reports_lines_and_chars():
 # ---------------- tool emoji / category / arg formatting ----------------
 
 @pytest.mark.parametrize("name,emoji", [
-    ("read_file", "🔍"), ("edit_file", "✏️"), ("write_file", "📝"),
+    ("read_file", "🔍"), ("edit_file", "📝"), ("write_file", "📄"),
     ("run_shell", "💻"), ("git_commit", "💾"), ("save_memory", "🧠"),
     ("list_resources", "📚"), ("read_resource", "📖"),
 ])
@@ -483,7 +483,7 @@ def test_server_tools_table_lists_tools_with_emoji_and_description(cap):
     ])
     out = flat(cap)
     assert "read_file" in out and "Read a file" in out
-    assert "🔍" in out and "📝" in out
+    assert "🔍" in out and "📄" in out
     assert "2 of 2 callable" in out
 
 
@@ -852,6 +852,26 @@ def test_enter_submits_the_text(mocker):
     event = mocker.Mock()
     _binding(box, "enter")(event)
     event.app.exit.assert_called_once_with(result="go")
+
+
+def test_no_tool_emoji_needs_a_variation_selector():
+    """U+FE0F makes a terminal draw the emoji two columns wide while advancing
+    the cursor one, so the glyph overlaps the space and collides with the tool
+    name next to it. Every emoji here must stand on its own codepoint."""
+    everything = (list(ui._TOOL_EMOJI.values()) + list(ui._SERVER_EMOJI_PALETTE)
+                   + [ui._DEFAULT_TOOL_EMOJI])
+    offenders = [e for e in everything if "\ufe0f" in e]
+    assert not offenders, f"variation selector in: {offenders}"
+
+
+def test_tool_emoji_are_all_two_cells_wide():
+    from rich.cells import cell_len
+    assert {cell_len(e) for e in ui._TOOL_EMOJI.values()} == {2}
+
+
+def test_call_line_separates_emoji_from_name():
+    line = ui._call_str("glob_files", {"pattern": "**/*.py"})
+    assert line.startswith("📂 ") and "glob_files" in line
 
 
 def test_prompt_box_hint_names_how_to_leave():

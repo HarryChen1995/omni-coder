@@ -960,13 +960,18 @@ def high_risk_warning():
     ))
 
 
+# No variation selectors (U+FE0F) in here. Rich measures "✏️" as two cells,
+# but terminals draw the emoji presentation two columns wide *and* advance the
+# cursor by one — so the glyph swallows the space after it and collides with
+# the tool name. Every emoji below stands on its own codepoint, where the
+# measured width and the drawn width agree. test_ui pins this.
 _TOOL_EMOJI = {
-    "read_file": "🔍", "write_file": "📝", "edit_file": "✏️",
-    "list_dir": "📁", "glob_files": "🗂️", "search_files": "🔎",
+    "read_file": "🔍", "write_file": "📄", "edit_file": "📝",
+    "list_dir": "📁", "glob_files": "📂", "search_files": "🔎",
     "run_shell": "💻",
-    "git_diff": "📊", "git_status": "📋", "git_log": "📜", "git_show": "👁️",
+    "git_diff": "📊", "git_status": "📋", "git_log": "📜", "git_show": "🧾",
     "git_branch": "🌿", "git_fetch": "📥", "git_add": "➕", "git_commit": "💾",
-    "git_pull": "⬇️", "git_push": "⬆️",
+    "git_pull": "🔽", "git_push": "🔼",
     "save_memory": "🧠", "search_tools": "🧰",
     "list_resources": "📚", "read_resource": "📖",
 }
@@ -978,7 +983,7 @@ _DEFAULT_TOOL_EMOJI = "🧩"  # fallback for an unnamespaced tool this map doesn
 # not Python's randomized-per-process hash()) — so all of one server's tools
 # share an icon, different servers get different ones, and it's the same
 # icon across runs, not just within one session.
-_SERVER_EMOJI_PALETTE = ["🔧", "🔌", "🛰️", "📡", "🧪", "🎛️", "🧬", "🪄"]
+_SERVER_EMOJI_PALETTE = ["🔧", "🔌", "🛸", "📡", "🧪", "🧭", "🧬", "🪄"]
 
 
 def _emoji_for(name: str) -> str:
