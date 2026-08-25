@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 import re
+import textwrap
 import time
 import zlib
 from contextlib import asynccontextmanager, contextmanager
@@ -1100,6 +1101,61 @@ def step_display(calls: list):
         console.print(f"  [dim]⎿[/dim]  {line}")
         if diff_body is not None:
             console.print(Padding(_render_diff(diff_body), (0, 0, 0, 5)))
+
+
+# How many wrapped lines of the chain of thought the collapsed form shows —
+# enough to judge whether it's worth opening, not enough to bury the answer.
+_REASONING_PREVIEW_LINES = 2
+
+
+def _reasoning_gutter(text: str, max_lines: int = None) -> Text:
+    """The reasoning body, quoted behind a dim gutter so it reads as an aside
+    rather than as part of the answer. Wrapped here rather than by Rich so the
+    gutter repeats on every line."""
+    width = max(console.width - 8, 30)
+    lines = []
+    for paragraph in text.strip().splitlines():
+        lines.extend(textwrap.wrap(paragraph, width) or [""])
+    clipped = max_lines is not None and len(lines) > max_lines
+    if clipped:
+        lines = lines[:max_lines]
+    body = Text()
+    for i, line in enumerate(lines):
+        body.append("  │ ", style="dim")
+        body.append(line, style="dim italic")
+        if i < len(lines) - 1:
+            body.append("\n")
+    if clipped:
+        body.append(" …", style="dim")
+    return body
+
+
+def _reasoning_head(marker: str, text: str, hint: str = "") -> Text:
+    head = Text(f"  {marker} reasoning", style=f"bold {ACCENT}")
+    head.append(f"  ·  {len(' '.join(text.split()))} chars", style="dim")
+    if hint:
+        head.append(f"  ·  {hint}", style="dim")
+    return head
+
+
+def reasoning_note(text: str):
+    """Collapsed chain of thought: a disclosure line and the first couple of
+    lines behind a gutter.
+
+    Shown when the server sent reasoning *alongside* an answer. It is usually
+    several times longer than the answer and would bury it, but knowing it
+    exists — and roughly what it says — is worth a few dim lines."""
+    console.print()
+    console.print(_reasoning_head("▸", text, "/reasoning to expand"))
+    console.print(_reasoning_gutter(text, _REASONING_PREVIEW_LINES))
+
+
+def reasoning_full(text: str):
+    """The whole chain of thought — the same block, expanded (/reasoning)."""
+    console.print()
+    console.print(_reasoning_head("▾", text))
+    console.print(_reasoning_gutter(text))
+    console.print()
 
 
 def assistant_message(text: str):

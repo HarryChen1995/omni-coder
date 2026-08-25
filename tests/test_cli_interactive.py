@@ -152,6 +152,28 @@ def test_the_repl_client_carries_the_tool_side_config(repl, cfg):
     assert env["AGENT_MEMORY_PATH"] == cfg.memory_path
 
 
+def test_reasoning_command_expands_the_last_chain_of_thought(repl, mocker):
+    full = mocker.patch("omni.ui.reasoning_full")
+    # last_reasoning is set per instance in __init__, so patching the class
+    # attribute would be shadowed — seed it as the REPL builds its agent.
+    real_init = cli_mod.CodingAgent.__init__
+
+    def seeded_init(self, cfg):
+        real_init(self, cfg)
+        self.last_reasoning = "the thinking"
+
+    mocker.patch.object(cli_mod.CodingAgent, "__init__", seeded_init)
+    repl(["/reasoning"])
+    full.assert_called_once_with("the thinking")
+
+
+def test_reasoning_command_without_any_says_so(repl, mocker, capsys):
+    mocker.patch.object(cli_mod.CodingAgent, "last_reasoning", "", create=True)
+    agent_run = repl(["/reasoning"])
+    assert "No reasoning recorded" in capsys.readouterr().out
+    agent_run.assert_not_awaited()
+
+
 # ---------------- /sessions, /delete, /compact ----------------
 
 def test_sessions_command_lists_without_running_a_turn(repl, mocker):

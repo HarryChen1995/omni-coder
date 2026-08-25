@@ -304,6 +304,7 @@ class CodingAgent:
         self.cfg = cfg
         self.logger = _setup_logger(cfg.log_path)
         self.force_approval = False  # set True for the run if intent is high-risk
+        self.last_reasoning = ""     # chain of thought from the latest reply, for /reasoning
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
 
@@ -508,6 +509,19 @@ class CodingAgent:
             messages.append(msg)
             self.store.append_message(session_id, persisted, msg)
             persisted += 1
+
+            # Chain of thought, when the server sends it as its own field
+            # (llama.cpp, vLLM's reasoning parsers, DeepSeek). Kept collapsed:
+            # it typically dwarfs the answer, so the transcript gets one dim
+            # line and /reasoning opens it. Skipped when the reasoning IS the
+            # content — llm_client falls back to that field for a reply that
+            # carried nothing else, and echoing it above itself prints it twice.
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            reasoning = reasoning.strip() if isinstance(reasoning, str) else ""
+            if reasoning and reasoning != (msg.get("content") or "").strip():
+                self.last_reasoning = reasoning
+                if _HAS_UI:
+                    ui.reasoning_note(reasoning)
 
             # What the model said alongside its tool calls. Shown before the
             # calls run, so the transcript above the prompt reads narration

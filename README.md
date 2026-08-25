@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-758%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-768%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -14,9 +14,10 @@ No vendor SDK required — the agent talks to an OpenAI-compatible
 chat-completions endpoint (`/api/v1/chat/completions`) directly over HTTP via
 `httpx`. Reasoning models served with their output split in two (the answer in
 `content`, the chain of thought in `reasoning_content` — llama.cpp, vLLM's
-reasoning parsers, DeepSeek) are handled: when the model emits only reasoning
-and `content` comes back empty, the reasoning field is used rather than
-rendering a blank answer. This works against Ollama, vLLM, LM Studio, or any other
+reasoning parsers, DeepSeek) are handled: the reasoning is shown collapsed
+above the answer (`/reasoning` expands it), and when the model emits *only*
+reasoning — `content` comes back empty — that field is used as the answer
+rather than rendering a blank reply. This works against Ollama, vLLM, LM Studio, or any other
 OpenAI-compatible server/gateway (e.g. Open WebUI) — point `--llm-host` at
 whichever one you're running.
 
@@ -249,10 +250,15 @@ MCP prompt exposed by a connected server. Special inputs:
   Persists immediately, so the shrunk history is what future turns (and
   `--resume`) load. History is also compacted automatically mid-run
   whenever it exceeds `--context-char-budget` (default 200,000 characters,
-  not tokens — a rough proxy); that automatic pass only affects the model's
-  working context and doesn't rewrite saved history. Use `--compact-model`
+  not tokens — a rough proxy); that automatic pass is persisted too, so
+  resuming doesn't reload everything it just summarized away. Use `--compact-model`
   to run the summarization call itself through a smaller/faster model
   than `--model` (same idea as `--intent-model`).
+- `/reasoning` — expand the last reply's chain of thought. When a server
+  sends reasoning as its own field alongside the answer, the transcript shows
+  a collapsed two-line preview (`▸ reasoning · 256 chars`) so the answer isn't
+  buried; this prints the whole thing. Nothing to expand if the model didn't
+  send any.
 - **Ctrl-C while a turn is running** — interrupts just that turn (cancels
   whatever model or tool call is in flight) and drops you back at the
   prompt; the session and MCP connection stay alive, so you can keep
@@ -640,7 +646,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-758 tests, 94% branch coverage (the badge numbers are the full suite,
+768 tests, 94% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"

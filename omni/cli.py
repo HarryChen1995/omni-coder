@@ -57,6 +57,7 @@ _STATIC_COMMANDS = {
     "/sessions": "list saved sessions",
     "/delete ": "delete a saved session — /delete <id-or-name>",
     "/compact": "summarize this session's history down to a briefing",
+    "/reasoning": "show the last reply's chain of thought in full",
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
@@ -465,6 +466,17 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         typer.echo("No active session yet — run a task first.")
                     else:
                         typer.echo(await agent.compact_history(session_id))
+                    continue
+                if task == "/reasoning":
+                    if agent.last_reasoning:
+                        try:
+                            from . import ui
+                            ui.reasoning_full(agent.last_reasoning)
+                        except ImportError:
+                            typer.echo(agent.last_reasoning)
+                    else:
+                        typer.echo("No reasoning recorded yet — no reply this session "
+                                   "carried a reasoning_content field.")
                     continue
                 if task == "/mcp":
                     _print_mcp_status(client.server_status())

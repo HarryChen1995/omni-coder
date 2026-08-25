@@ -559,3 +559,53 @@ async def test_a_no_op_compaction_leaves_the_store_alone(agent, client, mocker):
     replies(mocker, text_reply("fin"))
     await agent.run("a task long enough to exceed the tiny budget", client=client)
     replace.assert_not_called()
+
+
+# ---------------- reasoning ----------------
+
+def reasoning_reply(content, reasoning, key="reasoning_content"):
+    return {"role": "assistant", "content": content, key: reasoning}
+
+
+async def test_reasoning_is_shown_collapsed_beside_an_answer(agent, client, mocker):
+    """The normal shape for a reasoning model: an answer plus a much longer
+    chain of thought, which would bury the answer if printed in full."""
+    note = mocker.patch.object(agent_mod.ui, "reasoning_note")
+    replies(mocker, reasoning_reply("The answer.", "Long chain of thought."))
+    await agent.run("t", client=client)
+    note.assert_called_once_with("Long chain of thought.")
+    assert agent.last_reasoning == "Long chain of thought."
+
+
+async def test_plain_reasoning_key_is_shown_too(agent, client, mocker):
+    note = mocker.patch.object(agent_mod.ui, "reasoning_note")
+    replies(mocker, reasoning_reply("A.", "Thinking.", key="reasoning"))
+    await agent.run("t", client=client)
+    note.assert_called_once_with("Thinking.")
+
+
+async def test_reasoning_that_is_the_answer_is_not_echoed(agent, client, mocker):
+    """llm_client falls back to the reasoning field when a reply carries
+    nothing else; printing the note as well would show it twice."""
+    note = mocker.patch.object(agent_mod.ui, "reasoning_note")
+    replies(mocker, reasoning_reply("Only thinking.", "Only thinking."))
+    await agent.run("t", client=client)
+    note.assert_not_called()
+    assert agent.last_reasoning == ""
+
+
+async def test_no_reasoning_field_prints_nothing(agent, client, mocker):
+    note = mocker.patch.object(agent_mod.ui, "reasoning_note")
+    replies(mocker, text_reply("just an answer"))
+    await agent.run("t", client=client)
+    note.assert_not_called()
+
+
+async def test_reasoning_on_a_tool_calling_turn_is_shown_above_the_tools(agent, client, mocker):
+    note = mocker.patch.object(agent_mod.ui, "reasoning_note")
+    msg = tool_reply(("read_file", '{"path": "a"}'))
+    msg["content"] = "Reading it."
+    msg["reasoning_content"] = "I should read the file first."
+    replies(mocker, msg, text_reply("done"))
+    await agent.run("t", client=client)
+    note.assert_called_once_with("I should read the file first.")

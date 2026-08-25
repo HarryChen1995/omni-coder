@@ -329,6 +329,36 @@ def test_header_does_not_name_a_model(cap):
     assert "qwen" not in flat(cap).lower()
 
 
+# ---------------- reasoning ----------------
+
+LONG_REASONING = ("First I check the frame. " * 20) + "\n\nThen I summarise."
+
+
+def test_reasoning_note_is_collapsed(cap):
+    ui.reasoning_note(LONG_REASONING)
+    out = cap.getvalue()
+    assert "▸ reasoning" in out and "/reasoning to expand" in out
+    assert "chars" in out
+    body = [l for l in out.split("\n") if "│" in l]
+    assert len(body) == 2 and out.rstrip().endswith("…")   # clipped, with a marker
+
+
+def test_reasoning_full_shows_everything(cap):
+    ui.reasoning_full(LONG_REASONING)
+    out = cap.getvalue()
+    assert "▾ reasoning" in out                            # disclosure flipped open
+    assert "Then I summarise." in out
+    assert not out.rstrip().endswith("…")
+
+
+def test_reasoning_gutter_wraps_to_the_terminal(mocker):
+    buf = io.StringIO()
+    mocker.patch.object(ui, "console", Console(file=buf, width=50, force_terminal=False,
+                                               legacy_windows=False))
+    ui.reasoning_full(LONG_REASONING)
+    assert all(len(l) <= 50 for l in buf.getvalue().split("\n"))
+
+
 def test_final_result_calls_out_an_empty_answer(cap):
     """A blank panel is indistinguishable from "the terminal isn't rendering
     the response", which is the exact confusion an empty reply causes."""
