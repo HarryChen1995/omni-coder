@@ -12,7 +12,8 @@ import pytest
 
 from omni import llm_client
 from omni.llm_client import (
-    LLMError, _normalize_messages, _normalize_tool_call, chat, embed, list_models,
+    LLMError, _content_from_reasoning, _normalize_messages, _normalize_tool_call,
+    chat, embed, list_models,
 )
 
 
@@ -289,3 +290,56 @@ async def test_embed_raises_on_connect_error(mocker):
     mock_http(mocker, boom)
     with pytest.raises(LLMError, match="Could not reach"):
         await embed("m", ["a"])
+
+
+# ---------------- reasoning-model responses ----------------
+#
+# Reasoning models are usually served with the answer in `content` and the
+# chain of thought in `reasoning_content`. When the model emits only
+# reasoning, `content` arrives null/empty — and the turn renders as nothing at
+# all even though the server logged a completed response.
+
+@pytest.mark.parametrize("content", [None, "", "   "])
+async def test_reasoning_content_fills_in_for_an_empty_content(mocker, content):
+    mock_http(mocker, json_reply({"choices": [{"message": {
+        "role": "assistant", "content": content,
+        "reasoning_content": "The answer is 4."}}]}))
+    msg = await chat("m", [{"role": "user", "content": "2+2?"}])
+    assert msg["content"] == "The answer is 4."
+    assert msg["reasoning_content"] == "The answer is 4."   # original field kept
+
+
+async def test_plain_reasoning_key_is_also_accepted(mocker):
+    mock_http(mocker, json_reply({"choices": [{"message": {
+        "role": "assistant", "content": None, "reasoning": "Thought it through."}}]}))
+    assert (await chat("m", []))["content"] == "Thought it through."
+
+
+async def test_real_content_always_wins(mocker):
+    mock_http(mocker, json_reply({"choices": [{"message": {
+        "role": "assistant", "content": "the answer",
+        "reasoning_content": "the thinking"}}]}))
+    assert (await chat("m", []))["content"] == "the answer"
+
+
+async def test_tool_call_turns_are_untouched(mocker):
+    """A tool-calling turn legitimately has empty content; the tool_calls are
+    what matter and nothing should be invented for it."""
+    mock_http(mocker, json_reply({"choices": [{"message": {
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "c0", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}}]}}]}))
+    msg = await chat("m", [])
+    assert msg["content"] is None and msg["tool_calls"][0]["id"] == "c0"
+
+
+def test_structured_content_parts_are_left_alone():
+    parts = [{"type": "text", "text": "hi"}]
+    msg = {"role": "assistant", "content": parts, "reasoning_content": "thinking"}
+    assert _content_from_reasoning(msg)["content"] == parts
+
+
+def test_empty_everything_stays_empty():
+    assert _content_from_reasoning({"role": "assistant", "content": None})["content"] is None
+    assert _content_from_reasoning({"role": "assistant", "content": None,
+                                    "reasoning_content": "   "})["content"] is None

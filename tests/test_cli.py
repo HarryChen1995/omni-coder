@@ -291,9 +291,19 @@ async def test_read_task_falls_back_to_input(mocker):
 
 
 def test_print_header_delegates_to_ui(mocker, cfg):
+    """No model in the header: it would be stale after the first /model
+    switch, and the frame's hint line carries the live one instead."""
     header = mocker.patch("omni.ui.header")
     cli_mod._print_header(cfg, "my-label")
-    header.assert_called_once_with(cfg.model, "my-label")
+    header.assert_called_once_with("my-label", cfg.project_root)
+
+
+def test_model_switch_is_announced_without_a_header(mocker):
+    switched = mocker.patch("omni.ui.model_switched")
+    header = mocker.patch("omni.ui.header")
+    cli_mod._announce_model("llama3.1:latest")
+    switched.assert_called_once_with("llama3.1:latest")
+    header.assert_not_called()
 
 
 def test_print_sessions_empty_and_populated(mocker, capsys):

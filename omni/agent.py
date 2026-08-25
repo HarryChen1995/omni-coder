@@ -490,11 +490,13 @@ class CodingAgent:
             msg = await self._call_model(messages, tool_schemas)
 
             tool_calls = msg.get("tool_calls")
+            recovered_from_text = False
             if not tool_calls:
                 recovered = _recover_text_tool_calls(msg.get("content", ""), tool_names)
                 if recovered:
                     msg["tool_calls"] = recovered
                     tool_calls = recovered
+                    recovered_from_text = True
                     self.logger.info(
                         f"[step {step}] model printed tool call as plain text; "
                         f"recovered {len(recovered)} call(s) via fallback parsing"
@@ -506,6 +508,18 @@ class CodingAgent:
             messages.append(msg)
             self.store.append_message(session_id, persisted, msg)
             persisted += 1
+
+            # What the model said alongside its tool calls. Shown before the
+            # calls run, so the transcript above the prompt reads narration
+            # then actions. Skipped when the "content" IS the tool call
+            # (recovered_from_text) — printing raw JSON adds nothing — and on
+            # the final turn, where cli.py renders it as the result panel.
+            interim = "" if recovered_from_text else (msg.get("content") or "").strip()
+            if tool_calls and interim:
+                if _HAS_UI:
+                    ui.assistant_message(interim)
+                else:
+                    print(f"\n{interim}")
 
             if not tool_calls:
                 final = msg.get("content", "")

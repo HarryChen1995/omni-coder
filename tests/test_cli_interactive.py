@@ -212,11 +212,21 @@ def test_model_command_lists_models(mocker, client, cfg, capsys):
         asyncio.run(cli_mod._interactive(cfg, None, None))
 
 
-def test_model_name_command_switches_and_redraws(repl, mocker, cfg):
+def test_model_name_command_switches_without_redrawing_the_header(repl, mocker, cfg, capsys):
+    """The header is startup furniture: a /model switch echoes the new name
+    instead of dropping a second copy of the box into the transcript."""
     header = mocker.patch.object(cli_mod, "_print_header")
     repl(["/model llama3.1:latest"])
     assert cfg.model == "llama3.1:latest"
-    assert any("llama3.1:latest" == c.args[0].model for c in header.call_args_list)
+    assert "llama3.1:latest" in capsys.readouterr().out
+    assert header.call_count == 1          # the one at startup
+
+
+def test_header_is_not_redrawn_when_the_session_gets_its_id(repl, mocker):
+    header = mocker.patch.object(cli_mod, "_print_header")
+    mocker.patch.object(cli_mod.CodingAgent, "session_id", "abc12345", create=True)
+    repl(["first task", "second task"])
+    assert header.call_count == 1
 
 
 def test_model_list_failure_is_reported(mocker, client, cfg, capsys):

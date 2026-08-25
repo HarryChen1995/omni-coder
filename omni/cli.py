@@ -340,29 +340,26 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
             return f"{resume} (resumed)"
         return session_name or session_id or "(new)"
 
-    shown_header = {}  # what the on-screen header last displayed — see refresh_header
-
-    def refresh_header():
-        """Redraw the header box only when the model or session label it
-        shows has actually changed. The session gains its real DB id after
-        its first turn, which would otherwise redraw the box directly above
-        that turn's result every time — visible as a duplicate header above
-        the final "done" panel, and identical to the one already on screen
-        whenever --session-name pins the label."""
-        state = (cfg.model, session_label())
-        if state == shown_header.get("state"):
-            return
-        shown_header["state"] = state
-        _print_header(cfg, state[1])
-
+    # The header is drawn once, at startup, and never redrawn: the two things
+    # it used to be redrawn for — the model changing and the session gaining
+    # its real id after turn one — are both visible without it. The session
+    # name rides on the input frame's chip (which is rebuilt every prompt),
+    # and a /model switch echoes the new name. Redrawing meant a second copy
+    # of the box landing in the middle of the transcript.
     commands = dict(_STATIC_COMMANDS)  # mutated in place below once MCP prompts are discovered
 
     try:
         from . import ui
-        from prompt_toolkit import PromptSession
         from prompt_toolkit.patch_stdout import patch_stdout
-        refresh_header()
-        prompt_session = PromptSession(completer=ui.SlashCommandCompleter(commands), complete_while_typing=True)
+        _print_header(cfg, session_label())
+        # The input box owns four lines directly under the transcript (rule +
+        # session chip, the ❯ line, closing rule, key hint) and repaints them
+        # in place, including on a terminal resize.
+        prompt_session = ui.PromptBox(commands)
+        # Hand the box to ui: it owns the bottom of the terminal for the whole
+        # session, idle (input) and busy (running a turn) alike. Cleared again
+        # when the REPL exits (below) so nothing keeps a dead box registered.
+        ui.register_box(prompt_session)
         # raw=True: pass Rich's ANSI-coded output straight through instead of
         # patch_stdout()'s default write() path, which sanitizes/escapes text
         # (it assumes plain text) and mangles embedded escape codes into
@@ -441,7 +438,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         with stdout_cm:
             while True:
                 try:
-                    task = await _read_task(prompt_session)
+                    task = await _read_task(prompt_session, session_label(), cfg.model)
                 except (EOFError, KeyboardInterrupt):
                     typer.echo()
                     break
@@ -573,13 +570,11 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     ).run_async()
                     if selected and selected != cfg.model:
                         cfg.model = selected
-                        typer.echo(f"Switched to model {cfg.model!r}.")
-                        refresh_header()
+                        _announce_model(cfg.model)
                     continue
                 if task.startswith("/model "):
                     cfg.model = task[len("/model "):].strip()
-                    typer.echo(f"Switched to model {cfg.model!r}.")
-                    refresh_header()
+                    _announce_model(cfg.model)
                     continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
@@ -625,33 +620,48 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                               session_name=session_name, show_banner=False)
                 )
                 previous_sigint = signal.signal(signal.SIGINT, lambda *_: run_task.cancel())
+                # Hold the frame at the bottom of the terminal for the whole
+                # turn, so narration, tool calls and panels scroll above it
+                # instead of the prompt furniture being redrawn per phase.
                 try:
-                    result = await run_task
-                except asyncio.CancelledError:
-                    session_id = agent.session_id or session_id
+                    from . import ui
+                    # on_interrupt: while the busy frame is up, prompt_toolkit
+                    # holds the terminal in raw mode, so Ctrl+C arrives as a
+                    # keystroke rather than SIGINT — the handler above never
+                    # fires and the cancel has to be wired through the box.
+                    frame = ui.turn_frame(session_label(), cfg.model,
+                                           on_interrupt=run_task.cancel)
+                except ImportError:
+                    frame = nullcontext()
+                async with frame:
                     try:
-                        from . import ui
-                        ui.interrupted()
-                    except ImportError:
-                        typer.echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
-                    continue
-                except (ValueError, RuntimeError, LLMError) as e:
-                    # A turn failing (bad session id, or _call_model giving up
-                    # after its retries because the LLM server is unreachable)
-                    # used to unwind past this loop and end the whole REPL —
-                    # dropping the MCP connections and the session over what
-                    # is usually a transient hiccup. Report it and stay put;
-                    # session_id is carried forward so a retry continues the
-                    # same conversation.
-                    session_id = agent.session_id or session_id
-                    typer.echo(f"Error: {e}", err=True)
-                    continue
-                finally:
-                    signal.signal(signal.SIGINT, previous_sigint)
+                        result = await run_task
+                    except asyncio.CancelledError:
+                        session_id = agent.session_id or session_id
+                        try:
+                            from . import ui
+                            ui.interrupted()
+                        except ImportError:
+                            typer.echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
+                        continue
+                    except (ValueError, RuntimeError, LLMError) as e:
+                        # A turn failing (bad session id, or _call_model giving
+                        # up after its retries because the LLM server is
+                        # unreachable) used to unwind past this loop and end the
+                        # whole REPL — dropping the MCP connections and the
+                        # session over what is usually a transient hiccup.
+                        # Report it and stay put; session_id is carried forward
+                        # so a retry continues the same conversation.
+                        session_id = agent.session_id or session_id
+                        typer.echo(f"Error: {e}", err=True)
+                        continue
+                    finally:
+                        signal.signal(signal.SIGINT, previous_sigint)
 
                 if agent.session_id != session_id:
+                    # Carried into the next turn's resume and the frame's chip;
+                    # deliberately no header redraw (see above).
                     session_id = agent.session_id
-                    refresh_header()
 
                 try:
                     from . import ui
@@ -659,6 +669,12 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 except ImportError:
                     typer.echo("\n=== RESULT ===")
                     typer.echo(result)
+
+    try:
+        from . import ui
+        ui.register_box(None)
+    except ImportError:
+        pass
 
 
 async def _handle_btw(cfg: AgentConfig, question: str):
@@ -686,6 +702,16 @@ async def _handle_btw(cfg: AgentConfig, question: str):
         typer.echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
 
 
+def _announce_model(model: str):
+    """Confirm a /model switch. The header isn't redrawn for this — it's
+    scrollback by then; the frame's hint line shows the live model instead."""
+    try:
+        from . import ui
+        ui.model_switched(model)
+    except ImportError:
+        typer.echo(f"Switched to model {model!r}.")
+
+
 def _print_header(cfg: AgentConfig, session_label: str):
     """Re-print the header box — used at REPL startup and again whenever
     the model or session identity changes (a /model switch, or the session
@@ -693,7 +719,7 @@ def _print_header(cfg: AgentConfig, session_label: str):
     goes stale."""
     try:
         from . import ui
-        ui.header(cfg.model, session_label)
+        ui.header(session_label, cfg.project_root)
     except ImportError:
         typer.echo(f"[model: {cfg.model}] [session: {session_label}]")
 
@@ -719,10 +745,10 @@ def _show_resumed_history(db_path: str, resume: str):
         typer.echo("--- end history ---\n")
 
 
-async def _read_task(prompt_session) -> str:
+async def _read_task(prompt_session, session_label: str = "", model: str = "") -> str:
     if prompt_session is not None:
         from . import ui
-        return await ui.prompt_task_async(prompt_session)
+        return await ui.prompt_task_async(prompt_session, session_label, model)
     return input("> ")
 
 

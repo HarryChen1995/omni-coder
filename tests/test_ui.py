@@ -15,6 +15,16 @@ from rich.console import Console
 from omni import ui
 
 
+@pytest.fixture(autouse=True)
+def no_registered_box():
+    """ui keeps the REPL's PromptBox in module state; a test elsewhere that
+    ran the REPL would otherwise leave one registered and silently reroute
+    every frame assertion here."""
+    ui.register_box(None)
+    yield
+    ui.register_box(None)
+
+
 @pytest.fixture
 def cap(mocker):
     """Capture ui.console output as plain text."""
@@ -282,12 +292,23 @@ async def test_ticking_spinner_cancels_its_task_on_exit(cap):
 
 async def test_ticking_spinner_survives_a_ticker_error(cap, mocker):
     """The ticker is cosmetic — a failure in it must never surface over the
-    real work being awaited."""
+    real work being awaited, and must not stop the ticker either: catching
+    around the loop instead of inside it froze the glyph and the elapsed
+    counter for the rest of the turn after one bad frame."""
     spinner = ui.thinking("x")
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise RuntimeError("render boom")
+
     # Patch what _tick itself calls, not Live.__exit__'s final refresh.
-    mocker.patch.object(spinner._spinner, "update", side_effect=RuntimeError("render boom"))
+    mocker.patch.object(spinner._spinner, "update", side_effect=boom)
     with spinner:
-        await asyncio.sleep(0.25)               # no exception escapes here
+        await asyncio.sleep(0.5)                # no exception escapes here
+        assert not spinner._task.done()         # still ticking
+    assert calls["n"] > 1                       # kept trying, frame after frame
+    await asyncio.sleep(0)                      # let the cancellation land
     assert spinner._task.done()
 
 
@@ -295,9 +316,30 @@ async def test_ticking_spinner_survives_a_ticker_error(cap, mocker):
 
 def test_banner_and_header(cap):
     ui.banner("my task", "my-model")
-    ui.header("my-model", "my-session")
+    ui.header("my-session", "/tmp/proj")
     out = flat(cap)
-    assert "my task" in out and "my-model" in out and "my-session" in out
+    assert "my task" in out and "my-model" in out       # banner (one-shot runs)
+    assert "my-session" in out and "Omni Coder" in out  # header
+
+
+def test_header_does_not_name_a_model(cap):
+    """It's scrollback the moment it prints, so any model named here goes
+    stale on the first /model switch."""
+    ui.header("my-session", "/tmp/proj")
+    assert "qwen" not in flat(cap).lower()
+
+
+def test_final_result_calls_out_an_empty_answer(cap):
+    """A blank panel is indistinguishable from "the terminal isn't rendering
+    the response", which is the exact confusion an empty reply causes."""
+    ui.final_result("")
+    out = flat(cap)
+    assert "empty response" in out and "agent_run.log" in out
+
+
+def test_final_result_renders_real_text(cap):
+    ui.final_result("**done** — created `note.txt`")
+    assert "note.txt" in flat(cap)
 
 
 def test_intent_panel(cap):
@@ -527,10 +569,284 @@ async def test_request_approval_falls_back_to_json_for_other_tools(cap, mocker):
     assert "docs__publish" in out and "prod" in out
 
 
+# ---------------- resize tolerance ----------------
+
+@pytest.mark.parametrize("width", [60, 100, 160, 220])
+def test_nothing_boxed_spans_a_wide_terminal(mocker, width):
+    """Scrollback belongs to the terminal: a box drawn the full width of a
+    wide window is rewrapped into broken box-drawing the moment the window
+    narrows, and nothing can redraw it. Capped boxes only suffer below their
+    own width."""
+    buf = io.StringIO()
+    mocker.patch.object(ui, "console", Console(file=buf, width=width, force_terminal=False,
+                                               legacy_windows=False))
+    ui.header("sess", "/tmp/p")
+    ui.intent_panel(_intent(), {})
+    longest = max((len(l) for l in buf.getvalue().split("\n")), default=0)
+    assert longest <= min(width, 100)
+
+
+def _intent():
+    from omni.intent import Intent
+    return Intent(task_type="feature", summary="s", target_files=[], constraints=[])
+
+
+# ---------------- the bottom frame ----------------
+
+async def test_thinking_inside_a_turn_frame_supports_update(cap):
+    """The retry path does `spinner = thinking(); ...; spinner.update(...)` on
+    the object itself, so whatever thinking() returns has to carry .update —
+    a bare @contextmanager generator raised AttributeError there."""
+    async with ui.turn_frame("my-session"):
+        spinner = ui.thinking("Thinking…")
+        assert hasattr(spinner, "update")
+        with spinner as handle:
+            handle.update("[bold yellow]Thinking… (retry 1/3)[/bold yellow]")
+            assert "retry 1/3" in ui._frame._label
+            spinner.update("relabelled directly")
+            assert "relabelled directly" in ui._frame._label
+
+
+async def test_turn_frame_restores_the_label_after_a_phase(cap):
+    async with ui.turn_frame("s"):
+        before = ui._frame._label
+        with ui.thinking("Running read_file…"):
+            assert "read_file" in ui._frame._label
+        assert ui._frame._label == before
+
+
+async def test_turn_frame_opens_and_closes(cap):
+    assert ui._frame.is_open is False
+    async with ui.turn_frame("s"):
+        assert ui._frame.is_open is True
+    assert ui._frame.is_open is False
+
+
+async def test_thinking_outside_a_frame_is_a_standalone_spinner(cap):
+    spinner = ui.thinking("Parsing intent…")
+    assert isinstance(spinner, ui._TickingSpinner)
+    with spinner:
+        spinner.update("still going")
+
+
+async def test_frame_render_carries_session_chip_and_hint(cap):
+    async with ui.turn_frame("probe-demo"):
+        ui.console.print(ui._frame._render())
+    out = flat(cap)
+    assert "probe-demo" in out and "ctrl+c interrupts" in out
+
+
+@pytest.mark.parametrize("width", [40, 60, 100, 200])
+async def test_frame_render_is_always_three_rows(mocker, width):
+    """Live repaints by stepping back over the previous render, so a frame
+    line that wraps at one width and not another strands the old copy on
+    screen — that was the staircase of rules seen when widening a terminal
+    mid-turn."""
+    buf = io.StringIO()
+    mocker.patch.object(ui, "console", Console(file=buf, width=width, force_terminal=False,
+                                               legacy_windows=False))
+    async with ui.turn_frame("a-fairly-long-session-name", "some-long-model-name:35b"):
+        ui.console.print(ui._frame._render())
+    assert len(buf.getvalue().rstrip("\n").split("\n")) == 3
+
+
+async def test_frame_pause_lets_the_terminal_go(cap):
+    async with ui.turn_frame("s"):
+        with ui._frame.pause():
+            assert ui._frame._paused is True
+        assert ui._frame._paused is False
+
+
+def test_frame_pause_outside_a_turn_is_a_no_op():
+    with ui._frame.pause():
+        pass
+
+
+# ---------------- PromptBox: busy frame ----------------
+#
+# In the REPL the box owns the bottom of the terminal in both states, so the
+# busy frame is prompt_toolkit's too — a Rich Live competing with it for that
+# region is what left the spinner frozen and the counter stuck.
+
+@pytest.fixture
+def registered_box():
+    box = ui.PromptBox({"/exit": "leave"})
+    ui.register_box(box)
+    yield box
+    ui.register_box(None)
+
+
+async def test_turn_frame_uses_the_registered_box(registered_box, cap):
+    async with ui.turn_frame("sess", "my-model"):
+        assert registered_box.is_busy is True
+        assert ui._frame.is_open is False        # no Rich Live in this path
+    assert registered_box.is_busy is False
+
+
+async def test_busy_spinner_advances_and_counter_climbs(registered_box):
+    """The two symptoms that started this: a glyph that never changed and an
+    elapsed time stuck at 0.0s."""
+    async with ui.turn_frame("sess", "my-model"):
+        glyphs, times = set(), set()
+        for _ in range(24):
+            glyphs.add(registered_box._busy_line()[0][1])
+            times.add(registered_box._busy_line()[2][1])
+            await asyncio.sleep(0.06)
+    assert len(glyphs) > 1, "spinner glyph never advanced"
+    assert len(times) > 1, "elapsed counter never moved"
+
+
+def test_busy_status_window_hides_the_cursor(registered_box):
+    """Otherwise the terminal parks its cursor on the first cell of the busy
+    line and paints it as a block over the spinner glyph."""
+    from prompt_toolkit.layout import Window
+    windows = [w for w in registered_box._busy_app.layout.walk() if isinstance(w, Window)]
+    assert windows and windows[0].always_hide_cursor() is True
+
+
+async def test_thinking_relabels_the_busy_box(registered_box):
+    async with ui.turn_frame("sess"):
+        spinner = ui.thinking("Running read_file…")
+        assert hasattr(spinner, "update")
+        with spinner:
+            assert "read_file" in registered_box._busy_line()[1][1]
+            spinner.update("[bold yellow]Thinking… (retry 1/3)[/bold yellow]")
+            label = registered_box._busy_line()[1][1]
+            assert "retry 1/3" in label and "[" not in label   # markup stripped
+        assert "read_file" not in registered_box._busy_line()[1][1]
+
+
+async def test_busy_frame_carries_chip_model_and_hint(registered_box):
+    async with ui.turn_frame("my-session", "my-model"):
+        assert " my-session " in "".join(t for _, t in registered_box._rule_with_chip())
+        hint = "".join(t for _, t in registered_box._busy_hint())
+        assert "my-model" in hint and "ctrl+c interrupts" in hint
+
+
+async def test_ctrl_c_while_busy_cancels_the_turn(registered_box, mocker):
+    """Raw mode means Ctrl+C never reaches the REPL's SIGINT handler, so the
+    cancel has to be wired through the box."""
+    cancelled = mocker.Mock()
+    async with ui.turn_frame("sess", on_interrupt=cancelled):
+        _binding_busy(registered_box, "c-c")(mocker.Mock())
+    cancelled.assert_called_once()
+
+
+def _binding_busy(box, key):
+    from prompt_toolkit.keys import Keys
+    wanted = {"c-c": Keys.ControlC}[key]
+    for b in box._busy_app.key_bindings.bindings:
+        if b.keys == (wanted,):
+            return b.handler
+    raise AssertionError(f"no busy binding for {key}")
+
+
+async def test_approval_stops_and_restarts_the_busy_frame(registered_box, mocker):
+    """A y/n answer can't be read while prompt_toolkit holds the terminal."""
+    states = []
+    async def fake_approval(name, args, client):
+        states.append(registered_box.is_busy)
+        return True
+    mocker.patch.object(ui, "_request_approval", fake_approval)
+    async with ui.turn_frame("sess"):
+        assert await ui.request_approval("write_file", {}, mocker.AsyncMock()) is True
+        assert registered_box.is_busy is True     # resumed afterwards
+    assert states == [False]                      # released while asking
+
+
+# ---------------- PromptBox ----------------
+
+def test_prompt_box_frame_lines():
+    box = ui.PromptBox({"/exit": "leave"})
+    box.session_label = "my-session"
+    chip = "".join(text for _, text in box._rule_with_chip())
+    assert chip.endswith("──") and " my-session " in chip
+    assert set("".join(t for _, t in box._rule())) == {"─"}
+    assert "⏎ send" in "".join(t for _, t in box._hint())
+
+
+def test_prompt_box_chip_falls_back_to_the_app_name():
+    box = ui.PromptBox({})
+    assert "omni-coder" in "".join(t for _, t in box._rule_with_chip())
+
+
+def test_prompt_box_completes_slash_commands():
+    box = ui.PromptBox({"/mcp": "servers", "/exit": "leave"})
+    box._buffer.text = "/m"
+    box._buffer.cursor_position = 2
+    completions = list(box._buffer.completer.get_completions(box._buffer.document, None))
+    assert [c.text for c in completions] == ["/mcp"]
+
+
+def _binding(box, key):
+    from prompt_toolkit.keys import Keys
+    wanted = {"c-c": Keys.ControlC, "c-d": Keys.ControlD, "enter": Keys.ControlM}[key]
+    for b in box._app.key_bindings.bindings:
+        if b.keys == (wanted,):
+            return b.handler
+    raise AssertionError(f"no binding for {key}")
+
+
+def test_ctrl_c_clears_the_line_instead_of_leaving_the_session(mocker):
+    """The REPL reads KeyboardInterrupt as end-of-input, so raising it here
+    turned a stray Ctrl+C at the prompt into "quit"."""
+    box = ui.PromptBox({})
+    box._buffer.text = "half-typed instruction"
+    event = mocker.Mock()
+    _binding(box, "c-c")(event)
+    assert box._buffer.text == ""
+    event.app.exit.assert_not_called()
+
+
+def test_ctrl_d_on_an_empty_line_still_exits(mocker):
+    box = ui.PromptBox({})
+    event = mocker.Mock()
+    _binding(box, "c-d")(event)
+    assert event.app.exit.call_args.kwargs["exception"] is EOFError
+
+
+def test_ctrl_d_with_text_does_not_exit(mocker):
+    box = ui.PromptBox({})
+    box._buffer.text = "keep me"
+    event = mocker.Mock()
+    _binding(box, "c-d")(event)
+    event.app.exit.assert_not_called()
+
+
+def test_enter_submits_the_text(mocker):
+    box = ui.PromptBox({})
+    box._buffer.text = "go"
+    event = mocker.Mock()
+    _binding(box, "enter")(event)
+    event.app.exit.assert_called_once_with(result="go")
+
+
+def test_prompt_box_hint_names_how_to_leave():
+    hint = "".join(t for _, t in ui.PromptBox({})._hint())
+    assert "ctrl+d exit" in hint and "ctrl+c clear" in hint
+
+
+def test_prompt_box_hint_shows_the_current_model():
+    """A /model switch can't rewrite the header (it's scrollback), so the
+    live model name rides on the hint line, rebuilt every prompt."""
+    box = ui.PromptBox({})
+    box.model = "qwen3.6:35b"
+    assert "qwen3.6:35b" in "".join(t for _, t in box._hint())
+    box.model = "llama3.1:latest"
+    hint = "".join(t for _, t in box._hint())
+    assert "llama3.1:latest" in hint and "qwen3.6:35b" not in hint
+
+
+async def test_turn_frame_hint_shows_the_current_model(cap):
+    async with ui.turn_frame("sess", "qwen3.6:35b"):
+        ui.console.print(ui._frame._render())
+    assert "qwen3.6:35b" in flat(cap)
+
+
 # ---------------- prompt_task_async ----------------
 
-async def test_prompt_task_async_reads_from_the_session(cap, mocker):
-    session = mocker.Mock()
-    session.prompt_async = mocker.AsyncMock(return_value="  my typed task  ")
-    assert await ui.prompt_task_async(session) == "  my typed task  "
-    session.prompt_async.assert_awaited_once()
+async def test_prompt_task_async_reads_from_the_box(cap, mocker):
+    box = mocker.Mock()
+    box.prompt = mocker.AsyncMock(return_value="  my typed task  ")
+    assert await ui.prompt_task_async(box, "sess", "my-model") == "  my typed task  "
+    box.prompt.assert_awaited_once_with("sess", "my-model")

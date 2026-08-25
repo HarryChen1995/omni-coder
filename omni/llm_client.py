@@ -48,6 +48,32 @@ def _normalize_messages(messages: list) -> list:
     return normalized
 
 
+def _content_from_reasoning(message: dict) -> dict:
+    """Recover the answer when a server put it in a reasoning field.
+
+    Reasoning models are commonly served with their output split in two:
+    `content` for the answer, `reasoning_content` (llama.cpp, vLLM's reasoning
+    parsers, DeepSeek) or `reasoning` for the chain of thought. When the model
+    emits only reasoning, `content` comes back null or empty — and a turn that
+    the server logged as a completed 51-token response then renders as nothing
+    at all. Fall back to whichever reasoning field is populated instead.
+
+    Structured `content` (a list of content parts) is left alone; only a
+    missing or blank string is filled in."""
+    if not isinstance(message, dict):
+        return message
+    content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        return message
+    if content and content.strip():
+        return message
+    for key in ("reasoning_content", "reasoning"):
+        text = message.get(key)
+        if isinstance(text, str) and text.strip():
+            return {**message, "content": text}
+    return message
+
+
 class LLMError(Exception):
     pass
 
@@ -103,7 +129,7 @@ async def chat(
     message = choices[0].get("message")
     if message is None:
         raise LLMError(f"Unexpected response shape from LLM server (no 'message' key): {data}")
-    return message
+    return _content_from_reasoning(message)
 
 
 async def list_models(base_url: str = None, api_key: str = None, timeout: float = 15.0) -> list:

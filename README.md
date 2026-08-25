@@ -1,7 +1,7 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-713%20passed-brightgreen)](#-tests)
-[![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-758%20passed-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -12,7 +12,11 @@ pip install -e .
 ```
 No vendor SDK required — the agent talks to an OpenAI-compatible
 chat-completions endpoint (`/api/v1/chat/completions`) directly over HTTP via
-`httpx`. This works against Ollama, vLLM, LM Studio, or any other
+`httpx`. Reasoning models served with their output split in two (the answer in
+`content`, the chain of thought in `reasoning_content` — llama.cpp, vLLM's
+reasoning parsers, DeepSeek) are handled: when the model emits only reasoning
+and `content` comes back empty, the reasoning field is used rather than
+rendering a blank answer. This works against Ollama, vLLM, LM Studio, or any other
 OpenAI-compatible server/gateway (e.g. Open WebUI) — point `--llm-host` at
 whichever one you're running.
 
@@ -166,7 +170,43 @@ omni --resume utils-typing                 # resumes and prompts for input
 ```
 Type a task and press enter to run it; the conversation (and the MCP tool
 connection) stays alive between turns, so follow-ups don't pay the cost of
-re-parsing intent or re-spawning the tool server. Type `/` at the prompt to
+re-parsing intent or re-spawning the tool server.
+
+The screen is laid out as a transcript above a fixed frame at the bottom:
+
+```
+  …model narration, tool calls, diffs and result panels scroll up here…
+⠋ Thinking… (3.2s)
+──────────────────────────────────────────────────────── my-session ──
+❯ what you're typing
+──────────────────────────────────────────────────────────────────────
+  qwen3.6:35b  ·  ⏎ send  ·  / commands  ·  ctrl+c clear  ·  ctrl+d exit
+```
+
+The frame carries the session name on its top rule and the live model name on
+its hint line, and it never moves: while a turn runs it shows what the agent
+is doing (with an elapsed counter) in the same spot, and everything the model
+says or does is printed above it. It repaints in place when the terminal is
+resized, and steps aside for an approval prompt.
+
+The header box above is printed once, at startup, and never redrawn — it's
+scrollback the moment it appears, so anything that can change (the model, the
+session id once the first turn assigns one) lives on the frame instead, where
+it stays current. `/model` echoes the switch; the frame's hint line shows what
+is actually in use.
+
+Ctrl+C never leaves the session: mid-turn it cancels the turn, at the prompt
+it clears the line. Use `/exit`, `/quit`, or Ctrl+D on an empty line.
+
+Both states of the frame are drawn by prompt_toolkit, so one renderer owns
+that region for the whole session and repaints it on every resize. The turn's
+answer is printed as plain Markdown — no box, so copying it doesn't drag
+border characters along — and nothing boxed is ever drawn wider than 100
+columns, because scrollback belongs to the terminal: a full-width box is
+rewrapped into broken box-drawing as soon as the window narrows, and no
+program can redraw what has already scrolled past.
+
+Type `/` at the prompt to
 pop a completion menu of every available command — static ones below, plus
 one `/model <name>` entry per model the LLM server reports (best-effort;
 skipped if it doesn't expose `/v1/models`) and one `/server:prompt` entry per
@@ -600,7 +640,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-713 tests, 95% branch coverage (the badge numbers are the full suite,
+758 tests, 94% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
@@ -609,6 +649,16 @@ pytest --cov=omni               # with a coverage report
 pytest -m "not live"            # skip the subprocess-spawning tests (fast)
 pytest tests/test_tools.py -v   # one module
 ```
+
+Per module (branch coverage, whole suite):
+
+| Module | Cover | Module | Cover |
+|---|---|---|---|
+| `config.py` | 100% | `mcp_client.py` | 95% |
+| `mcp_server.py` | 100% | `agent.py` | 93% |
+| `session_store.py` | 100% | `tools.py` | 93% |
+| `llm_client.py` | 99% | `cli.py` | 92% |
+| `intent.py` | 98% | `ui.py` | 92% |
 
 Almost everything is mocked at the process boundary — `httpx` via
 `MockTransport`, `subprocess.run` for the git tools, `ClientSession` for MCP,
@@ -623,14 +673,14 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 | `test_tools_git.py` | Every git tool's argv, exit codes, timeouts, missing binary |
 | `test_session_store.py` | SQLite persistence, resume/rename/delete, compaction rewrites |
 | `test_intent.py` | JSON coercion of malformed model output, retry + fallback |
-| `test_llm_client.py` | Request shaping, auth headers, every error path |
+| `test_llm_client.py` | Request shaping, auth headers, reasoning-model replies, every error path |
 | `test_mcp_client_pure.py` | Spec parsing, settings file + migration, env-var expansion |
 | `test_mcp_client_class.py` | Tool routing, deferred loading, prompts, resources, restart |
 | `test_mcp_client_live.py` | Real stdio servers: connect, restart, reap (`live` marker) |
 | `test_mcp_server.py` | The exposed MCP tool surface and its delegation to `tools.py` |
 | `test_agent_helpers.py` | Tool-call recovery, history trimming, approval policy |
-| `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits |
-| `test_ui.py` | Diff rendering, summaries, completer, every renderer |
+| `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits, tool_call_id pairing |
+| `test_ui.py` | Diff rendering, summaries, the input box + bottom frame, every renderer |
 | `test_cli.py` / `test_cli_interactive.py` | Flags, MCP registry, and every REPL slash command |
 | `test_cli_no_rich.py` | The degraded path when rich/prompt_toolkit aren't installed |
 | `test_config.py` | `AgentConfig` defaults that encode policy (what's auto-approved) |
