@@ -448,7 +448,10 @@ class PromptBox:
         status = Window(FormattedTextControl(self._busy_line, focusable=True), height=one,
                          always_hide_cursor=True)
         return Layout(HSplit([
+            Window(height=one),   # gap: the transcript ends right above this
             status,
+            Window(height=one),   # and gap below, so the status line isn't
+                                   # pinned against the prompt frame either
             Window(FormattedTextControl(self._rule_with_chip), height=one),
             Window(FormattedTextControl(self._busy_hint), height=one),
         ]), focused_element=status)
@@ -656,7 +659,9 @@ class _BottomFrame:
         label.overflow = "ellipsis"
         self._spinner.update(text=label)
         return Group(
+            Text(""),             # gap between the transcript and the status line
             self._spinner,
+            Text(""),             # and between the status line and the frame
             _frame_top(self._session),
             self._hint_line(),
         )

@@ -637,7 +637,7 @@ async def test_frame_render_carries_session_chip_and_hint(cap):
 
 
 @pytest.mark.parametrize("width", [40, 60, 100, 200])
-async def test_frame_render_is_always_three_rows(mocker, width):
+async def test_frame_render_is_always_five_rows(mocker, width):
     """Live repaints by stepping back over the previous render, so a frame
     line that wraps at one width and not another strands the old copy on
     screen — that was the staircase of rules seen when widening a terminal
@@ -647,7 +647,8 @@ async def test_frame_render_is_always_three_rows(mocker, width):
                                                legacy_windows=False))
     async with ui.turn_frame("a-fairly-long-session-name", "some-long-model-name:35b"):
         ui.console.print(ui._frame._render())
-    assert len(buf.getvalue().rstrip("\n").split("\n")) == 3
+    # blank, status, blank, rule, hint
+    assert len(buf.getvalue().rstrip("\n").split("\n")) == 5
 
 
 async def test_frame_pause_lets_the_terminal_go(cap):
@@ -701,7 +702,9 @@ def test_busy_status_window_hides_the_cursor(registered_box):
     line and paints it as a block over the spinner glyph."""
     from prompt_toolkit.layout import Window
     windows = [w for w in registered_box._busy_app.layout.walk() if isinstance(w, Window)]
-    assert windows and windows[0].always_hide_cursor() is True
+    status = next(w for w in windows
+                   if getattr(w.content, "text", None) == registered_box._busy_line)
+    assert status.always_hide_cursor() is True
 
 
 async def test_thinking_relabels_the_busy_box(registered_box):
