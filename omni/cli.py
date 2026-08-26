@@ -104,6 +104,18 @@ def main(
         help="Skip human approval for write/edit/shell tools. Only use in an "
              "already-isolated environment (container/VM). Overridden if intent parsing flags the task high-risk.",
     ),
+    system_prompt: Optional[str] = typer.Option(
+        None, "--system-prompt",
+        help="Replace the built-in system prompt with this text. Omit to use the built-in one, "
+             "which is what tells the model the tool discipline the loop expects (prefer "
+             "edit_file over write_file, finish with plain text, save_memory for durable "
+             "facts) — a replacement should cover the same ground.",
+    ),
+    system_prompt_file: Optional[str] = typer.Option(
+        None, "--system-prompt-file",
+        help="Same as --system-prompt, read from a file (easier for anything multi-line). "
+             "Mutually exclusive with --system-prompt.",
+    ),
     log_path: str = typer.Option("agent_run.log", "--log-path", help="Where to write the structured run log"),
     mcp_log_path: str = typer.Option(
         AgentConfig.mcp_log_path, "--mcp-log-path",
@@ -248,6 +260,23 @@ def main(
         _print_sessions(SessionStore(db_path).list_sessions())
         raise typer.Exit()
 
+    if system_prompt is not None and system_prompt_file is not None:
+        typer.echo("Error: pass --system-prompt or --system-prompt-file, not both.", err=True)
+        raise typer.Exit(code=1)
+
+    if system_prompt_file is not None:
+        try:
+            system_prompt = open(system_prompt_file, encoding="utf-8").read()
+        except OSError as e:
+            typer.echo(f"Error: could not read --system-prompt-file {system_prompt_file!r}: {e}",
+                        err=True)
+            raise typer.Exit(code=1)
+        if not system_prompt.strip():
+            # Silently falling back to the built-in prompt would look like the
+            # flag was ignored, which is worse than refusing.
+            typer.echo(f"Error: --system-prompt-file {system_prompt_file!r} is empty.", err=True)
+            raise typer.Exit(code=1)
+
     try:
         extra_mcp_servers = parse_mcp_server_specs(mcp_server)
     except ValueError as e:
@@ -280,6 +309,7 @@ def main(
         auto_approve=auto_approve,
         log_path=log_path,
         mcp_log_path=mcp_log_path,
+        system_prompt=system_prompt or "",
         parse_intent=not skip_intent_parsing,
         intent_model=intent_model or "",
         context_char_budget=context_char_budget,
@@ -332,6 +362,12 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
     agent = CodingAgent(cfg)
     session_id = resume
 
+    def session_title() -> str:
+        """What the terminal window/tab is named. The session's own name where
+        there is one, otherwise the id it was given — the "(resumed)" suffix
+        that session_label() carries is noise in a window title."""
+        return session_name or resume or session_id or "omni"
+
     def session_label() -> str:
         # Prefer whatever human-chosen name identifies this session — the
         # --session-name given for a new one, or the --resume value (which
@@ -353,6 +389,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         from . import ui
         from prompt_toolkit.patch_stdout import patch_stdout
         _print_header(cfg, session_label())
+        _set_title(session_title())
         # The input box owns four lines directly under the transcript (rule +
         # session chip, the ❯ line, closing rule, key hint) and repaints them
         # in place, including on a terminal resize.
@@ -674,6 +711,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     # Carried into the next turn's resume and the frame's chip;
                     # deliberately no header redraw (see above).
                     session_id = agent.session_id
+                    _set_title(session_title())   # an unnamed session just got its id
 
                 try:
                     from . import ui
@@ -712,6 +750,15 @@ async def _handle_btw(cfg: AgentConfig, question: str):
         ui.btw_answer(question, answer)
     except ImportError:
         typer.echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
+
+
+def _set_title(text: str):
+    """Name the terminal after the session, when the UI layer is available."""
+    try:
+        from . import ui
+        ui.set_terminal_title(text)
+    except ImportError:
+        pass
 
 
 def _announce_model(model: str):

@@ -152,6 +152,31 @@ def test_the_repl_client_carries_the_tool_side_config(repl, cfg):
     assert env["AGENT_MEMORY_PATH"] == cfg.memory_path
 
 
+def test_terminal_is_titled_after_the_session(repl, mocker, cfg):
+    title = mocker.patch("omni.ui.set_terminal_title")
+    repl([], session_name="white-house-3d")
+    assert title.call_args_list[0].args[0] == "white-house-3d"
+
+
+def test_title_follows_a_resumed_session(repl, mocker):
+    title = mocker.patch("omni.ui.set_terminal_title")
+    repl([], resume="utils-typing")
+    assert title.call_args_list[0].args[0] == "utils-typing"
+
+
+def test_unnamed_session_is_titled_once_it_has_an_id(repl, mocker):
+    title = mocker.patch("omni.ui.set_terminal_title")
+    real_init = cli_mod.CodingAgent.__init__
+
+    def seeded_init(self, cfg):
+        real_init(self, cfg)
+        self.session_id = "abc12345"
+
+    mocker.patch.object(cli_mod.CodingAgent, "__init__", seeded_init)
+    repl(["a task"])
+    assert "abc12345" in [c.args[0] for c in title.call_args_list]
+
+
 def test_reasoning_command_expands_the_last_chain_of_thought(repl, mocker):
     full = mocker.patch("omni.ui.reasoning_full")
     # last_reasoning is set per instance in __init__, so patching the class

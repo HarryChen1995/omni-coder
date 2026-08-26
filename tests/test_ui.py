@@ -599,6 +599,46 @@ async def test_request_approval_falls_back_to_json_for_other_tools(cap, mocker):
     assert "docs__publish" in out and "prod" in out
 
 
+# ---------------- terminal title ----------------
+
+def test_terminal_title_uses_the_osc_escape(cap, mocker):
+    """Works on xterm-family terminals, Terminal.app/iTerm and Windows
+    Terminal alike — Rich emits it only when stdout is a real terminal."""
+    setter = mocker.patch.object(ui.console, "set_window_title")
+    ui.set_terminal_title("my-session")
+    setter.assert_called_once_with("my-session")
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_blank_title_is_ignored(cap, mocker, blank):
+    setter = mocker.patch.object(ui.console, "set_window_title")
+    ui.set_terminal_title(blank)
+    setter.assert_not_called()
+
+
+def test_windows_also_goes_through_the_console_api(cap, mocker):
+    """Older Windows consoles ignore the escape and only answer to
+    SetConsoleTitleW."""
+    win = mocker.patch.object(ui, "_set_windows_console_title")
+    mocker.patch.object(ui, "_IS_WINDOWS", True)
+    mocker.patch.object(ui.console, "set_window_title")
+    ui.set_terminal_title("my-session")
+    win.assert_called_once_with("my-session")
+
+
+def test_other_platforms_skip_the_windows_call(cap, mocker):
+    win = mocker.patch.object(ui, "_set_windows_console_title")
+    mocker.patch.object(ui, "_IS_WINDOWS", False)
+    mocker.patch.object(ui.console, "set_window_title")
+    ui.set_terminal_title("my-session")
+    win.assert_not_called()
+
+
+def test_a_failing_terminal_never_breaks_the_run(cap, mocker):
+    mocker.patch.object(ui.console, "set_window_title", side_effect=RuntimeError("no tty"))
+    ui.set_terminal_title("my-session")   # must not raise
+
+
 # ---------------- resize tolerance ----------------
 
 @pytest.mark.parametrize("width", [60, 100, 160, 220])

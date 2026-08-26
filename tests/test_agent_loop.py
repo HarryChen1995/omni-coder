@@ -609,3 +609,54 @@ async def test_reasoning_on_a_tool_calling_turn_is_shown_above_the_tools(agent, 
     replies(mocker, msg, text_reply("done"))
     await agent.run("t", client=client)
     note.assert_called_once_with("I should read the file first.")
+
+
+# ---------------- system prompt ----------------
+
+def system_of(sent):
+    return next(m["content"] for m in sent if m["role"] == "system")
+
+
+async def test_built_in_system_prompt_is_the_default(agent, client, mocker):
+    m = replies(mocker, text_reply("ok"))
+    await agent.run("t", client=client)
+    assert system_of(m.sent[0]) == agent_mod.SYSTEM_PROMPT
+
+
+async def test_configured_system_prompt_replaces_the_built_in(agent, client, mocker):
+    agent.cfg.system_prompt = "You are a terse reviewer. Answer in one line."
+    m = replies(mocker, text_reply("ok"))
+    await agent.run("t", client=client)
+    sent = system_of(m.sent[0])
+    assert sent == "You are a terse reviewer. Answer in one line."
+    assert "edit_file" not in sent          # the built-in one is gone, not merged
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+async def test_blank_system_prompt_falls_back_to_the_built_in(agent, client, mocker, blank):
+    agent.cfg.system_prompt = blank
+    m = replies(mocker, text_reply("ok"))
+    await agent.run("t", client=client)
+    assert system_of(m.sent[0]) == agent_mod.SYSTEM_PROMPT
+
+
+async def test_project_memory_still_rides_on_a_custom_prompt(agent, client, mocker, project_root):
+    (project_root / "agent_memory.md").write_text("- [2026-01-01] uses pytest\n")
+    agent.cfg.system_prompt = "Custom."
+    m = replies(mocker, text_reply("ok"))
+    await agent.run("t", client=client)
+    sent = system_of(m.sent[0])
+    assert sent.startswith("Custom.") and "uses pytest" in sent
+
+
+async def test_a_resumed_session_keeps_the_prompt_it_started_with(agent, client, mocker):
+    """The prompt is stored as the session's first message, so changing the
+    flag later must not rewrite the history of a session already underway."""
+    agent.cfg.system_prompt = "Original prompt."
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client)
+
+    agent.cfg.system_prompt = "Different prompt."
+    m = replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id=agent.session_id, client=client)
+    assert system_of(m.sent[0]) == "Original prompt."

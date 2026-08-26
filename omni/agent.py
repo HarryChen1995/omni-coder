@@ -386,7 +386,11 @@ class CodingAgent:
             if _HAS_UI and show_banner:
                 ui.banner(task, self.cfg.model)
             session_id = self.store.create_session(self.cfg.project_root, self.cfg.model, task, name=session_name)
-            system_content = SYSTEM_PROMPT
+            # cfg.system_prompt replaces the built-in one; empty falls back
+            # to it. Whatever is chosen here is stored as the session's first
+            # message, so a resumed session keeps the prompt it started with
+            # rather than silently adopting a new flag value.
+            system_content = self.cfg.system_prompt.strip() or SYSTEM_PROMPT
             memory_text = _load_project_memory(self.cfg.project_root, self.cfg.memory_path)
             if memory_text:
                 system_content += "\n\n# Project memory (persisted from previous sessions)\n" + memory_text

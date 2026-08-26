@@ -35,6 +35,14 @@ class AgentConfig:
     # system prompt at the start of every new (non-resumed) session.
     memory_path: str = "agent_memory.md"
 
+    # Replaces the built-in system prompt (agent.SYSTEM_PROMPT) when set.
+    # Empty = use the built-in one. Set from --system-prompt, or read from a
+    # file with --system-prompt-file. Note the built-in prompt is what tells
+    # the model the tool discipline the loop relies on (prefer edit_file over
+    # write_file, finish with plain text rather than a tool call, save_memory
+    # for durable facts) — a replacement should cover the same ground.
+    system_prompt: str = ""
+
     # Parse the freeform task into structured intent (task_type, target_files,
     # constraints, risk_level) before the agent starts acting.
     parse_intent: bool = True

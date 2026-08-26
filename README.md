@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-768%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-795%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -77,6 +77,31 @@ one-shot run — see [Session management](#session-management) below.
    watch the log for `BAD ARGS` entries; if they're frequent, consider a
    larger quant or `qwen2.5-coder:32b` (dense, less agentic-tuned but very
    reliable on straightforward edits).
+
+## 📝 System prompt
+
+The built-in prompt is what tells the model the discipline this loop expects:
+prefer `edit_file` over `write_file`, check state before doing something
+irreversible, call `save_memory` for durable facts, and finish with plain text
+rather than another tool call. It's used unless you replace it:
+
+```bash
+omni --system-prompt "You are a terse reviewer. Answer in one line." "review utils.py"
+omni --system-prompt-file ./prompts/release-engineer.md "cut the release"
+```
+
+`--system-prompt` takes the text inline, `--system-prompt-file` reads it from a
+file (easier for anything multi-line); passing both is an error, as is pointing
+the file flag at something missing or empty — falling back to the built-in
+prompt there would look like the flag had been ignored.
+
+A replacement is a replacement: nothing from the built-in prompt is merged in,
+so if you rely on the tool discipline above, restate it. Project memory still
+gets appended after whichever prompt is in force.
+
+The prompt is stored as the session's first message, so `--resume` continues
+with the prompt that session started with — changing the flag later doesn't
+rewrite a conversation already underway.
 
 ## 🧭 Intent parsing
 
@@ -277,6 +302,14 @@ banner + parsed intent as a panel, each step with a colored ✓/✗, approval
 prompts that show the actual diff/command *before* you approve — not just the
 raw args — and the final response rendered as Markdown (headers, lists, code
 blocks) rather than literal text.
+
+The terminal window/tab is named after the session, so several sessions side
+by side are tellable apart: `--session-name` if you gave one, otherwise the id
+the session is assigned after its first turn. Two mechanisms cover the
+platforms — the OSC 0 escape for xterm-family terminals, Terminal.app/iTerm
+and Windows Terminal, and `SetConsoleTitleW` for older Windows consoles that
+ignore it. Nothing restores the previous title on exit (a terminal can't be
+asked what its title was), but most shells set their own on the next prompt.
 
 - **`edit_file` diffs** (both the approval preview and the post-edit result)
   render through a custom GitHub-style diff view — a line-number gutter,
@@ -646,7 +679,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-768 tests, 94% branch coverage (the badge numbers are the full suite,
+795 tests, 94% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"

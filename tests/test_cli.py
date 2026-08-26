@@ -110,6 +110,59 @@ def test_defer_without_any_server_says_so(mocker, tmp_path):
     assert r.exit_code == 0 and "--defer had no effect" in r.output
 
 
+# ---------------- --system-prompt ----------------
+
+def captured_cfg(mocker):
+    captured = {}
+    mocker.patch.object(cli_mod.CodingAgent, "__init__", lambda self, cfg: captured.update(cfg=cfg))
+    mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock(return_value="ok"))
+    return captured
+
+
+def test_system_prompt_flag_is_threaded_through(mocker, tmp_path):
+    captured = captured_cfg(mocker)
+    invoke("t", "--system-prompt", "Be terse.", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].system_prompt == "Be terse."
+
+
+def test_system_prompt_defaults_to_empty_meaning_built_in(mocker, tmp_path):
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].system_prompt == ""
+
+
+def test_system_prompt_file_is_read(mocker, tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("You are a reviewer.\n\nBe specific.\n")
+    captured = captured_cfg(mocker)
+    invoke("t", "--system-prompt-file", str(prompt), "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].system_prompt == "You are a reviewer.\n\nBe specific.\n"
+
+
+def test_both_system_prompt_flags_is_an_error(mocker, tmp_path):
+    r = invoke("t", "--system-prompt", "a", "--system-prompt-file", str(tmp_path / "p.md"),
+               "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "not both" in r.output
+
+
+def test_missing_system_prompt_file_is_an_error(mocker, tmp_path):
+    r = invoke("t", "--system-prompt-file", str(tmp_path / "nope.md"),
+               "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "could not read" in r.output
+
+
+def test_empty_system_prompt_file_is_an_error(mocker, tmp_path):
+    """Falling back to the built-in prompt would look like the flag was
+    ignored, which is worse than refusing."""
+    empty = tmp_path / "empty.md"
+    empty.write_text("\n  \n")
+    r = invoke("t", "--system-prompt-file", str(empty), "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "is empty" in r.output
+
+
 def test_run_value_error_exits_nonzero(mocker, tmp_path):
     mocker.patch.object(cli_mod.CodingAgent, "run",
                         mocker.AsyncMock(side_effect=ValueError("no session found")))
@@ -145,7 +198,7 @@ def test_help_lists_the_key_flags():
     out = invoke("--help").output
     for flag in ("--project-root", "--model", "--llm-host", "--llm-timeout",
                  "--auto-approve", "--safe-tool", "--resume", "--add-mcp-server",
-                 "--mcp-log-path"):
+                 "--mcp-log-path", "--system-prompt", "--system-prompt-file"):
         assert flag in out
 
 

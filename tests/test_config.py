@@ -66,6 +66,10 @@ def test_paths_have_sensible_relative_defaults():
     assert cfg.mcp_log_path.endswith(".log")
 
 
+def test_system_prompt_defaults_to_empty_meaning_built_in():
+    assert AgentConfig().system_prompt == ""
+
+
 def test_optional_model_overrides_default_to_empty():
     """Empty means "reuse `model`" for each of these."""
     cfg = AgentConfig()

@@ -222,6 +222,43 @@ def _identity_column(session_label: str, project_root: str) -> Table:
     return col
 
 
+_IS_WINDOWS = os.name == "nt"
+
+
+def _set_windows_console_title(title: str) -> None:
+    """SetConsoleTitleW, for Windows console hosts that don't process the
+    escape sequence (conhost without VT enabled). Harmless where the escape
+    also works — the title just gets set twice."""
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleTitleW(title)
+    except Exception:
+        pass
+
+
+def set_terminal_title(text: str):
+    """Name the terminal window/tab after the session.
+
+    Two mechanisms, because one doesn't cover every platform: the OSC 0
+    escape Rich emits works on xterm-family terminals (Linux), Terminal.app
+    and iTerm (macOS) and Windows Terminal, while older Windows consoles only
+    respond to SetConsoleTitleW. Rich writes the escape only when stdout is a
+    real terminal, so this is a no-op under a pipe or in tests.
+
+    Nothing restores the previous title on exit — a terminal can't be asked
+    what its title was — but most shells set their own on the next prompt."""
+    title = (text or "").strip()
+    if not title:
+        return
+    if _IS_WINDOWS:
+        _set_windows_console_title(title)
+    try:
+        console.set_window_title(title)
+    except Exception:
+        pass   # cosmetic; never let a terminal quirk break a run
+
+
 def header(session_label: str, project_root: str = ""):
     """Box-framed header, printed once when the REPL starts.
 
