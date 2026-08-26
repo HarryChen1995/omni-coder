@@ -6,6 +6,7 @@ import pytest
 from omni import agent as agent_mod
 from omni.agent import (
     _approve, _compact_messages, _ensure_tool_call_ids, _find_json_objects,
+    _quiet_library_logs,
     _format_elapsed, _load_project_memory, _protected_head_len,
     _recover_text_tool_calls, _render_for_summary, _setup_logger, _trim_history,
 )
@@ -387,3 +388,32 @@ async def test_compact_with_keep_last_zero_summarizes_everything_after_the_head(
 async def test_approve_treats_an_interrupted_prompt_as_denial(cfg, mocker, boom):
     mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock(side_effect=boom))
     assert await _approve("write_file", {}, cfg, mocker.AsyncMock()) is False
+
+
+# ---------------- library logging ----------------
+
+def test_library_logs_go_to_the_file_not_the_terminal(tmp_path):
+    """Without a handler of their own, third-party records reach stderr via
+    Python's last-resort handler — i.e. the middle of the UI. The mcp package
+    logs there when a transport struggles to reap a subprocess."""
+    import logging
+
+    log = tmp_path / "run.log"
+    _quiet_library_logs(str(log))
+    mcp_logger = logging.getLogger("mcp.os.posix.utilities")
+    mcp_logger.warning("Process group termination failed for PID 1")
+
+    assert mcp_logger.getEffectiveLevel() <= logging.WARNING
+    assert logging.getLogger("mcp").propagate is False
+    for handler in logging.getLogger("mcp").handlers:
+        handler.flush()
+    assert "Process group termination failed" in log.read_text()
+
+
+def test_quiet_library_logs_is_idempotent(tmp_path):
+    import logging
+
+    log = tmp_path / "run.log"
+    _quiet_library_logs(str(log))
+    _quiet_library_logs(str(log))
+    assert len(logging.getLogger("mcp").handlers) == 1   # no handler pile-up

@@ -733,3 +733,40 @@ async def test_file_exists_parses_boolean(client, mocker):
     assert await client.file_exists("x") is True
     builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="false")])
     assert await client.file_exists("x") is False
+
+
+# ---------------- connect timeout ----------------
+
+async def test_connect_gives_up_on_a_handshake_that_never_finishes(mocker, tmp_path):
+    """_serve resolves `ready` on success or failure; a server that does
+    neither used to leave this awaiting forever."""
+    client = MCPToolClient(str(tmp_path), mcp_log_path=str(tmp_path / "m.log"),
+                            connect_timeout_s=0.2)
+
+    async def never_ready(name, spec, ready, shutdown):
+        await asyncio.sleep(3600)
+
+    mocker.patch.object(client, "_serve", never_ready)
+    with pytest.raises(RuntimeError, match="did not finish connecting within 0.2s"):
+        await client._connect("stuck", {"command": "x"})
+    assert "stuck" not in client._server_tasks    # and it isn't left running
+
+
+async def test_stop_server_cancels_a_task_that_never_parks(mocker, tmp_path):
+    """The shutdown Event is only checked once a server is connected, so a
+    task still in the handshake never sees it — waiting for it turned a hung
+    startup into a hung teardown as well."""
+    client = MCPToolClient(str(tmp_path), mcp_log_path=str(tmp_path / "m.log"))
+    started = asyncio.Event()
+
+    async def ignores_shutdown(name, spec, ready, shutdown):
+        started.set()
+        await asyncio.sleep(3600)
+
+    mocker.patch.object(client, "_serve", ignores_shutdown)
+    task = asyncio.ensure_future(client._serve("x", {}, asyncio.get_running_loop().create_future(),
+                                                asyncio.Event()))
+    client._server_tasks["x"] = (task, asyncio.Event())
+    await started.wait()
+    await asyncio.wait_for(client._stop_server("x", grace_s=0), timeout=2)
+    assert task.cancelled() or task.done()

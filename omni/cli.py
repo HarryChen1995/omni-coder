@@ -166,6 +166,13 @@ def main(
     delete_session: Optional[str] = typer.Option(
         None, "--delete-session", help="Delete a saved session (by id or --session-name) and exit",
     ),
+    mcp_connect_timeout: float = typer.Option(
+        AgentConfig.mcp_connect_timeout_s, "--mcp-connect-timeout",
+        help="Seconds one MCP server gets to complete its handshake before the session "
+             "carries on without it. A server that starts but never speaks MCP (or an "
+             "unreachable URL) is reported as failed instead of blocking startup; "
+             "/mcp shows the error and /mcp restart <name> retries it.",
+    ),
     mcp_config: Optional[str] = typer.Option(
         None, "--mcp-config",
         help='Path to a Claude-Desktop-style MCP config file ({"mcpServers": {"name": '
@@ -316,6 +323,7 @@ def main(
         compact_keep_last=compact_keep_last,
         compact_model=compact_model or "",
         db_path=db_path,
+        mcp_connect_timeout_s=mcp_connect_timeout,
         mcp_config_path=effective_mcp_config_path,
         mcp_servers=extra_mcp_servers,
         safe_tools=AgentConfig.safe_tools + tuple(safe_tool),
@@ -430,6 +438,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                               llm_host=cfg.llm_host or None,
                               llm_api_key=cfg.llm_api_key or None,
                               mcp_log_path=cfg.mcp_log_path,
+                              connect_timeout_s=cfg.mcp_connect_timeout_s,
                               builtin_env=cfg.tool_server_env()) as client:
         await client.list_llm_tools()  # populate tool counts for /mcp before any task runs
         for e in client.server_status():

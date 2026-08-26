@@ -85,6 +85,53 @@ async def test_builtin_tool_call_round_trips(make_client, tmp_path):
         assert "hello from disk" in await client.call_tool("read_file", {"path": "probe.txt"})
 
 
+def wedged_script(path):
+    """A server that starts, holds stdio open, and never speaks MCP — the
+    shape of one that's misconfigured, waiting on a lock, or hung."""
+    path.write_text("import time\nwhile True:\n    time.sleep(3600)\n")
+    return {"command": sys.executable, "args": [str(path)]}
+
+
+async def test_a_server_that_never_speaks_mcp_does_not_block_startup(make_client, tmp_path):
+    """The regression this exists for: an unbounded wait on the handshake let
+    one bad entry hang the entire session before the REPL ever appeared."""
+    spec = wedged_script(tmp_path / "wedged.py")
+    start = time.monotonic()
+    async with make_client(extra_servers={"wedged": spec}, connect_timeout_s=2.0) as client:
+        elapsed = time.monotonic() - start
+        assert elapsed < 12, f"startup took {elapsed:.1f}s"
+
+        entry = next(e for e in client.server_status() if e["name"] == "wedged")
+        assert entry["connected"] is False
+        assert "did not finish connecting" in entry["error"]
+
+        # ...and the session is fully usable without it
+        names = [t["function"]["name"] for t in await client.list_llm_tools()]
+        assert "read_file" in names
+    assert live_children(tmp_path / "wedged.py", expected=0) == 0
+
+
+async def test_two_wedged_servers_cost_one_timeout_not_two(make_client, tmp_path):
+    """Connects run concurrently; serially, every bad server added its full
+    budget to startup."""
+    a = wedged_script(tmp_path / "w1.py")
+    b = wedged_script(tmp_path / "w2.py")
+    start = time.monotonic()
+    async with make_client(extra_servers={"a": a, "b": b}, connect_timeout_s=2.0) as client:
+        elapsed = time.monotonic() - start
+        assert elapsed < 6, f"startup took {elapsed:.1f}s for two 2s budgets"
+        assert [e["connected"] for e in client.server_status() if e["name"] in ("a", "b")] == [False, False]
+
+
+async def test_restarting_a_wedged_server_is_bounded_too(make_client, tmp_path):
+    spec = wedged_script(tmp_path / "wedged.py")
+    async with make_client(extra_servers={"wedged": spec}, connect_timeout_s=2.0) as client:
+        start = time.monotonic()
+        entry = await client.restart_server("wedged")
+        assert time.monotonic() - start < 12
+        assert entry["connected"] is False and "did not finish connecting" in entry["error"]
+
+
 async def test_builtin_server_honors_the_tool_config_it_is_given(make_client, tmp_path):
     """The tools run in a subprocess, so these knobs only take effect if they
     are handed across that boundary — set on AgentConfig alone they used to

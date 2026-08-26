@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-795%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-804%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -427,7 +427,17 @@ A custom server failing to connect doesn't take down the whole session —
 only the built-in server (which provides the core file/shell tools) is
 fatal if it can't start; every other server's connection failure is just
 recorded and shown as ❌ in `/mcp` (see [Session management](#session-management)),
-so the rest of the session still starts normally. Every stdio-transport
+so the rest of the session still starts normally.
+
+That includes a server that *doesn't* fail outright but never finishes
+connecting — misconfigured, waiting on a lock, hung, or a URL nothing answers.
+Each server gets `--mcp-connect-timeout` seconds (default 20) to complete its
+MCP handshake before the session writes it off and carries on; `/mcp` shows
+why, and `/mcp restart <name>` retries it once you've fixed it. Servers are
+connected concurrently, so several slow ones cost one timeout rather than one
+each. Third-party log records (the `mcp` package's transport warnings among
+them) are routed to the run log rather than the terminal, so they can't print
+over the UI. Every stdio-transport
 server's stderr — built-in and custom alike — is redirected to
 `--mcp-log-path` (default `mcp_servers.log`) instead of the terminal, so a
 chatty or crashing server's raw debug output doesn't interleave with the
@@ -679,7 +689,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-795 tests, 94% branch coverage (the badge numbers are the full suite,
+804 tests, 94% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"

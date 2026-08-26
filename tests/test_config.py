@@ -66,6 +66,11 @@ def test_paths_have_sensible_relative_defaults():
     assert cfg.mcp_log_path.endswith(".log")
 
 
+def test_mcp_connect_timeout_is_bounded_by_default():
+    """A server that never completes its handshake must not hang the session."""
+    assert AgentConfig().mcp_connect_timeout_s == 20.0
+
+
 def test_system_prompt_defaults_to_empty_meaning_built_in():
     assert AgentConfig().system_prompt == ""
 

@@ -66,6 +66,12 @@ class AgentConfig:
     mcp_log_path: str = "mcp_servers.log"
     db_path: str = "agent_sessions.db"  # SQLite file storing session/message history
 
+    # How long one MCP server gets to complete its handshake before the
+    # session gives up on it and carries on without it. A server that starts
+    # but never speaks MCP (misconfigured, waiting on a lock, an unreachable
+    # URL) would otherwise hold up startup indefinitely.
+    mcp_connect_timeout_s: float = 20.0
+
     # Optional path to a Claude-Desktop-style MCP config file
     # ({"mcpServers": {"name": {"command": ..., "args": [...], "env": {...}}}})
     # for adding extra tool servers beyond the built-in one. Empty = none.

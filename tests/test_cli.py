@@ -163,6 +163,13 @@ def test_empty_system_prompt_file_is_an_error(mocker, tmp_path):
     assert r.exit_code == 1 and "is empty" in r.output
 
 
+def test_mcp_connect_timeout_flag_is_threaded_through(mocker, tmp_path):
+    captured = captured_cfg(mocker)
+    invoke("t", "--mcp-connect-timeout", "5", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].mcp_connect_timeout_s == 5.0
+
+
 def test_run_value_error_exits_nonzero(mocker, tmp_path):
     mocker.patch.object(cli_mod.CodingAgent, "run",
                         mocker.AsyncMock(side_effect=ValueError("no session found")))
@@ -198,7 +205,8 @@ def test_help_lists_the_key_flags():
     out = invoke("--help").output
     for flag in ("--project-root", "--model", "--llm-host", "--llm-timeout",
                  "--auto-approve", "--safe-tool", "--resume", "--add-mcp-server",
-                 "--mcp-log-path", "--system-prompt", "--system-prompt-file"):
+                 "--mcp-log-path", "--system-prompt", "--system-prompt-file",
+                 "--mcp-connect-timeout"):
         assert flag in out
 
 

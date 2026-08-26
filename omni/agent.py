@@ -55,6 +55,27 @@ def _load_project_memory(project_root: str, memory_path: str) -> str:
         return f.read().strip()
 
 
+# Third-party loggers we don't want writing to the terminal. Without a handler
+# of their own, Python's last-resort handler sends their records to stderr —
+# which is the middle of the UI. The mcp package logs there when a transport
+# has trouble reaping a subprocess, so a wedged server printed its plumbing
+# over the header.
+_LIBRARY_LOGGERS = ("mcp", "anyio", "asyncio", "httpx", "httpcore")
+
+
+def _quiet_library_logs(log_path: str) -> None:
+    """Route third-party log records into our own log file instead of the
+    terminal. Their content is worth keeping — just not on screen."""
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    for name in _LIBRARY_LOGGERS:
+        library = logging.getLogger(name)
+        for existing in library.handlers:
+            existing.close()
+        library.handlers = [handler]
+        library.propagate = False
+
+
 def _setup_logger(log_path: str) -> logging.Logger:
     logger = logging.getLogger("omni")
     logger.setLevel(logging.INFO)
@@ -303,6 +324,7 @@ class CodingAgent:
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
         self.logger = _setup_logger(cfg.log_path)
+        _quiet_library_logs(cfg.log_path)
         self.force_approval = False  # set True for the run if intent is high-risk
         self.last_reasoning = ""     # chain of thought from the latest reply, for /reasoning
         self.store = SessionStore(cfg.db_path)
@@ -412,6 +434,7 @@ class CodingAgent:
                                       llm_host=self.cfg.llm_host or None,
                                       llm_api_key=self.cfg.llm_api_key or None,
                                       mcp_log_path=self.cfg.mcp_log_path,
+                                      connect_timeout_s=self.cfg.mcp_connect_timeout_s,
                                       builtin_env=self.cfg.tool_server_env()) as owned_client:
                 return await self._run_loop(task, session_id, messages, persisted, resuming, owned_client)
         except asyncio.CancelledError:

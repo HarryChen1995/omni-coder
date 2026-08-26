@@ -382,7 +382,8 @@ class MCPToolClient:
     def __init__(self, project_root: str, server_path: str = None,
                  mcp_config_path: str = None, extra_servers: dict = None,
                  embedding_model: str = "", llm_host: str = None, llm_api_key: str = None,
-                 mcp_log_path: str = "mcp_servers.log", builtin_env: dict = None):
+                 mcp_log_path: str = "mcp_servers.log", builtin_env: dict = None,
+                 connect_timeout_s: float = 20.0):
         self.project_root = project_root
         # Environment for the built-in server subprocess, carrying the
         # tool-side config knobs across the process boundary (see
@@ -393,6 +394,9 @@ class MCPToolClient:
         # redirected here instead of the terminal — opened lazily in
         # __aenter__ and closed via self._stack on exit.
         self.mcp_log_path = mcp_log_path or "mcp_servers.log"
+        # How long one server gets to complete its MCP handshake before it is
+        # written off and the session continues without it.
+        self.connect_timeout_s = connect_timeout_s
         self._server_log_file = None
         # Default: run the built-in server as `python -m <package>.mcp_server`
         # rather than by file path — mcp_server.py uses relative imports
@@ -479,39 +483,88 @@ class MCPToolClient:
                 if not ready.done():
                     ready.set_result(session)
                 await shutdown.wait()
+        except asyncio.CancelledError:
+            # We cancelled it (a connect timeout, or shutdown). That is not a
+            # diagnosis, and recording it would overwrite the real one.
+            raise
         except BaseException as e:
             # A failure after the session was handed over (transport dropped,
             # or the benign teardown race) can't be reported through `ready`
             # anymore — record it for /mcp instead of crashing the REPL.
-            if not _is_benign_shutdown_race(e):
+            # Never clobber an error already recorded for this server: the
+            # timeout message names what actually went wrong.
+            if not _is_benign_shutdown_race(e) and name not in self._connect_errors:
                 self._connect_errors[name] = f"MCP server {name!r} connection ended: {e}"
             if not ready.done():
                 ready.set_exception(RuntimeError(f"Failed to start MCP server {name!r}: {e}"))
 
     async def _connect(self, name: str, spec: dict) -> ClientSession:
         """Start `name`'s owning task and wait for its session (see _serve).
-        Raises RuntimeError if it couldn't connect."""
+        Raises RuntimeError if it couldn't connect — including if it simply
+        never finished connecting.
+
+        The wait is bounded. A server that fails outright reports back through
+        `ready` and is handled; a server that *starts but never speaks MCP* —
+        misconfigured, waiting on a lock, wedged, or an unreachable URL whose
+        transport sits waiting for an endpoint event — leaves `ready` pending
+        forever, and an unbounded await here blocked the whole session on one
+        bad entry."""
         ready: asyncio.Future = asyncio.get_running_loop().create_future()
         shutdown = asyncio.Event()
         task = asyncio.ensure_future(self._serve(name, spec, ready, shutdown))
         self._server_tasks[name] = (task, shutdown)
         try:
-            return await ready
+            return await asyncio.wait_for(ready, self.connect_timeout_s)
+        except asyncio.TimeoutError:
+            # grace_s=0: it never connected, so it is not parked on `shutdown`
+            # and waiting out a grace period would only add to the delay.
+            await self._stop_server(name, grace_s=0)
+            raise RuntimeError(
+                f"MCP server {name!r} did not finish connecting within "
+                f"{self.connect_timeout_s:g}s — it started but never completed the MCP "
+                f"handshake. Check {self.mcp_log_path} for what it printed."
+            ) from None
         except BaseException:
             await self._stop_server(name)
             raise
 
-    async def _stop_server(self, name: str) -> None:
+    # After cancelling a server's task, the transport still needs a moment to
+    # terminate and reap its subprocess. This is separate from the graceful
+    # grace period: passing grace_s=0 means "don't wait to park", not "don't
+    # let the child be cleaned up" — conflating them left wedged servers
+    # running after the session exited.
+    _UNWIND_BUDGET_S = 5.0
+
+    async def _stop_server(self, name: str, grace_s: float = 5.0) -> None:
         """Signal one server's owning task to tear its connection down, and
         wait for it — so a restart never leaves the old subprocess running
-        alongside its replacement."""
+        alongside its replacement.
+
+        Bounded, and cancelled if the grace period passes: the shutdown Event
+        is only checked once a server is connected and parked, so a task still
+        stuck in the handshake never sees it. Waiting forever there turned a
+        wedged server into a hung teardown as well as a hung startup."""
         entry = self._server_tasks.pop(name, None)
         if entry is None:
             return
         task, shutdown = entry
         shutdown.set()
+        if grace_s > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), grace_s)
+                return
+            except asyncio.TimeoutError:
+                pass      # never parked on `shutdown`; cancel it below
+            except BaseException as e:
+                if not _is_benign_shutdown_race(e):
+                    raise
+                return
+        task.cancel()
         try:
-            await task
+            await asyncio.wait_for(asyncio.shield(task), self._UNWIND_BUDGET_S)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass          # transport refused to unwind; better a stray child
+                           # than a hung session
         except BaseException as e:
             if not _is_benign_shutdown_race(e):
                 raise
@@ -533,15 +586,26 @@ class MCPToolClient:
 
         servers = dict(load_mcp_config(self.mcp_config_path)) if self.mcp_config_path else {}
         servers.update(self.extra_servers)  # CLI-specified --mcp-server entries win on name clash
-        for name, spec in servers.items():
-            self._server_specs[name] = spec
+
+        async def _attach(name: str, spec: dict):
             try:
-                self._sessions[name] = await self._connect(name, spec)
-                self._connected_at[name] = time.monotonic()
-                if spec.get("defer"):
-                    self._deferred_servers.add(name)
+                session = await self._connect(name, spec)
             except RuntimeError as e:
                 self._connect_errors[name] = str(e)
+                return
+            self._sessions[name] = session
+            self._connected_at[name] = time.monotonic()
+            if spec.get("defer"):
+                self._deferred_servers.add(name)
+
+        # Concurrently: each server already owns its own task, and connecting
+        # them one at a time meant every server that had to time out added its
+        # full budget to startup. Status order still follows configured order,
+        # since _server_specs is populated up front.
+        for name, spec in servers.items():
+            self._server_specs[name] = spec
+        if servers:
+            await asyncio.gather(*(_attach(n, sp) for n, sp in servers.items()))
 
         # Catalog resources once here rather than on every list_llm_tools()
         # call (which runs per turn) — it decides whether the resource tools
@@ -549,8 +613,11 @@ class MCPToolClient:
         # uri -> server routing. The list_resources tool re-reads it live, so
         # a server publishing resources later is still reachable that way.
         try:
-            self._resources = await self.list_resources()
-        except Exception:
+            self._resources = await asyncio.wait_for(self.list_resources(),
+                                                      self.connect_timeout_s)
+        except (Exception, asyncio.TimeoutError):
+            # A server that connected but won't answer resources/list must not
+            # hold up the session either.
             self._resources = {}
         return self
 
