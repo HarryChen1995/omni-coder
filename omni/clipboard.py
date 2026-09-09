@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote
 
 # Bigger than this and it isn't worth sending: it has to be base64'd into the
 # request, and it stays in the conversation for every later turn.
@@ -32,6 +33,51 @@ _EXTENSION_MIME = {
 
 def _run(argv: list, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, timeout=10, **kwargs)
+
+
+def _from_file_reference() -> tuple:
+    """The file the user copied, when they copied a *file* rather than a picture.
+
+    Cmd+C on a file in Finder doesn't put the picture on the clipboard — it
+    puts a reference to the file, and alongside it an image of the file's
+    *icon*. Coercing the clipboard to a PNG therefore hands you a JPEG
+    placeholder icon rather than the photo, which is a confusing thing to send
+    a model. So the reference is asked for first, and the file read from disk;
+    only if there is no file reference does the clipboard's own image count.
+
+    (Copying inside Preview or a browser puts no file reference on the
+    clipboard, so nothing changes for that case.)"""
+    for path in _file_paths():
+        found = _from_text_path(path)
+        if found:
+            return found
+    return None
+
+
+def _file_paths() -> list:
+    """Paths of files on the clipboard — however this platform names them."""
+    if sys.platform == "darwin":
+        argv = ["osascript", "-e", "POSIX path of (the clipboard as «class furl»)"]
+    elif sys.platform == "win32":
+        argv = ["powershell", "-NoProfile", "-Command",
+                "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"]
+    else:
+        argv = ["wl-paste", "--no-newline", "--type", "text/uri-list"]
+    try:
+        result = _run(argv)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0 and sys.platform not in ("darwin", "win32"):
+        try:
+            result = _run(["xclip", "-selection", "clipboard", "-t", "text/uri-list", "-o"])
+        except (OSError, subprocess.SubprocessError):
+            return []
+    if result.returncode != 0:
+        return []
+    text = result.stdout.decode("utf-8", "replace")
+    # GNOME's flavour of the same thing starts with a "copy"/"cut" line.
+    return [line for line in text.splitlines()
+            if line.strip() and line.strip() not in ("copy", "cut")]
 
 
 def _from_macos() -> tuple:
@@ -111,7 +157,8 @@ def _from_text_path(text: str) -> tuple:
     the clipboard held no image."""
     candidate = (text or "").strip().strip('"').strip("'")
     if candidate.startswith("file://"):
-        candidate = candidate[len("file://"):]
+        # A URI, so spaces and anything else awkward arrive percent-encoded.
+        candidate = unquote(candidate[len("file://"):])
     if not candidate or "\n" in candidate:
         return None
     candidate = os.path.expanduser(candidate)
@@ -149,7 +196,9 @@ def grab_image() -> tuple:
     readers = {"darwin": _from_macos, "win32": _from_windows}
     reader = readers.get(sys.platform, _from_linux)
     try:
-        grabbed = reader() or _from_text_path(clipboard_text())
+        # A copied file first, then an image on the clipboard itself, then a
+        # path someone typed or copied as text.
+        grabbed = _from_file_reference() or reader() or _from_text_path(clipboard_text())
     except Exception:
         return None      # a clipboard is never worth an exception
     if not grabbed:

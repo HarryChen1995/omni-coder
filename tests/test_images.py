@@ -294,6 +294,7 @@ async def test_the_echo_says_how_many_images_went_along(app, mocker):
 
 def test_grab_image_returns_none_when_the_tool_is_missing(mocker):
     mocker.patch("omni.clipboard._run", side_effect=OSError("no such binary"))
+    mocker.patch("omni.clipboard._file_paths", return_value=[])
     mocker.patch("omni.clipboard.clipboard_text", return_value="")
     assert clipboard.grab_image() is None
 
@@ -301,7 +302,7 @@ def test_grab_image_returns_none_when_the_tool_is_missing(mocker):
 def test_grab_image_never_raises(mocker):
     """The clipboard is not worth an exception: a failure here has to look
     like an ordinary text paste, not a crashed session."""
-    mocker.patch.dict(clipboard.__dict__, {})
+    mocker.patch("omni.clipboard._file_paths", return_value=[])
     mocker.patch("omni.clipboard._from_macos", side_effect=RuntimeError("boom"))
     mocker.patch("omni.clipboard._from_linux", side_effect=RuntimeError("boom"))
     mocker.patch("omni.clipboard._from_windows", side_effect=RuntimeError("boom"))
@@ -311,6 +312,7 @@ def test_grab_image_never_raises(mocker):
 def test_an_oversized_image_is_refused(mocker):
     """It would be base64'd into the request and kept there for the rest of
     the session."""
+    mocker.patch("omni.clipboard._file_paths", return_value=[])
     mocker.patch("omni.clipboard._from_macos",
                   return_value=("image/png", b"x" * (clipboard.MAX_BYTES + 1)))
     mocker.patch("omni.clipboard._from_linux",
@@ -318,6 +320,117 @@ def test_an_oversized_image_is_refused(mocker):
     mocker.patch("omni.clipboard._from_windows",
                   return_value=("image/png", b"x" * (clipboard.MAX_BYTES + 1)))
     assert clipboard.grab_image() is None
+
+
+def test_a_copied_file_beats_the_icon_the_clipboard_offers(mocker, tmp_path):
+    """Cmd+C (or right-click → Copy) on a file in Finder puts a *reference*
+    to the file on the clipboard and, alongside it, a picture of the file's
+    icon. Coercing the clipboard to a PNG hands you the icon — a model then
+    dutifully describes "a JPEG placeholder icon" instead of the photo. The
+    file reference has to win."""
+    path = tmp_path / "white-house.jpeg"
+    path.write_bytes(b"\xff\xd8\xff the real photo")
+    mocker.patch("omni.clipboard._file_paths", return_value=[str(path)])
+    mocker.patch("omni.clipboard._from_macos", return_value=("image/png", b"an icon"))
+    mocker.patch("omni.clipboard._from_linux", return_value=("image/png", b"an icon"))
+    mocker.patch("omni.clipboard._from_windows", return_value=("image/png", b"an icon"))
+    assert clipboard.grab_image() == ("image/jpeg", b"\xff\xd8\xff the real photo")
+
+
+def test_a_copied_file_that_is_not_an_image_falls_through(mocker, tmp_path):
+    """Copying a .txt in Finder shouldn't stop an image on the clipboard from
+    being found."""
+    path = tmp_path / "notes.txt"
+    path.write_text("hello")
+    mocker.patch("omni.clipboard._file_paths", return_value=[str(path)])
+    reader = {"darwin": "_from_macos", "win32": "_from_windows"}.get(sys.platform, "_from_linux")
+    mocker.patch(f"omni.clipboard.{reader}", return_value=("image/png", PNG))
+    assert clipboard.grab_image() == ("image/png", PNG)
+
+
+def test_a_file_reference_with_no_image_flavour_at_all(mocker, tmp_path):
+    """The other half of the same bug: when the clipboard holds *only* a file
+    reference, pbpaste is empty, so before this there was nothing to find and
+    the paste silently did nothing."""
+    path = tmp_path / "shot.png"
+    path.write_bytes(PNG)
+    mocker.patch("omni.clipboard._file_paths", return_value=[str(path)])
+    mocker.patch("omni.clipboard._from_macos", return_value=None)
+    mocker.patch("omni.clipboard._from_linux", return_value=None)
+    mocker.patch("omni.clipboard._from_windows", return_value=None)
+    mocker.patch("omni.clipboard.clipboard_text", return_value="")
+    assert clipboard.grab_image() == ("image/png", PNG)
+
+
+def test_macos_asks_the_clipboard_for_a_file_url(mocker):
+    run = mocker.patch("omni.clipboard._run",
+                        return_value=mocker.Mock(returncode=0, stdout=b"/tmp/a.png\n"))
+    mocker.patch.object(clipboard.sys, "platform", "darwin")
+    assert clipboard._file_paths() == ["/tmp/a.png"]
+    assert "furl" in run.call_args.args[0][-1]
+
+
+def test_windows_asks_for_the_file_drop_list(mocker):
+    mocker.patch("omni.clipboard._run",
+                  return_value=mocker.Mock(returncode=0, stdout=b"C:\\pics\\a.png\r\n"))
+    mocker.patch.object(clipboard.sys, "platform", "win32")
+    assert clipboard._file_paths() == ["C:\\pics\\a.png"]
+
+
+def test_linux_reads_a_uri_list_and_falls_back_to_xclip(mocker):
+    def fake_run(argv, **kw):
+        ok = argv[0] == "xclip"
+        return mocker.Mock(returncode=0 if ok else 1,
+                            stdout=b"file:///tmp/a%20b.png\n" if ok else b"")
+
+    mocker.patch("omni.clipboard._run", side_effect=fake_run)
+    mocker.patch.object(clipboard.sys, "platform", "linux")
+    assert clipboard._file_paths() == ["file:///tmp/a%20b.png"]
+
+
+def test_no_uri_list_tool_on_linux_is_not_an_error(mocker):
+    """Neither wl-paste nor xclip installed: no files, no exception."""
+    mocker.patch("omni.clipboard._run", side_effect=FileNotFoundError())
+    mocker.patch.object(clipboard.sys, "platform", "linux")
+    assert clipboard._file_paths() == []
+
+
+def test_linux_survives_xclip_being_absent_after_wl_paste_fails(mocker):
+    def fake_run(argv, **kw):
+        if argv[0] == "xclip":
+            raise FileNotFoundError()
+        return mocker.Mock(returncode=1, stdout=b"")
+
+    mocker.patch("omni.clipboard._run", side_effect=fake_run)
+    mocker.patch.object(clipboard.sys, "platform", "linux")
+    assert clipboard._file_paths() == []
+
+
+def test_an_empty_uri_list_is_no_files(mocker):
+    mocker.patch("omni.clipboard._run", return_value=mocker.Mock(returncode=1, stdout=b""))
+    mocker.patch.object(clipboard.sys, "platform", "darwin")
+    assert clipboard._file_paths() == []
+
+
+def test_a_gnome_copied_files_header_is_not_a_path(mocker):
+    """Nautilus prefixes the list with the operation."""
+    mocker.patch("omni.clipboard._run",
+                  return_value=mocker.Mock(returncode=0, stdout=b"copy\nfile:///tmp/a.png\n"))
+    mocker.patch.object(clipboard.sys, "platform", "linux")
+    assert clipboard._file_paths() == ["file:///tmp/a.png"]
+
+
+def test_no_file_on_the_clipboard_is_not_an_error(mocker):
+    mocker.patch("omni.clipboard._run", side_effect=FileNotFoundError())
+    assert clipboard._file_paths() == []
+
+
+def test_a_percent_encoded_path_is_decoded(tmp_path):
+    """file:// URIs escape spaces, and "a%20b.png" is not a filename."""
+    path = tmp_path / "white house.png"
+    path.write_bytes(PNG)
+    uri = "file://" + str(path).replace(" ", "%20")
+    assert clipboard._from_text_path(uri) == ("image/png", PNG)
 
 
 def test_a_clipboard_holding_a_path_to_an_image_counts(tmp_path):
@@ -454,6 +567,7 @@ def test_clipboard_text_survives_undecodable_bytes(mocker):
 def test_grab_image_falls_back_to_a_path_on_the_clipboard(mocker, tmp_path):
     path = tmp_path / "diagram.png"
     path.write_bytes(PNG)
+    mocker.patch("omni.clipboard._file_paths", return_value=[])
     mocker.patch("omni.clipboard._from_macos", return_value=None)
     mocker.patch("omni.clipboard._from_linux", return_value=None)
     mocker.patch("omni.clipboard._from_windows", return_value=None)
@@ -462,6 +576,7 @@ def test_grab_image_falls_back_to_a_path_on_the_clipboard(mocker, tmp_path):
 
 
 def test_grab_image_returns_an_image_from_the_clipboard_itself(mocker):
+    mocker.patch("omni.clipboard._file_paths", return_value=[])
     reader = {"darwin": "_from_macos", "win32": "_from_windows"}.get(sys.platform, "_from_linux")
     mocker.patch(f"omni.clipboard.{reader}", return_value=("image/png", PNG))
     assert clipboard.grab_image() == ("image/png", PNG)

@@ -75,8 +75,9 @@ Run `omni --help` for the full option list.
   left exactly as they were. Ctrl+V rather than Cmd+V because Cmd+V is the
   *terminal's* own paste and no terminal can hand an application image data,
   so the clipboard is read directly (`osascript` / `wl-paste` / `xclip` /
-  PowerShell, none a hard dependency); with no image on the clipboard the key
-  pastes text as usual. Images are stored with the message, so a resumed
+  PowerShell, none a hard dependency). A file copied in Finder works too, and
+  is preferred over the icon rendering the clipboard offers beside it; with no
+  image on the clipboard at all the key pastes text as usual. Images are stored with the message, so a resumed
   session still sends what the model saw.
 - **Token counts** — every turn shows what it cost (`Responded (16.0s · ↑ 3.3k
   ↓ 115)`, and live beside the spinner), from the server's own
@@ -235,7 +236,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-965 tests, 88% branch coverage — hermetic (no model, server, or network
+977 tests, 88% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

@@ -221,8 +221,14 @@ It inserts text, and there is no escape sequence by which a terminal could
 hand an application image data — so the application has to read the clipboard
 itself, which needs a keystroke the terminal passes through. `osascript` does
 it on macOS, `wl-paste`/`xclip` on Linux, PowerShell on Windows; none is a
-hard dependency, and a clipboard holding a *path* to an image counts as an
-image (copying a file in Finder gives you its path).
+hard dependency.
+
+**A copied file works too** — Cmd+C or right-click → Copy on an image in
+Finder (or a file manager, or a path you copied as text). That case is asked
+about *first*, because Finder puts a reference to the file on the clipboard
+and, alongside it, a picture of the file's *icon*: coercing the clipboard to
+a PNG hands you the icon, and the model then dutifully describes "a JPEG
+placeholder icon" instead of your photo.
 
 When the clipboard holds no image Ctrl+V pastes its text instead, so the key
 does the ordinary thing when there's nothing to attach.
@@ -896,7 +902,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-965 tests, 88% branch coverage (the badge numbers are the full suite,
+977 tests, 88% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
