@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-846%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-902%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -102,6 +102,75 @@ gets appended after whichever prompt is in force.
 The prompt is stored as the session's first message, so `--resume` continues
 with the prompt that session started with — changing the flag later doesn't
 rewrite a conversation already underway.
+
+## 🤖 Several agents at once
+
+The agent can hand a self-contained piece of work to another agent with the
+`spawn_agent` tool. Each subagent is a session of its own — its own history,
+its own step budget (`--subagent-max-steps`, default 40), optionally its own
+model (`--subagent-model`) and its own system prompt, which the parent can
+set per subagent. Only its **final answer** comes back as the tool result:
+
+```
+▸ [2] 🤖 spawn_agent(task="Read README.md and report its title", name="readme")
+  ⎿  ✓ The title of the document is **Test project**. · 56.4s
+
+  ▸ 🤖 subagent files   ·  13 blocks  ·  reported back
+  ▸ 🤖 subagent readme  ·  6 blocks  ·  reported back
+  Responded (16.0s · ↑ 3.3k ↓ 115)
+```
+
+That is the point of the arrangement: the parent reasons on the conclusion
+instead of carrying every step the subagent took in its context.
+
+More than one arises naturally: the model can issue several `spawn_agent` calls
+in a single turn, and since spawning changes nothing by itself it's a safe
+tool, so those run **concurrently** — three subagents cost one subagent's
+wall-clock, not three.
+
+While they run, the agents appear as a tree under the input line, and each has
+a pane of its own — its own transcript, scrolled and clicked like main's, and
+its own token count:
+
+```
+──────────────────────────────────────────────────── test omni ──
+❯
+─────────────────────────────────────────────────────────────────
+  qwen3.6:35b  ·  working…  ·  ctrl+c interrupts  ·  ctrl+←→ switch
+  ○ main  Running spawn_agent, spawn_agent… (16.1s)
+  ├─ ○ 1 files   Thinking… (16.0s)
+  └─ ● 2 readme
+```
+
+`○` is working, `●` (green) has finished and reported back, `!` is waiting on
+you for an approval or an answer, `✕` was interrupted or failed. With the
+prompt empty, ↑/↓ walk the tree and Enter switches — the tree is right there
+under the input, so that's where the arrows go; type anything and they belong
+to the line again. That works **while an agent is busy**, which is exactly when
+you want to look at another one. Rows are clickable too, and `/agent` lists
+them, `/agent <n>` switches, `/agent close <n>` drops one.
+
+Interrupting is per agent: Ctrl+C in a subagent's pane stops that subagent and
+nothing else, and the parent is told in as many words — "interrupted by the
+user before it finished, so there is no answer; don't spawn it again unless
+asked" — because a model told only "it didn't finish" tends to try the same
+job again. A subagent that errors reports the reason the same way.
+
+Once every subagent has finished, they fold into main's transcript as one
+clickable block each and the tree disappears — nothing is lost: the block holds
+everything that agent did, its answer is already in the conversation, and its
+session is still in the database (`--list-sessions`, `--resume`).
+
+Turns run concurrently, so main keeps working while you read or type at a
+subagent, and anything you type at a busy agent queues for its next turn.
+Approvals and questions stay with the agent that raised them: a background
+subagent asking to write a file waits in its own pane (flagged `!`) instead of
+seizing the screen. A subagent can't spawn subagents — one level, on purpose.
+
+Flags: `--subagent-model` runs them on something smaller and faster than main
+(exploration and review are where that pays off), `--subagent-max-steps`
+(default 40) caps one subagent separately from `--max-steps` so a runaway one
+can't eat the whole run.
 
 ## ❓ Asking you a question
 
@@ -356,6 +425,19 @@ makes the transcript clickable:
 ────────────────────────────────────────────────────────────────────────
   qwen3.6:35b  ·  ⏎ send  ·  / commands  ·  click ▸ to expand  ·  …
 ```
+
+Each turn's line also carries what it cost — `Responded (16.0s · ↑ 3.3k ↓ 115)`
+and, live, next to the spinner — taken from the `prompt_tokens` /
+`completion_tokens` the server reports, so the count is its own rather than a
+guess. Everything that spends tokens on an agent's behalf is counted, intent
+parsing and history compaction included, and each agent counts only its own:
+switch to a subagent and the number beside its spinner is what *it* has spent.
+
+`--theme-color '#00b4d8'` recolours the accent — prompt, spinners, tool calls,
+the agent tree, panel borders — if the default rust doesn't suit your terminal.
+The hex is matched to whatever colour depth your terminal reports, so on a
+256-colour terminal (macOS Terminal.app, say) you get the nearest palette
+entry rather than the exact value.
 
 Clicking a `▸` line opens that block in place — a tool call shows every
 argument and its entire result, a reasoning block shows the whole chain of
@@ -758,7 +840,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-846 tests, 88% branch coverage (the badge numbers are the full suite,
+902 tests, 88% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
@@ -773,11 +855,11 @@ Per module (branch coverage, whole suite):
 | Module | Cover | Module | Cover |
 |---|---|---|---|
 | `config.py` | 100% | `agent.py` | 94% |
-| `mcp_server.py` | 100% | `mcp_client.py` | 94% |
+| `mcp_server.py` | 100% | `mcp_client.py` | 93% |
 | `session_store.py` | 100% | `tools.py` | 93% |
-| `llm_client.py` | 99% | `tui.py` | 86% |
-| `intent.py` | 98% | `cli.py` | 81% |
-| | | `ui.py` | 78% |
+| `llm_client.py` | 99% | `tui.py` | 87% |
+| `intent.py` | 98% | `ui.py` | 85% |
+| | | `cli.py` | 76% |
 
 `ui.py` and `tui.py` carry the drawing code, most of which is only exercised
 by rendering it — the numbers there are lower on purpose: the transcript's

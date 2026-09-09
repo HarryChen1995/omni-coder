@@ -48,6 +48,19 @@ def _normalize_messages(messages: list) -> list:
     return normalized
 
 
+def add_usage(total: dict, call: dict) -> dict:
+    """Accumulate one response's usage block into a running total.
+
+    Separate from chat()'s `usage` out-param, which reports a single call:
+    anything that retries, or makes several calls for one turn, has to add
+    them up rather than overwrite."""
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = (call or {}).get(key)
+        if value:
+            total[key] = total.get(key, 0) + int(value)
+    return total
+
+
 def _content_from_reasoning(message: dict) -> dict:
     """Recover the answer when a server put it in a reasoning field.
 
@@ -86,9 +99,15 @@ async def chat(
     base_url: str = None,
     api_key: str = None,
     timeout: float = 300.0,
+    usage: dict = None,
 ) -> dict:
     """POST /v1/chat/completions (OpenAI-compatible) with stream=false and
     return the `message` dict.
+
+    Pass a dict as `usage` to receive the response's usage block in it
+    (prompt_tokens / completion_tokens / total_tokens). Filled in place
+    rather than returned so the return type stays the message and every
+    existing caller is unaffected.
 
     Response shape is `choices[0].message`, which already has the
     role/content/tool_calls keys the rest of the agent expects.
@@ -129,6 +148,8 @@ async def chat(
     message = choices[0].get("message")
     if message is None:
         raise LLMError(f"Unexpected response shape from LLM server (no 'message' key): {data}")
+    if usage is not None and isinstance(data.get("usage"), dict):
+        usage.update(data["usage"])
     return _content_from_reasoning(message)
 
 

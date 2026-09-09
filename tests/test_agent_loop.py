@@ -7,6 +7,7 @@ persistence, cancellation, retries — is driven deterministically.
 
 import asyncio
 import copy
+import time
 
 import pytest
 
@@ -346,7 +347,7 @@ async def test_intent_parsing_is_skipped_when_resuming_with_no_new_task(agent, c
 async def test_history_is_compacted_when_over_budget(agent, client, mocker):
     agent.cfg.context_char_budget = 10
     compact = mocker.patch.object(agent_mod, "_compact_messages",
-                                  mocker.AsyncMock(side_effect=lambda m, *a: m))
+                                  mocker.AsyncMock(side_effect=lambda m, *a, **kw: m))
     replies(mocker, text_reply("fin"))
     await agent.run("a task long enough to exceed the tiny budget", client=client)
     compact.assert_awaited()
@@ -542,7 +543,7 @@ async def test_automatic_compaction_is_written_back_to_the_store(agent, client, 
     reloads everything that was just summarized away."""
     agent.cfg.context_char_budget = 10
     mocker.patch.object(agent_mod, "_compact_messages", mocker.AsyncMock(
-        side_effect=lambda msgs, *a: [msgs[0], {"role": "system", "content": "BRIEFING"}]))
+        side_effect=lambda msgs, *a, **kw: [msgs[0], {"role": "system", "content": "BRIEFING"}]))
     replies(mocker, text_reply("fin"))
     await agent.run("a task long enough to exceed the tiny budget", client=client)
 
@@ -554,7 +555,7 @@ async def test_automatic_compaction_is_written_back_to_the_store(agent, client, 
 async def test_a_no_op_compaction_leaves_the_store_alone(agent, client, mocker):
     agent.cfg.context_char_budget = 10
     mocker.patch.object(agent_mod, "_compact_messages",
-                        mocker.AsyncMock(side_effect=lambda msgs, *a: msgs))
+                        mocker.AsyncMock(side_effect=lambda msgs, *a, **kw: msgs))
     replace = mocker.spy(agent.store, "replace_messages")
     replies(mocker, text_reply("fin"))
     await agent.run("a task long enough to exceed the tiny budget", client=client)
@@ -661,3 +662,135 @@ async def test_a_resumed_session_keeps_the_prompt_it_started_with(agent, client,
     m = replies(mocker, text_reply("b"))
     await agent.run("second", resume_session_id=agent.session_id, client=client)
     assert system_of(m.sent[0]) == "Original prompt."
+
+
+# ---------------- token accounting ----------------
+#
+# The count beside the spinner should be what the session actually cost, so
+# everything that spends tokens on the agent's behalf has to be folded in —
+# not just the replies you can see.
+
+def usage_reply(content, prompt=0, completion=0):
+    """A chat() stand-in that reports usage the way a server does."""
+    async def fake(*args, **kwargs):
+        if kwargs.get("usage") is not None:
+            kwargs["usage"].update({"prompt_tokens": prompt, "completion_tokens": completion})
+        return {"role": "assistant", "content": content}
+    return fake
+
+
+async def test_a_turn_counts_its_own_calls(agent, client, mocker):
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 1200, 60))
+    await agent.run("t", client=client)
+    assert agent.tokens == {"prompt": 1200, "completion": 60}
+
+
+async def test_counts_accumulate_across_turns(agent, client, mocker):
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 100, 10))
+    await agent.run("first", client=client)
+    await agent.run("second", resume_session_id=agent.session_id, client=client)
+    assert agent.tokens == {"prompt": 200, "completion": 20}
+
+
+async def test_intent_parsing_is_counted(agent, client, mocker):
+    """It's a real model call, so it belongs in what the turn cost."""
+    from omni.intent import Intent
+    agent.cfg.parse_intent = True
+    mocker.patch.object(agent_mod.ui, "intent_panel")
+
+    async def fake_intent(*args, **kwargs):
+        if kwargs.get("usage") is not None:
+            kwargs["usage"].update({"prompt_tokens": 300, "completion_tokens": 40})
+        return Intent()
+
+    mocker.patch.object(agent_mod, "extract_intent", fake_intent)
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 1000, 50))
+    await agent.run("t", client=client)
+    assert agent.tokens == {"prompt": 1300, "completion": 90}
+
+
+async def test_compaction_is_counted(agent, client, mocker):
+    agent.cfg.context_char_budget = 10
+
+    async def fake_compact(messages, model, cfg, logger, usage=None):
+        if usage is not None:
+            usage.update({"prompt_tokens": 800, "completion_tokens": 120})
+        return [messages[0], {"role": "system", "content": "BRIEFING"}]
+
+    mocker.patch.object(agent_mod, "_compact_messages", fake_compact)
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 100, 10))
+    await agent.run("a task long enough to exceed the tiny budget", client=client)
+    assert agent.tokens == {"prompt": 900, "completion": 130}
+
+
+async def test_manual_compaction_is_counted(agent, mocker):
+    async def fake_compact(messages, model, cfg, logger, usage=None):
+        if usage is not None:
+            usage.update({"prompt_tokens": 500, "completion_tokens": 70})
+        return messages[:1]
+
+    sid = agent.store.create_session("/p", "m", "t")
+    for i in range(30):
+        agent.store.append_message(sid, i, {"role": "user", "content": f"m{i}"})
+    mocker.patch.object(agent_mod, "_compact_messages", fake_compact)
+    await agent.compact_history(sid)
+    assert agent.tokens == {"prompt": 500, "completion": 70}
+
+
+async def test_a_server_that_reports_no_usage_counts_nothing(agent, client, mocker):
+    """Not every OpenAI-compatible server sends a usage block."""
+    replies(mocker, text_reply("done"))
+    await agent.run("t", client=client)
+    assert agent.tokens == {"prompt": 0, "completion": 0}
+
+
+async def test_each_agent_counts_only_its_own(cfg, client, mocker):
+    """Subagents have their own tally, which is what the pane's spinner
+    shows — main's number must not absorb theirs."""
+    mocker.patch.object(agent_mod.ui, "step_display")
+    mocker.patch.object(agent_mod.ui, "elapsed_note")
+    mocker.patch.object(agent_mod.ui, "banner")
+    first, second = CodingAgent(cfg), CodingAgent(cfg)
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 100, 10))
+    await first.run("one", client=client)
+    assert first.tokens == {"prompt": 100, "completion": 10}
+    assert second.tokens == {"prompt": 0, "completion": 0}
+
+
+# ---------------- several subagents at once ----------------
+
+async def test_two_spawns_in_one_step_run_concurrently(agent, client, mocker):
+    """This is how more than one subagent comes about: the model issues
+    several spawn_agent calls in a single turn. spawn_agent is a safe tool, so
+    the step executor runs them together rather than one after another —
+    otherwise two 3-second subagents would cost six seconds."""
+    started = []
+
+    async def slow_spawn(name, args):
+        started.append(name)
+        await asyncio.sleep(0.3)
+        return f"{args.get('name')} reported"
+
+    client.call_tool = mocker.AsyncMock(side_effect=slow_spawn)
+    replies(mocker,
+            tool_reply(("spawn_agent", '{"task": "a", "name": "one"}'),
+                        ("spawn_agent", '{"task": "b", "name": "two"}')),
+            text_reply("both reported"))
+
+    start = time.monotonic()
+    await agent.run("split it", client=client)
+    elapsed = time.monotonic() - start
+
+    assert len(started) == 2
+    assert elapsed < 0.55, f"ran one after another ({elapsed:.2f}s for two 0.3s calls)"
+
+
+async def test_spawn_needs_no_approval_but_what_it_does_still_might(cfg, mocker):
+    """Spawning changes nothing by itself, so it isn't gated; the subagent's
+    own writes are approved on their own terms."""
+    from omni.agent import _approve
+    approve = mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock())
+    assert await _approve("spawn_agent", {}, cfg, mocker.AsyncMock()) is True
+    approve.assert_not_called()
+    await _approve("write_file", {}, cfg, mocker.AsyncMock())
+    approve.assert_awaited_once()

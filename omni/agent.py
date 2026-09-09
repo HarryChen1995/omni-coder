@@ -13,7 +13,7 @@ import signal
 import time
 from contextlib import nullcontext
 
-from .llm_client import chat, LLMError
+from .llm_client import add_usage, chat, LLMError
 
 from .config import AgentConfig
 from .intent import extract_intent
@@ -269,12 +269,15 @@ _COMPACT_PROMPT = (
 )
 
 
-async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger) -> list:
+async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger,
+                             usage: dict = None) -> list:
     """Replace the middle of a long conversation with an LLM-written summary,
     keeping the system + task messages and the most recent `cfg.compact_keep_last`
     messages verbatim. Returns `messages` unchanged if there's nothing worth
     compacting (short history, or no middle to summarize). Falls back to the
     crude drop-oldest trim (_trim_history) if the summarization call fails."""
+    # `usage`, when given, collects the summarizing call's tokens: compaction
+    # is a real model call and should show up in what the turn cost.
     keep_last = max(cfg.compact_keep_last, 0)
     head_len = _protected_head_len(messages)
     if len(messages) <= head_len + keep_last:
@@ -289,6 +292,7 @@ async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger
     transcript = "\n".join(_render_for_summary(m) for m in middle)
     start = time.monotonic()
     spinner = ui.thinking(f"Compacting {len(middle)} messages…") if _HAS_UI else nullcontext()
+    call_usage = {}
     try:
         with spinner:
             reply = await chat(
@@ -298,7 +302,10 @@ async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger
                     {"role": "user", "content": transcript},
                 ],
                 base_url=cfg.llm_host, api_key=cfg.llm_api_key, timeout=cfg.llm_timeout_s,
+                usage=call_usage,
             )
+        if usage is not None:
+            add_usage(usage, call_usage)
         summary = (reply.get("content") or "").strip()
     except Exception as e:
         logger.info(f"compaction failed, falling back to drop-oldest trim: {e}")
@@ -332,8 +339,21 @@ class CodingAgent:
         # result — what /expand <n> reprints. The transcript only ever shows
         # an abbreviated version of both.
         self.call_log = []
+        # Tokens this agent has used, from the server's own usage blocks
+        # (prompt_tokens / completion_tokens). Shown beside the spinner.
+        self.tokens = {"prompt": 0, "completion": 0}
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
+
+    def _count(self, usage: dict):
+        """Fold one usage block into this agent's running total.
+
+        Everything that spends tokens on this agent's behalf goes through
+        here — the turn's own calls, intent parsing, and history compaction —
+        so the number beside the spinner is the whole of what the session has
+        cost, not just the visible replies."""
+        self.tokens["prompt"] += int((usage or {}).get("prompt_tokens") or 0)
+        self.tokens["completion"] += int((usage or {}).get("completion_tokens") or 0)
 
     async def _call_model(self, messages: list, tool_schemas: list):
         """Call the LLM server with retries for transient errors (connection refused,
@@ -345,12 +365,17 @@ class CodingAgent:
         with spinner:
             for attempt in range(1, self.cfg.max_retries + 1):
                 try:
+                    usage = {}
                     result = await chat(model=self.cfg.model, messages=messages, tools=tool_schemas,
                                          base_url=self.cfg.llm_host, api_key=self.cfg.llm_api_key,
-                                         timeout=self.cfg.llm_timeout_s)
+                                         timeout=self.cfg.llm_timeout_s, usage=usage)
+                    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                    completion_tokens = int(usage.get("completion_tokens") or 0)
+                    self._count(usage)
                     elapsed = time.monotonic() - start
                     if _HAS_UI:
-                        ui.elapsed_note("Responded", elapsed)
+                        ui.elapsed_note("Responded", elapsed,
+                                         tokens=(prompt_tokens, completion_tokens))
                     else:
                         print(f"Responded ({_format_elapsed(elapsed)})")
                     return result
@@ -375,9 +400,12 @@ class CodingAgent:
         session store, so it takes effect immediately and survives resume.
         Returns a short human-readable message describing what happened."""
         messages = self.store.load_messages(session_id)
+        usage = {}
         compacted = await _compact_messages(
             messages, self.cfg.compact_model or self.cfg.model, self.cfg, self.logger,
+            usage=usage,
         )
+        self._count(usage)
         if len(compacted) >= len(messages):
             return "Nothing to compact — history is already short."
         self.store.replace_messages(session_id, compacted)
@@ -471,9 +499,12 @@ class CodingAgent:
             intent_model = self.cfg.intent_model or self.cfg.model
             spinner = ui.thinking("Parsing intent…") if _HAS_UI else nullcontext()
             with spinner:
+                intent_usage = {}
                 intent = await extract_intent(task, intent_model, self.cfg.max_retries, self.logger,
                                                base_url=self.cfg.llm_host, api_key=self.cfg.llm_api_key,
-                                               timeout=self.cfg.llm_timeout_s)
+                                               timeout=self.cfg.llm_timeout_s,
+                                               usage=intent_usage)
+                self._count(intent_usage)
 
             existing = {f: await client.file_exists(f) for f in intent.target_files}
             context_block = intent.as_context_block(existing)
@@ -508,9 +539,12 @@ class CodingAgent:
         for step in range(1, self.cfg.max_steps + 1):
             total_chars = sum(len(str(m.get("content", ""))) for m in messages)
             if total_chars > self.cfg.context_char_budget:
+                compaction_usage = {}
                 compacted = await _compact_messages(
                     messages, self.cfg.compact_model or self.cfg.model, self.cfg, self.logger,
+                    usage=compaction_usage,
                 )
+                self._count(compaction_usage)
                 if compacted is not messages:
                     # Mirror the compaction into the store, the way the manual
                     # /compact command does. Without this the DB keeps the full

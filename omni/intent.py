@@ -13,7 +13,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import List
 
-from .llm_client import chat, LLMError
+from .llm_client import add_usage, chat, LLMError
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -108,11 +108,16 @@ def _coerce(data: dict) -> Intent:
 
 
 async def extract_intent(task: str, model: str, max_retries: int = 3, logger=None, base_url: str = None,
-                          api_key: str = None, timeout: float = 300.0) -> Intent:
+                          api_key: str = None, timeout: float = 300.0,
+                          usage: dict = None) -> Intent:
     """Ask the model to parse `task` into structured intent. On repeated
     failure, returns a low-confidence Intent(task_type='other') rather than
     raising — callers should treat `confident=False` as a signal to fall
-    back to plain freeform behavior, not as ground truth to act on."""
+    back to plain freeform behavior, not as ground truth to act on.
+
+    Pass a dict as `usage` to have this call's token usage added to it —
+    retries included, since a retried parse costs real tokens and the count
+    shown in the UI should say so."""
     messages = [
         {"role": "system", "content": INTENT_SCHEMA_PROMPT},
         {"role": "user", "content": task},
@@ -121,8 +126,11 @@ async def extract_intent(task: str, model: str, max_retries: int = 3, logger=Non
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
+            call_usage = {}
             message = await chat(model=model, messages=messages, format="json", base_url=base_url,
-                                  api_key=api_key, timeout=timeout)
+                                  api_key=api_key, timeout=timeout, usage=call_usage)
+            if usage is not None:
+                add_usage(usage, call_usage)
             content = message["content"]
             data = json.loads(_strip_code_fence(content))
             intent = _coerce(data)

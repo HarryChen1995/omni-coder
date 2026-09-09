@@ -35,9 +35,11 @@ Examples:
 
 import asyncio
 import os
+import re
 import shlex
 import signal
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, Optional
 
 import typer
@@ -58,6 +60,7 @@ _STATIC_COMMANDS = {
     "/delete ": "delete a saved session — /delete <id-or-name>",
     "/compact": "summarize this session's history down to a briefing",
     "/reasoning": "show a reply's chain of thought in full — /reasoning [n]",
+    "/agent": "the agents in this session — /agent <n> switches, /agent close <n> drops one",
     "/expand ": "reprint one tool call whole, arguments and result — /expand <n>",
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
@@ -95,6 +98,16 @@ def main(
              "local model — that's usually a client-side timeout, not the server being unreachable.",
     ),
     max_steps: int = typer.Option(100, "--max-steps", help="Hard cap on agent loop iterations"),
+    subagent_model: Optional[str] = typer.Option(
+        None, "--subagent-model",
+        help="Model for subagents the agent spawns (defaults to --model). Exploration and "
+             "review are where a smaller, faster model pays off.",
+    ),
+    subagent_max_steps: int = typer.Option(
+        AgentConfig.subagent_max_steps, "--subagent-max-steps",
+        help="Step cap for one subagent, separate from --max-steps so a runaway subagent "
+             "can't eat the whole run's allowance.",
+    ),
     safe_tool: List[str] = typer.Option(
         [], "--safe-tool",
         help="Auto-approve one extra tool, named as the model sees it (a custom server's "
@@ -117,6 +130,12 @@ def main(
         None, "--system-prompt-file",
         help="Same as --system-prompt, read from a file (easier for anything multi-line). "
              "Mutually exclusive with --system-prompt.",
+    ),
+    theme_color: Optional[str] = typer.Option(
+        None, "--theme-color",
+        help="Accent colour for the UI as a hex value (e.g. --theme-color '#00b4d8'). "
+             "Colours the prompt, spinners, tool calls, the agent tree and every panel "
+             "border. Omit to keep the built-in accent.",
     ),
     log_path: str = typer.Option("agent_run.log", "--log-path", help="Where to write the structured run log"),
     mcp_log_path: str = typer.Option(
@@ -269,6 +288,21 @@ def main(
         _print_sessions(SessionStore(db_path).list_sessions())
         raise typer.Exit()
 
+    if theme_color is not None:
+        colour = theme_color.strip()
+        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", colour):
+            typer.echo(f"Error: --theme-color {theme_color!r} isn't a 6-digit hex colour "
+                        "(e.g. '#00b4d8').", err=True)
+            raise typer.Exit(code=1)
+        theme_color = colour if colour.startswith("#") else f"#{colour}"
+        try:
+            # Applied before anything renders — the full-screen app copies the
+            # style map when it's built.
+            from . import ui
+            ui.set_accent(theme_color)
+        except ImportError:
+            pass
+
     if system_prompt is not None and system_prompt_file is not None:
         typer.echo("Error: pass --system-prompt or --system-prompt-file, not both.", err=True)
         raise typer.Exit(code=1)
@@ -319,6 +353,9 @@ def main(
         log_path=log_path,
         mcp_log_path=mcp_log_path,
         system_prompt=system_prompt or "",
+        theme_color=theme_color or "",
+        subagent_model=subagent_model or "",
+        subagent_max_steps=subagent_max_steps,
         parse_intent=not skip_intent_parsing,
         intent_model=intent_model or "",
         context_char_budget=context_char_budget,
@@ -419,6 +456,12 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         if resolved is not None:
             session_id = resolved
 
+    # Main is pane 0. Every pane owns its agent and its session, which is what
+    # lets several run at once without their transcripts or histories mixing.
+    main_pane = tui.main if tui is not None else _PlainPane(session_label())
+    main_pane.agent = agent
+    main_pane.session_id = session_id
+
     async with MCPToolClient(cfg.project_root, mcp_config_path=cfg.mcp_config_path or None,
                               extra_servers=cfg.mcp_servers or None,
                               embedding_model=cfg.embedding_model or None,
@@ -426,7 +469,8 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                               llm_api_key=cfg.llm_api_key or None,
                               mcp_log_path=cfg.mcp_log_path,
                               connect_timeout_s=cfg.mcp_connect_timeout_s,
-                              builtin_env=cfg.tool_server_env()) as client:
+                              builtin_env=cfg.tool_server_env(),
+                              spawn_agent=_make_spawner(cfg, tui, main_pane)) as client:
         await client.list_llm_tools()  # populate tool counts for /mcp before any task runs
         for e in client.server_status():
             if not e["connected"]:
@@ -471,17 +515,42 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         except LLMError:
             pass
 
+        # The spawner needs the live client and the dispatcher, both of which
+        # only exist inside this block.
+        _RUNTIME["client"] = client
+
+        def _turn_finished(pane):
+            """Run whatever was typed at this pane while it was working."""
+            if pane.pending:
+                _start_turn(pane, pane.pending.pop(0))
+
+        def _start_turn(pane, text: str):
+            if pane.task is not None and not pane.task.done():
+                pane.pending.append(text)
+                _echo(f"queued for {pane.name!r} — it's still working")
+                return
+            # Recorded synchronously: the exit path waits on in-flight turns,
+            # and a task only known once _run_turn starts could be dropped.
+            pane.task = asyncio.ensure_future(
+                _run_turn(pane, text, cfg=cfg, client=client, tui=tui,
+                          session_name=session_name, on_finished=_turn_finished))
+
+        _RUNTIME["start_turn"] = _start_turn
         runner = asyncio.ensure_future(tui.run()) if tui is not None else None
         try:
             while True:
                 try:
-                    task = await _next_instruction(tui, session_label(), cfg.model)
+                    pane, task = await _next_instruction(tui, main_pane)
                 except (EOFError, KeyboardInterrupt):
                     _echo("")
                     break
-                if task is None:      # ctrl+d, or the app exited
+                if pane is None or task is None:   # ctrl+d, or the app exited
                     break
 
+                # Everything below acts on the pane the line was typed at:
+                # its agent, its session, its slash commands. Main is pane 0.
+                agent = pane.agent
+                session_id = pane.session_id
                 task = task.strip()
                 if not task:
                     continue
@@ -522,6 +591,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     else:
                         _echo("No reasoning recorded yet — no reply this session "
                                    "carried a reasoning_content field.")
+                    continue
+                if task == "/agent" or task.startswith("/agent "):
+                    _agent_command(tui, task[len("/agent"):].strip())
                     continue
                 if task == "/mcp":
                     _print_mcp_status(client.server_status())
@@ -656,11 +728,11 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     ).run_async()
                     if selected and selected != cfg.model:
                         cfg.model = selected
-                        _announce_model(cfg.model)
+                        _announce_model(cfg.model, tui)
                     continue
                 if task.startswith("/model "):
                     cfg.model = task[len("/model "):].strip()
-                    _announce_model(cfg.model)
+                    _announce_model(cfg.model, tui)
                     continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
@@ -693,70 +765,22 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                             continue
                         _echo(f"--- resolved /{prompt_name} ---\n{task}\n")
 
-                # Run the turn as a Task so Ctrl+C can cancel just this turn
-                # (via the SIGINT handler below) instead of killing the whole
-                # REPL — a raw KeyboardInterrupt raised inside asyncio's own
-                # blocking wait can otherwise escape uncaught past this loop
-                # entirely. task.cancel() injects CancelledError at the
-                # coroutine's next await point (model call, tool call, etc.),
-                # unwinding just that turn; the MCP client and session history
-                # already written to disk are untouched, so the REPL keeps going.
-                run_task = asyncio.ensure_future(
-                    agent.run(task, resume_session_id=session_id, client=client,
-                              session_name=session_name, show_banner=False)
-                )
-                previous_sigint = signal.signal(signal.SIGINT, lambda *_: run_task.cancel())
-                # Hold the frame at the bottom of the terminal for the whole
-                # turn, so narration, tool calls and panels scroll above it
-                # instead of the prompt furniture being redrawn per phase.
-                try:
-                    from . import ui
-                    # on_interrupt: while the busy frame is up, prompt_toolkit
-                    # holds the terminal in raw mode, so Ctrl+C arrives as a
-                    # keystroke rather than SIGINT — the handler above never
-                    # fires and the cancel has to be wired through the box.
-                    frame = ui.turn_frame(session_label(), cfg.model,
-                                           on_interrupt=run_task.cancel)
-                except ImportError:
-                    frame = nullcontext()
-                async with frame:
-                    try:
-                        result = await run_task
-                    except asyncio.CancelledError:
-                        session_id = agent.session_id or session_id
-                        try:
-                            from . import ui
-                            ui.interrupted()
-                        except ImportError:
-                            _echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
-                        continue
-                    except (ValueError, RuntimeError, LLMError) as e:
-                        # A turn failing (bad session id, or _call_model giving
-                        # up after its retries because the LLM server is
-                        # unreachable) used to unwind past this loop and end the
-                        # whole REPL — dropping the MCP connections and the
-                        # session over what is usually a transient hiccup.
-                        # Report it and stay put; session_id is carried forward
-                        # so a retry continues the same conversation.
-                        session_id = agent.session_id or session_id
-                        _echo(f"Error: {e}", err=True)
-                        continue
-                    finally:
-                        signal.signal(signal.SIGINT, previous_sigint)
+                # Dispatched, not awaited: the input loop has to stay
+                # responsive so main keeps working while you read — or type
+                # at — a subagent. One turn per pane at a time; anything typed
+                # at a busy pane queues for its next turn.
+                _start_turn(pane, task)
 
-                if agent.session_id != session_id:
-                    # Carried into the next turn's resume and the frame's chip;
-                    # deliberately no header redraw (see above).
-                    session_id = agent.session_id
-                    _set_title(session_title())   # an unnamed session just got its id
-
-                try:
-                    from . import ui
-                    ui.final_result(result)
-                except ImportError:
-                    _echo("\n=== RESULT ===")
-                    _echo(result)
         finally:
+            # Turns are dispatched, so some may still be in flight. Give them
+            # a moment to land, then cancel: exiting shouldn't lose a turn
+            # that was about to finish, or hang on one that wasn't.
+            panes = tui.panes if tui is not None else [main_pane]
+            in_flight = [p.task for p in panes if p.task is not None and not p.task.done()]
+            if in_flight:
+                _, still_running = await asyncio.wait(in_flight, timeout=0.5)
+                for pending in still_running:
+                    pending.cancel()
             if tui is not None:
                 tui.stop()
                 if runner is not None:
@@ -772,6 +796,213 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 tui.dump()
                 from . import ui
                 ui.use_tui(None)
+
+
+# The live client and turn dispatcher live inside _interactive's `async with`;
+# the spawner closure needs them, so they're handed over here rather than
+# threaded through every signature.
+_RUNTIME: dict = {}
+
+
+class _PlainPane:
+    """A pane's worth of state without a full-screen app (the no-rich
+    fallback). Carries the attributes _run_turn reads, so the turn code
+    doesn't care which kind it got."""
+
+    def __init__(self, name: str, kind: str = "main"):
+        self.name = name or "main"
+        self.kind = kind
+        self.depth = 0 if kind == "main" else 1
+        self.agent = None
+        self.session_id = None
+        self.task = None
+        self.pending: list = []
+        self.on_interrupt = None
+        self.busy = False
+        self.done = False
+        self.outcome = ""
+        self.error = ""
+
+
+async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finished=None):
+    """One turn for one pane.
+
+    Its output goes to that pane's transcript (see tui.current_pane), and so
+    do its approvals and questions — a background subagent asking to write a
+    file waits in its own pane rather than seizing whatever you were reading.
+
+    Returns the turn's final answer, which is what a subagent reports back to
+    whoever spawned it."""
+    from . import ui
+    token = None
+    if tui is not None:
+        from . import tui as tui_mod
+        token = tui_mod.current_pane.set(pane)
+    previous_sigint = None
+    result = None
+    try:
+        agent = pane.agent
+        run_task = asyncio.ensure_future(
+            agent.run(task, resume_session_id=pane.session_id, client=client,
+                      session_name=session_name if pane.kind == "main" else None,
+                      show_banner=False)
+        )
+        if pane.task is None:
+            pane.task = asyncio.current_task()   # spawned directly, not dispatched
+        if tui is None:
+            # Nothing is holding the terminal, so Ctrl+C really is a signal.
+            previous_sigint = signal.signal(signal.SIGINT, lambda *_: run_task.cancel())
+        try:
+            frame = ui.turn_frame(pane.name, cfg.model, on_interrupt=run_task.cancel)
+        except ImportError:
+            frame = nullcontext()
+        async with frame:
+            try:
+                result = await run_task
+                pane.outcome, pane.error = "done", ""
+            except asyncio.CancelledError:
+                # Stop the agent too: awaiting it was cancelled, which on its
+                # own would leave the run going in the background.
+                run_task.cancel()
+                pane.outcome, pane.error = "interrupted", ""
+                try:
+                    ui.interrupted()
+                except ImportError:
+                    _echo("\n[Interrupted — back at the prompt.]")
+            except (ValueError, RuntimeError, LLMError) as e:
+                # A turn failing (a bad session id, or _call_model giving up
+                # after its retries because the LLM server is unreachable)
+                # must not end the session over what is usually a transient
+                # hiccup. Report it; the session id is kept so a retry
+                # continues the same conversation.
+                pane.outcome, pane.error = "error", str(e)
+                _echo(f"Error: {e}", err=True)
+        pane.session_id = agent.session_id or pane.session_id
+        if pane.kind == "main" and pane.session_id:
+            _set_title(pane.session_id)
+        if result is not None:
+            try:
+                ui.final_result(result)
+            except ImportError:
+                _echo("\n=== RESULT ===")
+                _echo(result)
+        return result
+    finally:
+        pane.task = None
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+        if token is not None:
+            from . import tui as tui_mod
+            tui_mod.current_pane.reset(token)
+        if on_finished is not None:
+            on_finished(pane)
+
+
+def _make_spawner(cfg: AgentConfig, tui, main_pane):
+    """Build the spawn_agent handler the MCP client offers to the model.
+
+    A subagent is a pane of its own with its own agent, its own child session
+    and its own step budget, run to completion. Only its final answer crosses
+    back as the tool result — that is the point of the arrangement: the parent
+    reasons on the conclusion instead of carrying every step in its
+    context."""
+    async def spawn(task: str, name: str = "", system_prompt: str = "", model: str = "") -> str:
+        client = _RUNTIME.get("client")
+        if client is None:
+            return "ERROR: no tool session available to run a subagent in."
+        parent = main_pane
+        if tui is not None:
+            from . import tui as tui_mod
+            parent = tui_mod.current_pane.get() or tui.main
+        if getattr(parent, "depth", 0) >= 1:
+            return ("ERROR: a subagent can't spawn subagents. Do the work yourself, or "
+                     "report back and let the main agent decide what to delegate next.")
+        child_cfg = replace(
+            cfg,
+            model=model or cfg.subagent_model or cfg.model,
+            system_prompt=system_prompt or cfg.system_prompt,
+            max_steps=cfg.subagent_max_steps or cfg.max_steps,
+        )
+        child = CodingAgent(child_cfg)
+        label = " ".join((name or task).split())[:24] or "subagent"
+        if tui is not None:
+            pane = tui.add_pane(label, agent=child, depth=getattr(parent, "depth", 0) + 1)
+        else:
+            pane = _PlainPane(label, kind="subagent")
+            pane.agent = child
+        try:
+            answer = await _run_turn(pane, task, cfg=child_cfg, client=client, tui=tui,
+                                      session_name=None)
+        except Exception as e:                     # noqa: BLE001 - reported, not raised
+            # Whatever went wrong is the parent's business to know about, not
+            # a reason to break its turn.
+            if tui is not None:
+                tui.set_idle(pane=pane, done=True)
+            return f"The subagent {label!r} failed to run: {e}"
+        if tui is not None:
+            # Green in the agent list: it landed, and its pane is still there
+            # to read — the "done" state before the answer goes back to main.
+            tui.set_idle(pane=pane, done=True)
+        if answer is None:
+            # Say which, and say it as a fact the parent can act on: a model
+            # told only "it didn't finish" tends to spawn the same job again.
+            if getattr(pane, "outcome", "") == "interrupted":
+                return (f"The subagent {label!r} was interrupted by the user before it "
+                         "finished, so there is no answer. Don't spawn it again unless "
+                         "asked — check with the user, or do the work yourself.")
+            if getattr(pane, "outcome", "") == "error":
+                return (f"The subagent {label!r} failed: {pane.error}. Its session holds "
+                         "what it managed to do; consider doing this work yourself.")
+            return (f"The subagent {label!r} produced no answer. Its session holds what it "
+                     "managed to do.")
+        return answer
+
+    return spawn
+
+
+def _agent_command(tui, argument: str):
+    """/agent — list the agents, switch to one, or close a finished one."""
+    if tui is None:
+        _echo("Several agents at once needs the full-screen UI (rich + prompt_toolkit).",
+               err=True)
+        return
+    panes = tui.panes
+    if not argument:
+        for index, pane in enumerate(panes):
+            state = ("working" if pane.busy else
+                      "waiting for you" if pane.needs_you else
+                      "done" if pane.done else "idle")
+            here = "  ← here" if index == tui.focused else ""
+            _echo(f"{index}. {pane.name}  [{state}]{here}")
+        _echo("/agent <n> switches · /agent close <n> drops a finished one · ctrl+↑↓ picks")
+        return
+    if argument.startswith("close"):
+        rest = argument[len("close"):].strip()
+        try:
+            index = int(rest) if rest else tui.focused
+        except ValueError:
+            _echo("Usage: /agent close <n>", err=True)
+            return
+        if not 0 <= index < len(panes):
+            _echo(f"No agent {index} — they run 0–{len(panes) - 1}.", err=True)
+            return
+        pane = panes[index]
+        if pane.busy:
+            _echo(f"{pane.name!r} is still working — interrupt it first (ctrl+c in its pane).",
+                   err=True)
+            return
+        if not tui.close_pane(pane):
+            _echo("The main agent can't be closed.", err=True)
+        return
+    try:
+        index = int(argument)
+    except ValueError:
+        _echo("Usage: /agent [<n> | close <n>]", err=True)
+        return
+    if not 0 <= index < len(panes):
+        _echo(f"No agent {index} — they run 0–{len(panes) - 1}.", err=True)
+        return
+    tui.focus(index)
 
 
 async def _handle_btw(cfg: AgentConfig, question: str):
@@ -877,9 +1108,14 @@ def _echo(text: str, err: bool = False):
     typer.echo(text, err=err)
 
 
-def _announce_model(model: str):
-    """Confirm a /model switch. The header isn't redrawn for this — it's
-    scrollback by then; the frame's hint line shows the live model instead."""
+def _announce_model(model: str, tui=None):
+    """Confirm a /model switch.
+
+    The header isn't redrawn for it — the header is scrollback by then — so
+    the frame's hint line carries the live model name, which means the app
+    has to be told about the change or that line goes stale."""
+    if tui is not None:
+        tui.model = model
     try:
         from . import ui
         ui.model_switched(model)
@@ -942,16 +1178,19 @@ def _make_tui(commands: dict, session_label: str, model: str):
     return app
 
 
-async def _next_instruction(tui, session_label: str = "", model: str = ""):
-    """The next thing typed. From the running app's queue when there is one
-    (it owns the screen and the keyboard for the whole session), otherwise
-    from a plain input() — the no-rich fallback. None means "end the
-    session"."""
+async def _next_instruction(tui, main_pane):
+    """The next (pane, text) typed.
+
+    From the running app's queue when there is one — it owns the screen and
+    the keyboard for the whole session, and tags each line with the pane it
+    was typed at. Otherwise a plain input(), which only ever has main.
+    (None, None) ends the session."""
     if tui is not None:
-        tui.session_label = session_label
-        tui.model = model
         return await tui.next_instruction()
-    return input("> ")
+    try:
+        return main_pane, input("> ")
+    except EOFError:
+        return None, None
 
 
 def _print_sessions(sessions: list):

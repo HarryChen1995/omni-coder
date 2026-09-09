@@ -1,6 +1,6 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-846%20passed-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-902%20passed-brightgreen)](#-tests)
 [![coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -54,6 +54,24 @@ Run `omni --help` for the full option list.
   the wheel and PageUp/PageDown scroll. `/expand <n>` and `/reasoning [n]`
   do the same from the keyboard. The transcript is written out on exit, so
   it stays in your scrollback.
+- **Subagents** — the agent can delegate a self-contained job with
+  `spawn_agent`: the subagent gets its own session, step budget, and
+  optionally its own model (`--subagent-model`) and system prompt, and only
+  its final answer comes back to the parent, keeping the parent's context
+  clear of the whole investigation. Several `spawn_agent` calls in one turn
+  run concurrently, so three subagents cost one subagent's wall-clock.
+  Running agents appear as a tree under the prompt — `○` working, `●` done,
+  `!` waiting on you, `✕` interrupted — and ↑/↓ with Enter switch between
+  them, even while one is busy. Each has its own transcript and token count;
+  they fold into main as clickable blocks once they've all reported back.
+  Interrupting is per agent, and the parent is told in as many words when a
+  subagent is interrupted or fails.
+- **Token counts** — every turn shows what it cost (`Responded (16.0s · ↑ 3.3k
+  ↓ 115)`, and live beside the spinner), from the server's own
+  `prompt_tokens` / `completion_tokens`. Intent parsing and history
+  compaction are counted too, and each agent counts only its own.
+- **Themeable** — `--theme-color '#00b4d8'` recolours the accent across the
+  whole UI; omit it for the built-in one.
 - **The model can ask you a question** — `ask_user` puts a genuine ambiguity
   (or a plan to accept) to you mid-turn. Offered choices become a picker:
   arrow or click to select, Enter to submit, and anything you type instead
@@ -205,7 +223,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-846 tests, 88% branch coverage — hermetic (no model, server, or network
+902 tests, 88% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

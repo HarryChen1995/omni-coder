@@ -23,7 +23,9 @@ class AgentConfig:
         "read_file", "list_dir", "search_files", "glob_files",
         "git_diff", "git_status", "git_log", "git_show", "git_branch", "git_fetch",
         "save_memory", "search_tools",
-        "ask_user",   # asking the person a question is not a change to anything
+        "ask_user",     # asking the person a question changes nothing
+        "spawn_agent",  # spawning one changes nothing either — whatever the
+                         # subagent then does is approved on its own terms
         "list_resources", "read_resource",   # MCP Resources capability — read-only
     )
 
@@ -43,6 +45,15 @@ class AgentConfig:
     # write_file, finish with plain text rather than a tool call, save_memory
     # for durable facts) — a replacement should cover the same ground.
     system_prompt: str = ""
+
+    # Subagents (the spawn_agent tool). Empty/zero = same as the parent's.
+    # A separate step budget matters: a runaway subagent would otherwise eat
+    # the whole run's allowance.
+    subagent_model: str = ""
+    subagent_max_steps: int = 40
+
+    # Accent colour for the UI, as #rrggbb. Empty = the built-in one.
+    theme_color: str = ""
 
     # Parse the freeform task into structured intent (task_type, target_files,
     # constraints, risk_level) before the agent starts acting.

@@ -199,7 +199,8 @@ def binding(application, key, *, filter_mode=None):
 def test_enter_hands_the_instruction_over(app, mocker):
     app._buffer.text = "do the thing"
     binding(app, "enter")(mocker.Mock())
-    assert app._queue.get_nowait() == "do the thing"
+    pane, text = app._queue.get_nowait()
+    assert (pane, text) == (app.main, "do the thing")
     assert app._buffer.text == ""
 
 
@@ -224,7 +225,7 @@ def test_ctrl_c_clears_the_line_when_idle(app, mocker):
 
 def test_ctrl_c_interrupts_the_turn_when_busy(app, mocker):
     cancel = mocker.Mock()
-    app.on_interrupt = cancel
+    app.pane.on_interrupt = cancel      # interrupts belong to a pane, not the window
     app.set_busy("Thinking…")
     binding(app, "c-c")(mocker.Mock())
     cancel.assert_called_once()
@@ -232,7 +233,7 @@ def test_ctrl_c_interrupts_the_turn_when_busy(app, mocker):
 
 def test_ctrl_d_on_an_empty_line_ends_the_session(app, mocker):
     binding(app, "c-d")(mocker.Mock())
-    assert app._queue.get_nowait() is None
+    assert app._queue.get_nowait() == (None, None)
 
 
 def test_ctrl_d_with_text_keeps_the_session(app, mocker):
@@ -343,7 +344,7 @@ async def test_the_picker_is_gone_once_answered(app, mocker):
     await asyncio.sleep(0)
     binding(app, "enter")(mocker.Mock())
     await pending
-    assert app._options == [] and app._choosing() is False
+    assert app.pane.options == [] and app._choosing() is False
 
 
 async def test_a_question_restores_the_busy_state_afterwards(app, mocker):
@@ -377,7 +378,7 @@ def test_the_hint_follows_the_mode(app):
 
 def test_emit_adds_a_transcript_block(app):
     app.emit(lambda: Text("hello"))
-    assert len(app.transcript.blocks) == 1
+    assert len(app.pane.transcript.blocks) == 1
 
 
 def test_dump_writes_every_block(app, capsys):
@@ -393,3 +394,214 @@ def test_dump_writes_open_blocks_in_their_open_form(app, capsys):
     block.is_open = True
     app.dump()
     assert "opened" in capsys.readouterr().out
+
+
+# ---------------- panes: several agents at once ----------------
+#
+# Main is pane 0; every subagent gets its own. What matters here is that
+# output, questions and interrupts land on the pane that owns them even while
+# three agents are running — which is what the ContextVar is for — and that
+# the tree reflects each one's state.
+
+from omni.tui import Pane, current_pane
+
+
+def test_a_session_starts_with_only_main(app):
+    assert [p.kind for p in app.panes] == ["main"]
+    assert app.main is app.pane and app.pane.depth == 0
+
+
+def test_adding_a_subagent_gives_it_its_own_transcript(app):
+    sub = app.add_pane("audit", depth=1)
+    assert sub.kind == "subagent" and sub.transcript is not app.main.transcript
+    assert app.panes == [app.main, sub]
+    assert app.pane is app.main          # spawning doesn't steal focus
+
+
+def test_output_goes_to_the_pane_that_produced_it(app):
+    sub = app.add_pane("audit", depth=1)
+    token = current_pane.set(sub)
+    try:
+        app.emit(lambda: Text("from the subagent"))
+    finally:
+        current_pane.reset(token)
+    assert len(sub.transcript.blocks) == 1
+    assert app.main.transcript.blocks == []
+    assert sub.unseen is True            # flagged, since you were elsewhere
+
+
+def test_switching_clears_the_unseen_flag(app):
+    sub = app.add_pane("audit", depth=1)
+    sub.unseen = True
+    app.focus(1)
+    assert app.pane is sub and sub.unseen is False
+
+
+def test_the_transcript_window_follows_focus(app):
+    sub = app.add_pane("audit", depth=1)
+    token = current_pane.set(sub)
+    try:
+        app.emit(lambda: Text("subagent line"))
+    finally:
+        current_pane.reset(token)
+    app.focus(1)
+    app.pane.transcript.create_content(60, 10)
+    rows = lines_of(app.pane.transcript)
+    assert any("subagent line" in row for row in rows)
+
+
+async def test_background_approval_does_not_take_over_the_frame(app, mocker):
+    sub = app.add_pane("writer", depth=1)
+    pending = asyncio.ensure_future(app.ask_approval("Approve write_file?", pane=sub))
+    await asyncio.sleep(0)
+    assert app.mode == "idle"            # main's frame is untouched
+    assert sub.needs_you is True
+    assert "!" in "".join(f[1] for f in app._agent_tree())
+    app.focus(1)
+    assert app.mode == "approve"         # ...and there it is, once you switch
+    binding(app, "y")(mocker.Mock())
+    assert await pending is True
+
+
+async def test_typing_goes_to_the_focused_pane(app, mocker):
+    sub = app.add_pane("audit", depth=1)
+    app.focus(1)
+    app._buffer.text = "narrow it to save_memory"
+    binding(app, "enter")(mocker.Mock())
+    pane, text = app._queue.get_nowait()
+    assert pane is sub and text == "narrow it to save_memory"
+
+
+def test_status_and_tokens_are_per_pane(app, mocker):
+    sub = app.add_pane("audit", agent=mocker.Mock(tokens={"prompt": 12100, "completion": 3400}),
+                        depth=1)
+    app.set_busy("Thinking…", pane=sub)
+    assert app.main.busy is False and sub.busy is True
+    app.focus(1)
+    line = "".join(f[1] for f in app._status_line())
+    assert "↑ 12.1k" in line and "↓ 3.4k" in line
+
+
+# ---------------- the agent tree ----------------
+
+async def test_main_is_labelled_main_and_subagents_are_numbered(app):
+    app.add_pane("files", depth=1)
+    app.add_pane("readme", depth=1)
+    rows = "".join(f[1] for f in app._agent_tree())
+    assert "main" in rows and "0 " not in rows      # main isn't a numbered subagent
+    assert "1 files" in rows and "2 readme" in rows
+
+
+async def test_the_tree_marks_each_state(app, mocker):
+    working = app.add_pane("working", depth=1)
+    finished = app.add_pane("finished", depth=1)
+    waiting = app.add_pane("waiting", depth=1)
+    app.set_busy("Thinking…", pane=working)
+    finished.done = True
+    waiting.approval = ("Approve?", asyncio.get_running_loop().create_future())
+
+    rows = "".join(f[1] for f in app._agent_tree())
+    assert "○" in rows          # working
+    assert "●" in rows          # finished and reported back
+    assert "!" in rows          # waiting on you
+
+
+def test_a_tree_row_can_be_clicked(app, mocker):
+    from prompt_toolkit.mouse_events import MouseEventType
+    sub = app.add_pane("audit", depth=1)
+    handler = next(f[2] for f in app._agent_tree() if len(f) == 3 and "1 audit" in f[1])
+    handler(mocker.Mock(event_type=MouseEventType.MOUSE_UP))
+    assert app.pane is sub
+
+
+def test_arrows_walk_the_tree_when_the_prompt_is_empty(app, mocker):
+    """The tree is visible under the input, so that's where the arrows go —
+    until you type something, when they belong to the line again."""
+    sub = app.add_pane("audit", depth=1)
+    assert app._navigating() is True
+    binding(app, "down")(mocker.Mock())
+    assert app._picking is True and app._pick_index == 1
+    binding(app, "enter")(mocker.Mock())
+    assert app.pane is sub and app._picking is False
+
+
+def test_the_tree_can_be_walked_while_an_agent_is_working(app, mocker):
+    """When main is busy is exactly when you want to look at a subagent — and
+    getting this wrong sent ctrl+c to the wrong agent."""
+    sub = app.add_pane("audit", depth=1)
+    app.set_busy("Thinking…", pane=app.main)
+    assert app._navigating() is True
+    binding(app, "down")(mocker.Mock())
+    binding(app, "enter")(mocker.Mock())
+    assert app.pane is sub
+
+
+async def test_a_question_keeps_the_arrows(app, mocker):
+    """A choice picker owns ↑↓ and Enter while it is up."""
+    app.add_pane("audit", depth=1)
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b"]))
+    await asyncio.sleep(0)
+    assert app._navigating() is False
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "a"
+
+
+def test_typing_takes_the_arrows_back(app):
+    app.add_pane("audit", depth=1)
+    app._buffer.text = "half typed"
+    assert app._navigating() is False
+
+
+def test_a_lone_main_agent_shows_no_tree(app):
+    assert len(app.panes) == 1        # the tree's container is filtered off
+
+
+# ---------------- folding finished subagents ----------------
+
+def test_finished_subagents_fold_into_main(app):
+    """Their panes disappear once they've all reported back, but the work
+    stays reachable as one clickable block in main."""
+    sub = app.add_pane("audit", depth=1)
+    token = current_pane.set(sub)
+    try:
+        app.emit(lambda: Text("what the subagent did"))
+    finally:
+        current_pane.reset(token)
+    app.set_idle(pane=sub, done=True)
+    app._fold_finished()
+
+    assert app.panes == [app.main]
+    assert len(app.main.transcript.blocks) == 1
+    block = app.main.transcript.blocks[0]
+    assert block.clickable
+    assert "what the subagent did" in block.expanded()
+    assert "audit" in block.collapsed()
+
+
+def test_folding_waits_for_the_last_subagent(app):
+    first = app.add_pane("one", depth=1)
+    second = app.add_pane("two", depth=1)
+    app.set_idle(pane=first, done=True)
+    assert app._all_subagents_finished() is False    # `two` is still going
+    app.set_idle(pane=second, done=True)
+    assert app._all_subagents_finished() is True
+    app._fold_finished()
+    assert app.panes == [app.main]                   # both folded, together
+
+
+def test_a_finished_subagent_shows_green_before_folding(app):
+    sub = app.add_pane("audit", depth=1)
+    app.set_idle(pane=sub, done=True)
+    assert sub.done is True
+    assert "●" in "".join(f[1] for f in app._agent_tree())
+
+
+def test_closing_a_pane_by_hand(app):
+    sub = app.add_pane("audit", depth=1)
+    app.focus(1)
+    assert app.close_pane(sub) is True
+    assert app.panes == [app.main] and app.pane is app.main
+
+
+def test_main_cannot_be_closed(app):
+    assert app.close_pane(app.main) is False

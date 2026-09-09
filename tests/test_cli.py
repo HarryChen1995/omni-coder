@@ -170,6 +170,38 @@ def test_mcp_connect_timeout_flag_is_threaded_through(mocker, tmp_path):
     assert captured["cfg"].mcp_connect_timeout_s == 5.0
 
 
+def test_theme_colour_is_applied_and_recorded(mocker, tmp_path):
+    accent = mocker.patch("omni.ui.set_accent")
+    captured = captured_cfg(mocker)
+    invoke("t", "--theme-color", "#00b4d8", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    accent.assert_called_once_with("#00b4d8")
+    assert captured["cfg"].theme_color == "#00b4d8"
+
+
+def test_theme_colour_accepts_a_bare_hex(mocker, tmp_path):
+    accent = mocker.patch("omni.ui.set_accent")
+    captured_cfg(mocker)
+    invoke("t", "--theme-color", "00b4d8", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    accent.assert_called_once_with("#00b4d8")
+
+
+@pytest.mark.parametrize("bad", ["blue", "#12345", "#gggggg", "#1234567"])
+def test_a_bad_theme_colour_is_refused(mocker, tmp_path, bad):
+    r = invoke("t", "--theme-color", bad, "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "hex colour" in r.output
+
+
+def test_no_theme_colour_leaves_the_default(mocker, tmp_path):
+    accent = mocker.patch("omni.ui.set_accent")
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    accent.assert_not_called()
+    assert captured["cfg"].theme_color == ""
+
+
 def test_run_value_error_exits_nonzero(mocker, tmp_path):
     mocker.patch.object(cli_mod.CodingAgent, "run",
                         mocker.AsyncMock(side_effect=ValueError("no session found")))
@@ -206,7 +238,7 @@ def test_help_lists_the_key_flags():
     for flag in ("--project-root", "--model", "--llm-host", "--llm-timeout",
                  "--auto-approve", "--safe-tool", "--resume", "--add-mcp-server",
                  "--mcp-log-path", "--system-prompt", "--system-prompt-file",
-                 "--mcp-connect-timeout"):
+                 "--mcp-connect-timeout", "--theme-color"):
         assert flag in out
 
 

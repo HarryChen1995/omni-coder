@@ -343,3 +343,37 @@ def test_empty_everything_stays_empty():
     assert _content_from_reasoning({"role": "assistant", "content": None})["content"] is None
     assert _content_from_reasoning({"role": "assistant", "content": None,
                                     "reasoning_content": "   "})["content"] is None
+
+
+# ---------------- usage ----------------
+
+async def test_usage_is_filled_in_when_asked(mocker):
+    mock_http(mocker, json_reply({"choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                                   "usage": {"prompt_tokens": 1200, "completion_tokens": 60,
+                                             "total_tokens": 1260}}))
+    usage = {}
+    await chat("m", [], usage=usage)
+    assert usage["prompt_tokens"] == 1200 and usage["completion_tokens"] == 60
+
+
+async def test_usage_is_optional_and_absent_blocks_are_tolerated(mocker):
+    """Not every OpenAI-compatible server reports usage."""
+    mock_http(mocker, json_reply({"choices": [{"message": {"role": "assistant", "content": "hi"}}]}))
+    usage = {}
+    assert (await chat("m", [], usage=usage))["content"] == "hi"
+    assert usage == {}
+    assert (await chat("m", []))["content"] == "hi"        # no dict passed at all
+
+
+def test_add_usage_accumulates():
+    from omni.llm_client import add_usage
+    total = {}
+    add_usage(total, {"prompt_tokens": 100, "completion_tokens": 10})
+    add_usage(total, {"prompt_tokens": 250, "completion_tokens": 5, "total_tokens": 255})
+    assert total["prompt_tokens"] == 350 and total["completion_tokens"] == 15
+
+
+def test_add_usage_ignores_missing_and_zero_fields():
+    from omni.llm_client import add_usage
+    assert add_usage({}, None) == {}
+    assert add_usage({}, {"prompt_tokens": 0}) == {}

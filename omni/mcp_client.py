@@ -312,6 +312,59 @@ def _search_tools_schema() -> dict:
     }
 
 
+_SPAWN_AGENT_NAME = "spawn_agent"
+
+
+def _spawn_agent_schema() -> dict:
+    """Delegate a piece of work to another agent.
+
+    Client-side like ask_user, and for the same reason: a subagent needs a
+    pane, a session and a place on screen, none of which an MCP server
+    subprocess has."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _SPAWN_AGENT_NAME,
+            "description": (
+                "Hand a self-contained piece of work to another agent and wait for its "
+                "answer. It runs with the same tools you have, in its own session, and only "
+                "its final answer comes back to you — not the steps it took. Use it to keep "
+                "your own context clear of a long investigation ('find every place that "
+                "writes to disk without the scope check'), or to work on separate parts at "
+                "once by issuing several of these in one turn. Give it everything it needs: "
+                "it cannot see your conversation. Not for work you could do in a step or "
+                "two yourself, and a subagent cannot spawn further subagents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": ("What it should do, written as if to a colleague who "
+                                         "hasn't seen this conversation. State the goal and "
+                                         "what to report back."),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short label for it on screen, e.g. \"audit path scoping\".",
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": ("Optional system prompt for it, replacing the default "
+                                         "one — use it to give the subagent a different role "
+                                         "(\"you are a reviewer; do not change files\")."),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model to run it on, if a different one suits.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    }
+
+
 _ASK_USER_NAME = "ask_user"
 
 
@@ -425,7 +478,7 @@ class MCPToolClient:
                  mcp_config_path: str = None, extra_servers: dict = None,
                  embedding_model: str = "", llm_host: str = None, llm_api_key: str = None,
                  mcp_log_path: str = "mcp_servers.log", builtin_env: dict = None,
-                 connect_timeout_s: float = 20.0):
+                 connect_timeout_s: float = 20.0, spawn_agent=None):
         self.project_root = project_root
         # Environment for the built-in server subprocess, carrying the
         # tool-side config knobs across the process boundary (see
@@ -439,6 +492,10 @@ class MCPToolClient:
         # How long one server gets to complete its MCP handshake before it is
         # written off and the session continues without it.
         self.connect_timeout_s = connect_timeout_s
+        # Handler for the spawn_agent tool, supplied by whoever can actually
+        # run another agent (the REPL). Without one the tool isn't offered:
+        # a one-shot run has no panes to put a subagent in.
+        self.spawn_agent = spawn_agent
         self._server_log_file = None
         # Default: run the built-in server as `python -m <package>.mcp_server`
         # rather than by file path — mcp_server.py uses relative imports
@@ -897,6 +954,8 @@ class MCPToolClient:
         # Always offered: asking the person a question is never a server's
         # capability, it's the client's.
         schemas.append(_ask_user_schema())
+        if self.spawn_agent is not None:
+            schemas.append(_spawn_agent_schema())
         if self._deferred_tools:
             schemas.append(_search_tools_schema())
         if self._resources:
@@ -1149,6 +1208,18 @@ class MCPToolClient:
         return "\n\n".join(parts)
 
     async def call_tool(self, name: str, args: dict) -> str:
+        if name == _SPAWN_AGENT_NAME:
+            if self.spawn_agent is None:
+                return "ERROR: subagents aren't available in this session."
+            task = str(args.get("task") or "").strip()
+            if not task:
+                return "ERROR: spawn_agent requires a 'task' describing what to do."
+            return await self.spawn_agent(
+                task,
+                name=str(args.get("name") or "").strip(),
+                system_prompt=str(args.get("system_prompt") or ""),
+                model=str(args.get("model") or "").strip(),
+            )
         if name == _ASK_USER_NAME:
             question = str(args.get("question") or "").strip()
             if not question:

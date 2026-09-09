@@ -650,6 +650,46 @@ async def test_an_empty_answer_counts_as_dismissed(cap, mocker):
     assert await ui.ask_user("q") is None
 
 
+# ---------------- theme colour ----------------
+
+def test_the_accent_can_be_changed(cap):
+    """Renderers build their styles from ACCENT at call time, so recolouring
+    is a matter of one variable — except the prompt_toolkit style map, which
+    bakes it in and has to be rebuilt."""
+    try:
+        before = ui._PROMPT_STYLE
+        ui.set_accent("#00b4d8")
+        assert ui.ACCENT == "#00b4d8"
+        assert ui._PROMPT_STYLE is not before
+    finally:
+        ui.set_accent("")
+    assert ui.ACCENT == ui.DEFAULT_ACCENT
+
+
+def test_a_changed_accent_reaches_the_output(mocker):
+    def render():
+        buf = io.StringIO()
+        mocker.patch.object(ui, "console", Console(file=buf, width=70, force_terminal=True,
+                                                   color_system="truecolor"))
+        ui.step_display([{"index": 1, "name": "read_file", "args": {"path": "a.py"},
+                          "result": "x", "ok": True, "duration": 0.1}])
+        return buf.getvalue()
+
+    try:
+        assert "217;119;87" in render()          # the built-in accent
+        ui.set_accent("#00b4d8")
+        recoloured = render()
+        assert "0;180;216" in recoloured and "217;119;87" not in recoloured
+    finally:
+        ui.set_accent("")
+
+
+def test_an_empty_theme_colour_restores_the_default():
+    ui.set_accent("#123456")
+    ui.set_accent("")
+    assert ui.ACCENT == ui.DEFAULT_ACCENT
+
+
 # ---------------- terminal title ----------------
 
 def test_terminal_title_uses_the_osc_escape(cap, mocker):

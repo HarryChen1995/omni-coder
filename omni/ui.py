@@ -108,6 +108,20 @@ def _as_block(fn):
 # needs attention" panel border; green/red/yellow stay reserved for actual
 # success/danger/caution semantics (diffs, done, errors).
 ACCENT = "#D97757"
+DEFAULT_ACCENT = ACCENT
+
+
+def set_accent(color: str):
+    """Recolour the UI to `color` (a #rrggbb hex).
+
+    Every renderer builds its styles at call time from ACCENT, so they pick
+    this up on their own. The prompt_toolkit style dict is the exception —
+    it's built once — so it gets rebuilt here. Call this before the
+    full-screen app is constructed, since the app takes a copy of that
+    dict."""
+    global ACCENT, _PROMPT_STYLE
+    ACCENT = color or DEFAULT_ACCENT
+    _PROMPT_STYLE = _build_prompt_style()
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -407,29 +421,41 @@ def _hint_segments(model: str, keys: str) -> list:
     return segments
 
 
-_PROMPT_STYLE = Style.from_dict({
-    "frame.rule": _FRAME_RULE,
-    "frame.chip": f"bold reverse {ACCENT}",
-    "frame.hint": _FRAME_HINT,
-    "frame.model": f"bold {ACCENT}",
-    "choice": "",
-    "choice.selected": f"bold {ACCENT}",
-    "frame.spinner": f"bold {ACCENT}",
-    "frame.label": f"bold {ACCENT}",
-    "prompt.arrow": f"bold {ACCENT}",
-    # bg:default everywhere except the selected row: prompt_toolkit's stock
-    # menu paints a solid block, and since the menu is a full-width member of
-    # the box's stack (not a float) that block reads as the whole terminal
-    # going dark the moment you type "/".
-    "completion-menu": "bg:default",
-    "completion-menu.completion": "bg:default #d0d0d0",
-    "completion-menu.completion.current": f"bold bg:{ACCENT} #1c1c1c",
-    "completion-menu.meta.completion": "bg:default #8a8a8a",
-    "completion-menu.meta.completion.current": f"bg:{ACCENT} #1c1c1c",
-    "completion-menu.multi-column-meta": "bg:default #8a8a8a",
-    "scrollbar.background": "bg:default",
-    "scrollbar.button": f"bg:{_FRAME_RULE}",
-})
+def _build_prompt_style() -> Style:
+    """The full-screen app's style map. A function because the accent can be
+    changed at startup (--theme-color) and this dict bakes it in."""
+    return Style.from_dict({
+        "frame.rule": _FRAME_RULE,
+        "frame.chip": f"bold reverse {ACCENT}",
+        "frame.hint": _FRAME_HINT,
+        "frame.model": f"bold {ACCENT}",
+        "choice": "",
+        "choice.selected": f"bold {ACCENT}",
+        "agent": "#8a8a8a",
+        "agent.active": f"bold {ACCENT}",
+        "agent.picked": f"bold reverse {ACCENT}",
+        "agent.busy": ACCENT,
+        "agent.done": "#3fb950",          # green: finished and reported back
+        "agent.attention": "#d29922",     # amber: waiting on you
+        "frame.spinner": f"bold {ACCENT}",
+        "frame.label": f"bold {ACCENT}",
+        "prompt.arrow": f"bold {ACCENT}",
+        # bg:default everywhere except the selected row: prompt_toolkit's stock
+        # menu paints a solid block, and since the menu is a full-width member of
+        # the box's stack (not a float) that block reads as the whole terminal
+        # going dark the moment you type "/".
+        "completion-menu": "bg:default",
+        "completion-menu.completion": "bg:default #d0d0d0",
+        "completion-menu.completion.current": f"bold bg:{ACCENT} #1c1c1c",
+        "completion-menu.meta.completion": "bg:default #8a8a8a",
+        "completion-menu.meta.completion.current": f"bg:{ACCENT} #1c1c1c",
+        "completion-menu.multi-column-meta": "bg:default #8a8a8a",
+        "scrollbar.background": "bg:default",
+        "scrollbar.button": f"bg:{_FRAME_RULE}",
+    })
+
+
+_PROMPT_STYLE = _build_prompt_style()
 
 
 _DOTS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -625,13 +651,13 @@ async def turn_frame(session_label: str = "", model: str = "", on_interrupt=None
     every line the transcript prints. Falls back to the Rich Live frame
     otherwise, which is the one-shot `omni "task"` path where no box exists."""
     if _tui is not None:
-        _tui.on_interrupt = on_interrupt
+        _tui.set_interrupt(on_interrupt)
         _tui.set_busy()
         try:
             yield
         finally:
             _tui.set_idle()
-            _tui.on_interrupt = None
+            _tui.set_interrupt(None)
         return
     _frame.open(session_label, model)
     try:
@@ -729,165 +755,34 @@ def thinking(label: str = "Thinking…"):
 
 
 class _TuiPhase:
-    """`thinking()`'s return value in a full-screen session: relabels the
-    status line for one phase of the turn and restores it afterwards. Same
-    contract as the other two (context manager plus .update())."""
+    """`thinking()`'s return value in a full-screen session: relabels one
+    pane's status line for a phase of its turn and restores it afterwards.
+    Same contract as the other two (context manager plus .update()).
+
+    The pane is captured on entry rather than read again later: by the time
+    the phase ends the focus may well have moved to another agent, and this
+    label belongs to the one that started it."""
 
     def __init__(self, app, label: str):
         self._app = app
         self._label = label
+        self._pane = None
         self._previous = None
 
     def __enter__(self):
-        self._previous = self._app._status
-        self._app.set_label(self._label)
+        from .tui import current_pane
+        self._pane = current_pane.get() or self._app.pane
+        self._previous = self._pane.status
+        self._app.set_label(self._label, pane=self._pane)
         return self
 
     def __exit__(self, *exc_info):
         if self._previous:
-            self._app.set_label(self._previous)
+            self._app.set_label(self._previous, pane=self._pane)
         return False
 
     def update(self, label: str):
-        self._app.set_label(label)
-
-
-@asynccontextmanager
-async def turn_frame(session_label: str = "", model: str = "", on_interrupt=None):
-    """Hold the frame at the bottom of the terminal for one turn.
-
-    Through the registered PromptBox when there is one (the REPL): prompt_
-    toolkit then owns that region for the whole session, redrawing it around
-    every line the transcript prints. Falls back to the Rich Live frame
-    otherwise, which is the one-shot `omni "task"` path where no box exists."""
-    if _tui is not None:
-        _tui.on_interrupt = on_interrupt
-        _tui.set_busy()
-        try:
-            yield
-        finally:
-            _tui.set_idle()
-            _tui.on_interrupt = None
-        return
-    _frame.open(session_label, model)
-    try:
-        yield
-    finally:
-        _frame.close()
-
-
-def _format_elapsed(seconds: float) -> str:
-    """Sub-minute durations stay decisecond-precise (e.g. "3.2s"); once a
-    call runs a minute or longer, switch to whole-second m/s (or h/m/s past
-    an hour) so a long wait reads as a duration, not a large decimal."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    total = int(seconds)
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m {secs:02d}s"
-    return f"{minutes}m {secs:02d}s"
-
-
-class _TickingSpinner:
-    """`with`-usable spinner (same contract as the plain rich Status this
-    replaces: sync `__enter__`/`__exit__`, a `.update(label)` method) that
-    keeps a live "(N.Ns)" elapsed-time suffix ticking on its own via a
-    background asyncio task, instead of only reporting elapsed time once
-    after the operation finishes (see elapsed_note/compacted for that).
-    Must be entered from within a running event loop — true at every call
-    site here, all inside `async def` functions.
-
-    `.update(label)` keeps the exact prior contract: `label` is the full
-    markup string to show (callers style it themselves, e.g. a differently
-    colored retry message) — this class only appends the ticking suffix,
-    it doesn't impose its own styling on updates."""
-
-    def __init__(self, label: str, interval: float = 0.15):
-        self._label = label
-        self._interval = interval
-        self._spinner = Spinner("dots", text=label, style=ACCENT)
-        # auto_refresh=False plus redirect_stdout/stderr=False: drive every
-        # redraw from this class's own tick loop alone — console.status()'s
-        # default Live spawns its OWN background refresh thread and
-        # redirects stdout independently, a second uncoordinated writer on
-        # top of patch_stdout, which is already the one coordinating writes
-        # against the REPL's prompt.
-        self._live = Live(self._spinner, console=console, transient=True,
-                           auto_refresh=False, redirect_stdout=False, redirect_stderr=False)
-        self._task = None
-        self._start = None
-
-    def update(self, label: str):
-        self._label = label
-
-    async def _tick(self):
-        try:
-            while True:
-                try:
-                    elapsed = _format_elapsed(time.monotonic() - self._start)
-                    self._spinner.update(text=f"{self._label} ({elapsed})")
-                    self._live.refresh()
-                except Exception:
-                    pass  # one bad frame, not a dead ticker (see _BottomFrame._tick)
-                await asyncio.sleep(self._interval)
-        except asyncio.CancelledError:
-            pass
-
-    def __enter__(self):
-        self._start = time.monotonic()
-        self._live.__enter__()
-        self._task = asyncio.ensure_future(self._tick())
-        return self
-
-    def __exit__(self, *exc_info):
-        if self._task is not None:
-            self._task.cancel()
-        return self._live.__exit__(*exc_info)
-
-
-def thinking(label: str = "Thinking…"):
-    """Spinner shown while waiting on a model call or tool execution, with a
-    live elapsed-time counter.
-
-    Inside a turn_frame (the interactive REPL) this relabels the pinned
-    frame rather than opening a second live display — Rich permits only one,
-    and the frame has to keep the bottom of the terminal for the whole turn.
-    Outside one (a one-shot `omni "task"` run) it's a standalone spinner.
-    Either way the returned object is a context manager with .update()."""
-    if _tui is not None:
-        return _TuiPhase(_tui, label)
-    styled = f"[bold {ACCENT}]{label}[/bold {ACCENT}]"
-    if _frame.is_open:
-        return _frame.phase(styled)
-    return _TickingSpinner(styled)
-
-
-class _TuiPhase:
-    """`thinking()`'s return value in a full-screen session: relabels the
-    status line for one phase of the turn and restores it afterwards. Same
-    contract as the other two (context manager plus .update())."""
-
-    def __init__(self, app, label: str):
-        self._app = app
-        self._label = label
-        self._previous = None
-
-    def __enter__(self):
-        self._previous = self._app._status
-        self._app.set_label(self._label)
-        return self
-
-    def __exit__(self, *exc_info):
-        if self._previous:
-            self._app.set_label(self._previous)
-        return False
-
-    def update(self, label: str):
-        self._app.set_label(label)
-
-
+        self._app.set_label(label, pane=self._pane)
 class _BoxPhase:
     """`thinking()`'s return value while the PromptBox is showing the busy
     frame. Same contract as _TickingSpinner and _FramePhase: a context
@@ -913,11 +808,38 @@ class _BoxPhase:
         self._box.set_label(label)
 
 
-def elapsed_note(label: str, seconds: float):
+def format_tokens(prompt: int = 0, completion: int = 0) -> str:
+    """"↑ 12.1k ↓ 3.4k" — what was sent, and what came back.
+
+    Taken from the usage block an OpenAI-compatible server returns
+    (prompt_tokens / completion_tokens), so these are the server's counts
+    rather than a guess from character lengths."""
+    def short(n: int) -> str:
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+        if n >= 1_000:
+            return f"{n / 1_000:.1f}k".replace(".0k", "k")
+        return str(n)
+
+    parts = []
+    if prompt:
+        parts.append(f"↑ {short(prompt)}")
+    if completion:
+        parts.append(f"↓ {short(completion)}")
+    return " ".join(parts)
+
+
+def elapsed_note(label: str, seconds: float, tokens: tuple = None):
     """Small dim line noting how long an operation took — printed once it
     finishes (after a `thinking()` spinner closes, or a step's tool calls
-    are done executing), not a live-updating counter."""
-    console.print(f"[dim]  {label} ({_format_elapsed(seconds)})[/dim]")
+    are done executing), not a live-updating counter. `tokens` is
+    (prompt, completion) from the server's usage block, when it sent one."""
+    detail = _format_elapsed(seconds)
+    if tokens:
+        counted = format_tokens(*tokens)
+        if counted:
+            detail += f" · {counted}"
+    console.print(f"[dim]  {label} ({detail})[/dim]")
 
 
 def intent_panel(intent, existing: dict):
@@ -962,7 +884,7 @@ _TOOL_EMOJI = {
     "git_diff": "📊", "git_status": "📋", "git_log": "📜", "git_show": "🧾",
     "git_branch": "🌿", "git_fetch": "📥", "git_add": "➕", "git_commit": "💾",
     "git_pull": "🔽", "git_push": "🔼",
-    "save_memory": "🧠", "search_tools": "🧰", "ask_user": "❓",
+    "save_memory": "🧠", "search_tools": "🧰", "ask_user": "❓", "spawn_agent": "🤖",
     "list_resources": "📚", "read_resource": "📖",
 }
 _DEFAULT_TOOL_EMOJI = "🧩"  # fallback for an unnamespaced tool this map doesn't know
@@ -1579,6 +1501,21 @@ def _print_question(build):
     console.print(build())
 
 
+def subagent_summary(name: str, steps: int):
+    """Header of the block a finished subagent folds into main.
+
+    Its pane disappears once every subagent has reported back, so this is
+    what keeps the work reachable: click it open for everything that agent
+    did. The answer itself is already in the conversation, and the session is
+    still in the database."""
+    line = Text("  ▸ ", style="dim")
+    line.append("🤖 subagent ", style=f"bold {ACCENT}")
+    line.append(name, style="bold")
+    line.append(f"  ·  {steps} block{'s' if steps != 1 else ''}  ·  reported back", style="dim")
+    console.print()
+    console.print(line)
+
+
 def note(text: str):
     """One line of plain feedback (a command's answer, a status message).
     In a full-screen session it becomes a transcript block like anything
@@ -1603,6 +1540,7 @@ for _name in (
     "history_panel", "sessions_table", "resources_table", "resource_content",
     "server_tools_table", "mcp_status", "model_switched", "interrupted",
     "compacted", "btw_answer", "instruction", "note", "warning", "error",
+    "subagent_summary",
 ):
     globals()[_name] = _as_block(globals()[_name])
 del _name

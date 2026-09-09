@@ -7,6 +7,7 @@ header refresh, cancellation — without a terminal or a model.
 """
 
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -48,6 +49,30 @@ def client(mocker):
     return c
 
 
+def scripted(mocker, lines):
+    """Feed the REPL a sequence of typed lines.
+
+    Input now arrives as (pane, text) — the pane says which agent it was
+    typed at — so the stand-in hands back whichever pane the loop offered it,
+    which is main."""
+    remaining = iter(lines)
+
+    async def fake_next(tui, main_pane):
+        # Turns are dispatched rather than awaited, so wait for the pane to be
+        # free before "typing" the next line — which is what a person does,
+        # and what makes these sequences deterministic.
+        for _ in range(200):
+            if main_pane.task is None or main_pane.task.done():
+                break
+            await asyncio.sleep(0.005)
+        try:
+            return main_pane, next(remaining)
+        except StopIteration:
+            return None, None
+
+    return mocker.patch.object(cli_mod, "_next_instruction", fake_next)
+
+
 @pytest.fixture
 def repl(mocker, client, cfg):
     """Run the REPL over a scripted list of inputs. Returns a helper that
@@ -72,8 +97,7 @@ def repl(mocker, client, cfg):
             return None
 
         mocker.patch.object(cli_mod, "_make_tui", fake_make_tui)
-        mocker.patch.object(cli_mod, "_next_instruction",
-                            mocker.AsyncMock(side_effect=script))
+        scripted(mocker, script)
         agent_run = mocker.patch.object(
             cli_mod.CodingAgent, "run",
             mocker.AsyncMock(return_value=run_result, side_effect=run_side_effect))
@@ -102,7 +126,7 @@ def test_blank_input_is_ignored(repl):
 def test_exit_commands_leave_the_loop(repl, mocker, quit_cmd):
     """Anything typed after the quit command must never run."""
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=[quit_cmd, "never runs"]))
+    scripted(mocker, [quit_cmd, "never runs"])
     agent_run = mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock())
     repl([quit_cmd])
     agent_run.assert_not_awaited()
@@ -113,8 +137,7 @@ def test_session_id_is_carried_between_turns(mocker, client, cfg):
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch("omni.ui.final_result")
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction",
-                        mocker.AsyncMock(side_effect=["first", "second", "/exit"]))
+    scripted(mocker, ["first", "second", "/exit"])
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
 
@@ -292,7 +315,7 @@ def test_compact_uses_the_resolved_session_id(mocker, client, cfg, capsys):
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "_show_resumed_history")
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/compact", "/exit"]))
+    scripted(mocker, ["/compact", "/exit"])
     compact = mocker.patch.object(cli_mod.CodingAgent, "compact_history",
                                  mocker.AsyncMock(return_value="Compacted 30 down to 5"))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
@@ -307,7 +330,7 @@ def test_model_command_lists_models(mocker, client, cfg, capsys):
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=["a", "b"]))
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/model", "/exit"]))
+    scripted(mocker, ["/model", "/exit"])
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     # No usable picker without a real terminal -> falls back to the printed list.
@@ -338,7 +361,7 @@ def test_model_list_failure_is_reported(mocker, client, cfg, capsys):
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(side_effect=LLMError("no /v1/models")))
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/model", "/exit"]))
+    scripted(mocker, ["/model", "/exit"])
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     asyncio.run(cli_mod._interactive(cfg, None, None))
@@ -589,7 +612,7 @@ def test_resumed_history_is_shown_once(mocker, client, cfg):
     mocker.patch.object(cli_mod, "_print_header")
     shown = mocker.patch.object(cli_mod, "_show_resumed_history")
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
-    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/exit"]))
+    scripted(mocker, ["/exit"])
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     asyncio.run(cli_mod._interactive(cfg, "some-session", None))
@@ -606,3 +629,177 @@ def test_missing_v1_models_endpoint_is_tolerated(repl, client, mocker):
     from omni.llm_client import LLMError
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(side_effect=LLMError("404")))
     repl(["a task"])            # startup must not fail
+
+
+# ---------------- subagents ----------------
+#
+# These drive cli._run_turn against a real TuiApp, because that pairing is
+# where the interesting mistakes live: a subagent's output has to land in its
+# own pane, and a missing attribute on Pane silently turned every spawn into
+# an error result the model then worked around.
+
+@pytest.fixture
+def tui_app(mocker, cfg):
+    from omni import ui
+    from omni.tui import TuiApp
+    app = TuiApp({}, "main", cfg.model)
+    ui.use_tui(app)
+    yield app
+    ui.use_tui(None)
+
+
+def _stub_agent(mocker, label: str):
+    """An agent whose run() emits the way the real one does."""
+    from omni import ui
+
+    async def run(task, **kwargs):
+        ui.assistant_message(f"{label}: {task}")
+        return f"{label} finished"
+
+    agent = mocker.Mock(session_id=f"sess-{label}", tokens={"prompt": 10, "completion": 5})
+    agent.run = mocker.AsyncMock(side_effect=run)
+    return agent
+
+
+async def test_a_subagents_output_lands_in_its_own_pane(tui_app, mocker, cfg):
+    tui_app.main.agent = _stub_agent(mocker, "main")
+    sub = tui_app.add_pane("child", agent=_stub_agent(mocker, "child"), depth=1)
+
+    await cli_mod._run_turn(tui_app.main, "parent work", cfg=cfg, client=mocker.Mock(),
+                            tui=tui_app, session_name=None)
+    await cli_mod._run_turn(sub, "child work", cfg=cfg, client=mocker.Mock(),
+                            tui=tui_app, session_name=None)
+
+    def texts(pane):
+        return " ".join(b.collapsed() for b in pane.transcript.blocks)
+
+    assert "main: parent work" in texts(tui_app.main)
+    assert "child: child work" in texts(sub)
+    assert "child: child work" not in texts(tui_app.main)
+
+
+async def test_a_pane_carries_its_own_session(tui_app, mocker, cfg):
+    """Every pane resumes its own session; a Pane without this attribute made
+    each spawn fail with an AttributeError the model just worked around."""
+    sub = tui_app.add_pane("child", agent=_stub_agent(mocker, "child"), depth=1)
+    assert sub.session_id is None
+    await cli_mod._run_turn(sub, "work", cfg=cfg, client=mocker.Mock(), tui=tui_app,
+                            session_name=None)
+    assert sub.session_id == "sess-child"
+    assert sub.agent.run.await_args.kwargs["resume_session_id"] is None
+
+
+async def test_a_finished_subagent_is_marked_done(tui_app, mocker, cfg):
+    sub = tui_app.add_pane("child", agent=_stub_agent(mocker, "child"), depth=1)
+    await cli_mod._run_turn(sub, "work", cfg=cfg, client=mocker.Mock(), tui=tui_app,
+                            session_name=None)
+    tui_app.set_idle(pane=sub, done=True)
+    assert sub.done is True and "●" in "".join(f[1] for f in tui_app._agent_tree())
+
+
+async def test_the_spawner_reports_a_failure_instead_of_raising(tui_app, mocker, cfg):
+    """A broken subagent is the parent's business to hear about, not a reason
+    to break the parent's turn."""
+    mocker.patch.object(cli_mod, "_run_turn", mocker.AsyncMock(side_effect=RuntimeError("boom")))
+    cli_mod._RUNTIME["client"] = mocker.Mock()
+    spawn = cli_mod._make_spawner(cfg, tui_app, tui_app.main)
+    out = await spawn("do a thing", name="thing")
+    assert "failed to run" in out and "boom" in out
+
+
+async def test_a_subagent_cannot_spawn_another(tui_app, mocker, cfg):
+    from omni.tui import current_pane
+    cli_mod._RUNTIME["client"] = mocker.Mock()
+    sub = tui_app.add_pane("child", agent=_stub_agent(mocker, "child"), depth=1)
+    spawn = cli_mod._make_spawner(cfg, tui_app, tui_app.main)
+    token = current_pane.set(sub)
+    try:
+        out = await spawn("go deeper")
+    finally:
+        current_pane.reset(token)
+    assert "can't spawn subagents" in out
+
+
+async def test_the_spawner_gives_the_child_its_own_config(tui_app, mocker, cfg):
+    """A subagent's model, prompt and step budget are its own — that's what
+    --subagent-model and spawn_agent's system_prompt are for."""
+    cfg.subagent_model = "small-model"
+    cfg.subagent_max_steps = 7
+    cli_mod._RUNTIME["client"] = mocker.Mock()
+    captured = {}
+
+    async def fake_turn(pane, task, *, cfg, **kwargs):
+        captured["cfg"] = cfg
+        captured["pane"] = pane
+        return "ok"
+
+    mocker.patch.object(cli_mod, "_run_turn", fake_turn)
+    spawn = cli_mod._make_spawner(cfg, tui_app, tui_app.main)
+    assert await spawn("audit it", name="audit", system_prompt="You are a REVIEWER.") == "ok"
+    child_cfg = captured["cfg"]
+    assert child_cfg.model == "small-model"
+    assert child_cfg.system_prompt == "You are a REVIEWER."
+    assert child_cfg.max_steps == 7
+    assert captured["pane"].name == "audit" and captured["pane"].kind == "subagent"
+    assert cfg.model != "small-model"        # the parent's own config is untouched
+
+
+async def test_an_interrupted_subagent_says_so_to_its_parent(tui_app, mocker, cfg):
+    """"It didn't finish" isn't enough: a model told only that tends to spawn
+    the same job again."""
+    cli_mod._RUNTIME["client"] = mocker.Mock()
+
+    async def interrupted_turn(pane, task, **kwargs):
+        pane.outcome, pane.error = "interrupted", ""
+        return None
+
+    mocker.patch.object(cli_mod, "_run_turn", interrupted_turn)
+    spawn = cli_mod._make_spawner(cfg, tui_app, tui_app.main)
+    out = await spawn("long job", name="slow")
+    assert "interrupted by the user" in out and "Don't spawn it again" in out
+
+
+async def test_a_failed_subagent_reports_the_reason(tui_app, mocker, cfg):
+    cli_mod._RUNTIME["client"] = mocker.Mock()
+
+    async def failed_turn(pane, task, **kwargs):
+        pane.outcome, pane.error = "error", "LLM server unreachable"
+        return None
+
+    mocker.patch.object(cli_mod, "_run_turn", failed_turn)
+    spawn = cli_mod._make_spawner(cfg, tui_app, tui_app.main)
+    out = await spawn("job", name="broken")
+    assert "failed: LLM server unreachable" in out
+
+
+async def test_interrupting_a_turn_stops_the_agent_too(tui_app, mocker, cfg):
+    """Cancelling the await alone would leave the agent running in the
+    background, still spending tokens on a turn nobody is waiting for."""
+    started = asyncio.Event()
+
+    async def never_ends(task, **kwargs):
+        started.set()
+        await asyncio.sleep(30)
+
+    agent = mocker.Mock(session_id="s", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(side_effect=never_ends)
+    pane = tui_app.add_pane("slow", agent=agent, depth=1)
+
+    turn = asyncio.ensure_future(cli_mod._run_turn(pane, "work", cfg=cfg,
+                                                    client=mocker.Mock(), tui=tui_app,
+                                                    session_name=None))
+    await started.wait()
+    inner = pane.task
+    turn.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await turn
+    await asyncio.sleep(0)
+    assert inner.cancelled() or inner.done()
+    assert pane.outcome in ("interrupted", "")
+
+
+async def test_an_interrupted_subagent_is_marked_in_the_tree(tui_app, mocker, cfg):
+    sub = tui_app.add_pane("slow", agent=_stub_agent(mocker, "slow"), depth=1)
+    sub.outcome = "interrupted"
+    rows = "".join(f[1] for f in tui_app._agent_tree())
+    assert "✕" in rows and "interrupted" in rows

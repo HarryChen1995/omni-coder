@@ -25,8 +25,10 @@ straight to the terminal there.
 """
 
 import asyncio
+import contextvars
 import io
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -236,38 +238,120 @@ class Transcript(UIControl):
 _DOTS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+class Pane:
+    """One agent's screen.
+
+    Main is pane 0; every subagent gets its own. A pane owns everything that
+    belongs to *that* agent rather than to the window: its transcript, whether
+    it's working, and any question of its own waiting to be answered. That
+    last part is why approvals from a background subagent don't hijack the
+    screen — they wait in its own tab until you go there."""
+
+    def __init__(self, name: str, agent=None, kind: str = "main", depth: int = 0):
+        self.name = name
+        self.agent = agent
+        self.kind = kind              # "main" | "subagent"
+        self.depth = depth
+        # The session this pane's agent is continuing. Each pane has its own,
+        # which is what keeps two agents' histories apart in the database.
+        self.session_id = None
+        self.transcript = Transcript()
+
+        self.busy = False
+        self.status = ""
+        self.phase_start = 0.0
+        self.done = False             # a subagent that finished
+        self.unseen = False           # output arrived while you were elsewhere
+        # How its last turn ended: "" (never ran), "done", "interrupted" or
+        # "error". What a subagent reports back to its parent depends on this,
+        # so "it didn't finish" can say which.
+        self.outcome = ""
+        self.error = ""
+
+        self.task = None              # the turn running now, if any
+        self.pending: list = []       # typed at it while it was busy
+        self.on_interrupt = None
+
+        self.approval = None          # (question, Future)
+        self.ask = None               # (hint, Future)
+        self.options: list = []
+        self.choice = 0
+
+    # The frame shows exactly one of these for the focused pane.
+    @property
+    def mode(self) -> str:
+        if self.ask is not None:
+            return "ask"
+        if self.approval is not None:
+            return "approve"
+        if self.busy:
+            return "busy"
+        return "idle"
+
+    @property
+    def needs_you(self) -> bool:
+        return self.approval is not None or self.ask is not None
+
+
+# The pane a turn's output belongs to. A ContextVar rather than an attribute
+# because several agents run at once, each in its own task: a task inherits
+# the context it was created in, so output finds its own pane without every
+# renderer having to be told which one.
+current_pane = contextvars.ContextVar("current_pane", default=None)
+
+
+class _FocusedTranscript(UIControl):
+    """The transcript window shows whichever pane has focus, so switching is
+    a matter of which control this defers to — no rebuilding the layout."""
+
+    def __init__(self, app):
+        self._app = app
+
+    def create_content(self, width, height):
+        return self._app.pane.transcript.create_content(width, height)
+
+    def mouse_handler(self, mouse_event):
+        return self._app.pane.transcript.mouse_handler(mouse_event)
+
+    def is_focusable(self) -> bool:
+        return False
+
+    def preferred_height(self, width, max_available_height, wrap_lines, get_line_prefix):
+        return self._app.pane.transcript.preferred_height(
+            width, max_available_height, wrap_lines, get_line_prefix)
+
+
 class TuiApp:
     """The whole screen for an interactive session.
 
-    Transcript on top (scroll with the wheel, click a ▸ line to open it), the
-    familiar frame underneath. The frame has three states, and only ever one
-    at a time, so there is exactly one place to type:
+    A tab bar of panes, the focused pane's transcript (scroll with the wheel,
+    click a ▸ line to open it), and the frame underneath. The frame always
+    reflects the focused pane, and shows one thing at a time, so there is
+    exactly one place to type:
 
       idle     ❯ and your text
-      busy     what the agent is doing, with an elapsed counter
-      approve  a y/n question about one tool call
+      busy     what that agent is doing, with an elapsed counter
+      approve  a y/n question about one of its tool calls
+      ask      a question the model asked you, with optional choices
 
-    The REPL doesn't read input directly any more: this app runs for the whole
-    session and hands instructions over a queue (`next_instruction`), which is
-    what lets the transcript stay live and clickable while a turn runs.
+    The REPL doesn't read input directly: this app runs for the whole session
+    and hands (pane, instruction) pairs over a queue, which is what lets main
+    keep working while you read or type at a subagent.
     """
 
     def __init__(self, commands: dict, session_label: str = "", model: str = ""):
         if _ui is None:
             _bind_ui()
-        self.transcript = Transcript()
         self.session_label = session_label
         self.model = model
         self.commands = commands
-        self.on_interrupt = None          # set by the REPL while a turn runs
 
-        self._mode = "idle"               # idle | busy | approve | ask
-        self._ask = None                  # (hint, Future) while answering a question
-        self._options: list = []          # choices offered with the question
-        self._choice = 0                  # which one is highlighted
-        self._status = ""
-        self._phase_start = 0.0
-        self._approval = None             # (question, Future)
+        self.panes: list = [Pane(session_label or "main", kind="main")]
+        self.focused = 0
+        self._picking = False      # walking the agent tree with the keyboard
+        self._pick_index = 0
+        self._fold_task = None
+
         self._queue: asyncio.Queue = asyncio.Queue()
         self._ticker = None
         self._exit_requested = False
@@ -287,54 +371,104 @@ class TuiApp:
             erase_when_done=True,
         )
 
-    # ---- state ----
+    # ---- panes ----
 
     @property
-    def mode(self) -> str:
-        return self._mode
+    def pane(self) -> Pane:
+        return self.panes[min(self.focused, len(self.panes) - 1)]
 
-    def _idle(self) -> bool:
-        return self._mode == "idle"
+    @property
+    def main(self) -> Pane:
+        return self.panes[0]
 
-    def _busy(self) -> bool:
-        return self._mode == "busy"
+    def add_pane(self, name: str, agent=None, depth: int = 1) -> Pane:
+        pane = Pane(name, agent=agent, kind="subagent", depth=depth)
+        self.panes.append(pane)
+        self.invalidate()
+        return pane
 
-    def _approving(self) -> bool:
-        return self._mode == "approve"
+    def close_pane(self, pane: Pane) -> bool:
+        """Drop a finished subagent's tab. Main can't be closed."""
+        if pane is self.main or pane not in self.panes:
+            return False
+        index = self.panes.index(pane)
+        self.panes.remove(pane)
+        self.focused = min(self.focused, len(self.panes) - 1)
+        if index <= self.focused:
+            self.focused = max(self.focused - 1, 0) if index < self.focused else self.focused
+        self.invalidate()
+        return True
 
-    def _asking(self) -> bool:
-        return self._mode == "ask"
+    def focus(self, index: int):
+        if 0 <= index < len(self.panes):
+            self.focused = index
+            self.pane.unseen = False
+            self._buffer.reset()
+            self.invalidate()
 
-    def _choosing(self) -> bool:
-        return self._asking() and bool(self._options)
+    def focus_pane(self, pane: Pane):
+        if pane in self.panes:
+            self.focus(self.panes.index(pane))
 
-    def _options_lines(self):
-        """The choices, with the highlighted one marked. Each row carries its
-        own mouse handler, so an option can be clicked as well as arrowed
-        to — the transcript is clickable, and so is this."""
-        typing = bool(self._buffer.text.strip())
+    def cycle(self, step: int):
+        self.focus((self.focused + step) % len(self.panes))
+
+    def _agent_tree(self):
+        """The agents, as a tree under the prompt.
+
+        ○ is working, ● (green) has finished and reported back, ! is waiting
+        on you for an approval or an answer. Rows are clickable, and ctrl+↑↓
+        walks them with Enter to switch. The tree only exists while there are
+        subagents: once the last one finishes they fold into main's transcript
+        and it disappears again (see _fold_finished)."""
         fragments = []
-        for i, option in enumerate(self._options):
-            selected = i == self._choice and not typing
-            marker = "▸ " if selected else "  "
-            style = f"class:choice.selected" if selected else "class:choice"
+        for index, pane in enumerate(self.panes):
+            last = index == len(self.panes) - 1
+            branch = "  " if index == 0 else ("  └─ " if last else "  ├─ ")
 
-            def handler(event, index=i):
+            if pane.needs_you:
+                dot, dot_style = "!", "class:agent.attention"
+            elif pane.busy:
+                dot, dot_style = "○", "class:agent.busy"
+            elif pane.outcome in ("interrupted", "error"):
+                # Finished, but not with an answer — worth telling apart from
+                # a clean ●, since the parent was told as much.
+                dot, dot_style = "✕", "class:agent.attention"
+            elif pane.done:
+                dot, dot_style = "●", "class:agent.done"
+            else:
+                dot, dot_style = "·", "class:agent"
+
+            picked = self._picking and index == self._pick_index
+            name_style = ("class:agent.picked" if picked else
+                           "class:agent.active" if index == self.focused else "class:agent")
+            note = ""
+            if pane.busy and pane.status:
+                note = f"  {_ui._plain(pane.status)} " \
+                        f"({_ui._format_elapsed(time.monotonic() - pane.phase_start)})"
+            elif pane.needs_you:
+                note = "  waiting for you"
+            elif pane.outcome == "interrupted":
+                note = "  interrupted"
+            elif pane.outcome == "error":
+                note = f"  {pane.error}"[:40]
+            elif pane.unseen:
+                note = "  new output"
+
+            def handler(event, target=index):
                 if event.event_type == MouseEventType.MOUSE_UP:
-                    self._choice = index
-                    self._buffer.reset()
-                    self.invalidate()
+                    self.focus(target)
 
-            fragments.append((style, f" {marker}{i + 1}. {option}", handler))
-            fragments.append(("", "\n"))
-        if typing:
-            fragments.append(("class:frame.hint", "   (using what you typed)"))
+            fragments.append(("class:agent", branch, handler))
+            fragments.append((dot_style, dot + " ", handler))
+            # Main is "main": it isn't one of the numbered subagents, and a
+            # leading 0 beside the session name read like one.
+            label = "main" if index == 0 else f"{index} {pane.name}"
+            fragments.append((name_style, label, handler))
+            fragments.append(("class:frame.hint", note, handler))
+            if not last:
+                fragments.append(("", "\n"))
         return fragments
-
-    def _accepts_typing(self) -> bool:
-        """Both idle and ask mode read a line from the input row — the
-        difference is only where the line goes."""
-        return self._idle() or self._asking()
 
     def invalidate(self):
         try:
@@ -344,9 +478,15 @@ class TuiApp:
 
     # ---- transcript ----
 
-    def emit(self, collapsed, expanded=None) -> Block:
-        """Add one entry. Pass `expanded` to make it clickable."""
-        block = self.transcript.add(Block(collapsed=collapsed, expanded=expanded))
+    def emit(self, collapsed, expanded=None, pane: Pane = None) -> Block:
+        """Add one entry to the pane that produced it (see current_pane).
+        Pass `expanded` to make it clickable."""
+        target = pane or current_pane.get() or self.pane
+        if target not in self.panes:
+            target = self.pane
+        block = target.transcript.add(Block(collapsed=collapsed, expanded=expanded))
+        if target is not self.pane:
+            target.unseen = True
         self.invalidate()
         return block
 
@@ -355,33 +495,36 @@ class TuiApp:
         return self._width()
 
     def dump(self):
-        """Write the transcript to the real terminal, in whatever open/closed
-        state it was left in.
+        """Write the transcripts to the real terminal, in whatever open/closed
+        state they were left in.
 
         A full-screen app hands the terminal back with its previous contents
         restored, which would otherwise mean the whole session vanishing from
         scrollback on exit. Written as raw ANSI rather than through Rich: the
-        blocks are already rendered text, and re-printing them as markup
-        would mangle the escapes they contain. Must be called while ui still
-        has this app registered, since that is what the block closures render
-        against."""
+        blocks are already rendered text, and re-printing them as markup would
+        mangle the escapes they contain. Must be called while ui still has this
+        app registered, since that is what the block closures render against."""
         width = self.transcript_width()
-        for block in self.transcript.blocks:
-            build = block.expanded if (block.is_open and block.expanded) else block.collapsed
-            try:
-                produced = build()
-            except Exception:
-                continue        # one unrenderable block shouldn't lose the rest
-            text = produced if isinstance(produced, str) else _ansi(produced, width)
-            if not text.endswith("\n"):
-                text += "\n"
-            sys.stdout.write(text)
+        for index, pane in enumerate(self.panes):
+            if index:
+                sys.stdout.write(_ansi(_ui.subagent_summary(pane.name,
+                                                              len(pane.transcript.blocks)), width))
+            for block in pane.transcript.blocks:
+                build = block.expanded if (block.is_open and block.expanded) else block.collapsed
+                try:
+                    produced = build()
+                except Exception:
+                    continue    # one unrenderable block shouldn't lose the rest
+                text = produced if isinstance(produced, str) else _ansi(produced, width)
+                if not text.endswith("\n"):
+                    text += "\n"
+                sys.stdout.write(text)
         sys.stdout.flush()
 
     # ---- the frame ----
 
     def _rule_with_chip(self):
-        chip = f" {self.session_label or _ui._DEFAULT_LABEL} "
+        chip = f" {self.pane.name or _ui._DEFAULT_LABEL} "
         width = self._width()
         return [("class:frame.rule", "─" * max(width - len(chip) - 2, 0)),
                  ("class:frame.chip", chip), ("class:frame.rule", "──")]
@@ -396,34 +539,170 @@ class TuiApp:
             return _ui.console.width
 
     def _status_line(self):
-        glyph = _DOTS[int(__import__("time").monotonic() * 8) % len(_DOTS)]
-        elapsed = _ui._format_elapsed(__import__("time").monotonic() - self._phase_start)
+        """Spinner, what it's doing, and how long plus what it has spent —
+        the tokens come from the server's usage blocks, so the count beside
+        the spinner is the server's own."""
+        pane = self.pane
+        glyph = _DOTS[int(time.monotonic() * 8) % len(_DOTS)]
+        detail = _ui._format_elapsed(time.monotonic() - pane.phase_start)
+        tokens = getattr(pane.agent, "tokens", None) if pane.agent else None
+        if tokens:
+            counted = _ui.format_tokens(tokens.get("prompt", 0), tokens.get("completion", 0))
+            if counted:
+                detail += f" · {counted}"
         return [("class:frame.spinner", f"{glyph} "),
-                 ("class:frame.label", _ui._plain(self._status)),
-                 ("class:frame.hint", f"  ({elapsed})")]
+                 ("class:frame.label", _ui._plain(pane.status)),
+                 ("class:frame.hint", f"  ({detail})")]
 
     def _approve_line(self):
-        question = self._approval[0] if self._approval else ""
+        pane = self.pane
+        question = pane.approval[0] if pane.approval else ""
         return [("class:prompt.arrow", "❯ "), ("class:frame.label", question),
                  ("class:frame.hint", "   y / n")]
 
+    def _options_lines(self):
+        """The choices, with the highlighted one marked. Each row carries its
+        own mouse handler, so an option can be clicked as well as arrowed
+        to — the transcript is clickable, and so is this."""
+        pane = self.pane
+        typing = bool(self._buffer.text.strip())
+        fragments = []
+        for i, option in enumerate(pane.options):
+            selected = i == pane.choice and not typing
+            marker = "▸ " if selected else "  "
+            style = "class:choice.selected" if selected else "class:choice"
+
+            def handler(event, index=i, target=pane):
+                if event.event_type == MouseEventType.MOUSE_UP:
+                    target.choice = index
+                    self._buffer.reset()
+                    self.invalidate()
+
+            fragments.append((style, f" {marker}{i + 1}. {option}", handler))
+            fragments.append(("", "\n"))
+        if typing:
+            fragments.append(("class:frame.hint", "   (using what you typed)"))
+        return fragments
+
+    # ---- modes, read off the focused pane ----
+
+    @property
+    def mode(self) -> str:
+        return self.pane.mode
+
+    def _idle(self) -> bool:
+        return self.pane.mode == "idle"
+
+    def _busy(self) -> bool:
+        return self.pane.mode == "busy"
+
+    def _approving(self) -> bool:
+        return self.pane.mode == "approve"
+
+    def _asking(self) -> bool:
+        return self.pane.mode == "ask"
+
+    def _choosing(self) -> bool:
+        return self._asking() and bool(self.pane.options)
+
+    def _accepts_typing(self) -> bool:
+        """Idle and ask both read a line from the input row — the difference
+        is only where the line goes."""
+        return self._idle() or self._asking()
+
     def _hint(self):
+        switch = "  ·  ctrl+←→ switch" if len(self.panes) > 1 else ""
         if self._choosing():
             return _ui._hint_segments(self.model,
                                        "↑↓ or click to choose  ·  or type your own  ·  "
                                        "⏎ submit  ·  ctrl+c dismiss")
         if self._asking():
-            return _ui._hint_segments(self.model, self._ask[0] if self._ask else "")
-        if self._busy():
-            return _ui._hint_segments(self.model, _ui._HINT_BUSY)
+            return _ui._hint_segments(self.model, self.pane.ask[0] if self.pane.ask else "")
         if self._approving():
             return _ui._hint_segments(self.model, "y approve  ·  n deny  ·  ctrl+c interrupt")
-        return _ui._hint_segments(self.model, _HINT_TUI)
+        if self._busy():
+            return _ui._hint_segments(self.model, _ui._HINT_BUSY + switch)
+        return _ui._hint_segments(self.model, _HINT_TUI + switch)
+
+    # ---- picking an agent from the tree ----
+
+    def _pick_mode(self, on: bool):
+        self._picking = on
+        if on:
+            self._pick_index = self.focused
+        self.invalidate()
+
+    def _move_pick(self, step: int):
+        """First press enters pick mode *and* moves — pressing down once and
+        having nothing move reads as the key not working."""
+        if not self._picking:
+            self._pick_mode(True)
+        self._pick_index = (self._pick_index + step) % len(self.panes)
+        self.invalidate()
+
+    def _take_pick(self):
+        self.focus(self._pick_index)
+        self._pick_mode(False)
+
+    # ---- folding finished subagents back into main ----
+
+    def _subagents(self) -> list:
+        return [p for p in self.panes if p.kind == "subagent"]
+
+    def _all_subagents_finished(self) -> bool:
+        subs = self._subagents()
+        return bool(subs) and all(p.done and not p.busy and not p.needs_you for p in subs)
+
+    def _schedule_fold(self, delay: float = 1.5):
+        """Give the green dot a moment to be seen, then clear the tree."""
+        if self._fold_task is not None and not self._fold_task.done():
+            return
+        try:
+            self._fold_task = asyncio.ensure_future(self._fold_after(delay))
+        except RuntimeError:
+            pass    # no running loop (tests); folding is then explicit
+
+    async def _fold_after(self, delay: float):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._all_subagents_finished():
+            self._fold_finished()
+
+    def _fold_finished(self):
+        """Move each finished subagent into main's transcript as one clickable
+        block and drop its pane.
+
+        The tree returns to just main, but nothing is lost: the block holds
+        everything that agent did, its answer is already in main's
+        conversation, and its session is still in the database."""
+        width = self.transcript_width()
+        for pane in self._subagents():
+            if not pane.done:
+                continue
+            rendered = []
+            for block in pane.transcript.blocks:
+                build = block.expanded if (block.is_open and block.expanded) else block.collapsed
+                try:
+                    produced = build()
+                except Exception:
+                    continue
+                rendered.append(produced if isinstance(produced, str)
+                                 else _ansi(produced, width))
+            body = "".join(rendered)
+            head = _ui._rendered(_ui.subagent_summary._plain, pane.name,
+                                  len(pane.transcript.blocks))
+            self.emit(lambda head=head: head,
+                       lambda head=head, body=body: head + body,
+                       pane=self.main)
+            self.panes.remove(pane)
+        self.focused = min(self.focused, len(self.panes) - 1)
+        self._picking = False
+        self.invalidate()
 
     def _build_layout(self) -> Layout:
         one = Dimension.exact(1)
-        transcript_window = Window(self.transcript, wrap_lines=False,
-                                    always_hide_cursor=True)
         input_row = Window(BufferControl(buffer=self._buffer), height=one, wrap_lines=False)
         prompt_row = VSplit([
             Window(FormattedTextControl(lambda: [("class:prompt.arrow", "❯ ")]),
@@ -433,7 +712,7 @@ class TuiApp:
         self._input_row = input_row
 
         return Layout(HSplit([
-            transcript_window,
+            Window(_FocusedTranscript(self), wrap_lines=False, always_hide_cursor=True),
             ConditionalContainer(
                 CompletionsMenu(max_height=8, scroll_offset=1),
                 filter=Condition(lambda: self._idle() and bool(self._buffer.complete_state)),
@@ -467,6 +746,13 @@ class TuiApp:
             ),
             Window(FormattedTextControl(self._rule), height=one),
             Window(FormattedTextControl(self._hint), height=one),
+            # The agent tree sits under the prompt, and only while there is
+            # more than one agent to choose between.
+            ConditionalContainer(
+                Window(FormattedTextControl(self._agent_tree), always_hide_cursor=True,
+                        height=Dimension(min=1, max=8)),
+                filter=Condition(lambda: len(self.panes) > 1),
+            ),
         ]), focused_element=input_row)
 
     # ---- keys ----
@@ -474,7 +760,34 @@ class TuiApp:
     def _build_keys(self) -> KeyBindings:
         keys = KeyBindings()
 
-        @keys.add("enter", filter=Condition(lambda: self._idle()))
+        def _navigating() -> bool:
+            """An empty prompt with more than one agent means the arrows and
+            Enter belong to the agent tree — you can see it below the input,
+            so that is where they should go. The moment you type anything they
+            go back to the input line.
+
+            Busy counts: while an agent is working is exactly when you want to
+            look at another one, and there is nothing else the arrows could
+            mean then. Only a question in progress (a y/n approval, or a
+            choice picker) keeps them, since those own Enter."""
+            return (len(self.panes) > 1 and not self._buffer.text.strip()
+                     and self.pane.mode in ("idle", "busy"))
+
+        self._navigating = _navigating
+
+        @keys.add("up", filter=Condition(_navigating))
+        def _up_agent(event):
+            self._move_pick(-1)
+
+        @keys.add("down", filter=Condition(_navigating))
+        def _down_agent(event):
+            self._move_pick(1)
+
+        @keys.add("enter", filter=Condition(lambda: _navigating() and self._picking))
+        def _switch_agent(event):
+            self._take_pick()
+
+        @keys.add("enter", filter=Condition(lambda: self._idle() and not self._picking))
         def _submit(event):
             text = self._buffer.text
             self._buffer.reset()
@@ -482,46 +795,58 @@ class TuiApp:
                 # Echo it into the transcript immediately: the input line is
                 # cleared on submit, so otherwise the request would disappear
                 # and the turn's output would have nothing above it.
-                _ui.instruction(text)
-                self._queue.put_nowait(text)
+                token = current_pane.set(self.pane)
+                try:
+                    _ui.instruction(text)
+                finally:
+                    current_pane.reset(token)
+                self._queue.put_nowait((self.pane, text))
 
-        @keys.add("enter", filter=Condition(self._asking))
+        @keys.add("enter", filter=Condition(lambda: self._asking()))
         def _answer_question(event):
             """What you typed if you typed anything, otherwise the highlighted
             choice. Both are answers; neither is more correct than the other,
             which is why the list never blocks the keyboard."""
+            pane = self.pane
             typed = self._buffer.text.strip()
             self._buffer.reset()
             if typed:
                 answer = typed
-            elif self._options:
-                answer = self._options[self._choice]
+            elif pane.options:
+                answer = pane.options[pane.choice]
             else:
                 answer = ""
             if answer:
-                _ui.instruction(answer)
-            self._resolve_ask(answer)
+                token = current_pane.set(pane)
+                try:
+                    _ui.instruction(answer)
+                finally:
+                    current_pane.reset(token)
+            self._resolve_ask(pane, answer)
 
         @keys.add("up", filter=Condition(self._choosing))
         def _previous_choice(event):
-            self._choice = (self._choice - 1) % len(self._options)
+            pane = self.pane
+            pane.choice = (pane.choice - 1) % len(pane.options)
             self.invalidate()
 
         @keys.add("down", filter=Condition(self._choosing))
         def _next_choice(event):
-            self._choice = (self._choice + 1) % len(self._options)
+            pane = self.pane
+            pane.choice = (pane.choice + 1) % len(pane.options)
             self.invalidate()
 
         @keys.add("c-c")
         def _interrupt(event):
-            if self._asking():
+            pane = self.pane
+            if pane.ask is not None:
                 self._buffer.reset()
-                self._resolve_ask(None)      # dismissed; the tool reports that
-            elif self._approving():
-                self._answer(False)
-            elif self._busy():
-                if self.on_interrupt is not None:
-                    self.on_interrupt()
+                self._resolve_ask(pane, None)   # dismissed; the tool says so
+            elif pane.approval is not None:
+                self._answer(pane, False)
+            elif pane.busy:
+                if pane.on_interrupt is not None:
+                    pane.on_interrupt()
             else:
                 self._buffer.reset()
 
@@ -529,33 +854,59 @@ class TuiApp:
         def _eof(event):
             if not self._buffer.text:
                 self._exit_requested = True
-                self._queue.put_nowait(None)
+                self._queue.put_nowait((None, None))
 
         @keys.add("y", filter=Condition(self._approving))
         @keys.add("Y", filter=Condition(self._approving))
         def _yes(event):
-            self._answer(True)
+            self._answer(self.pane, True)
 
         @keys.add("n", filter=Condition(self._approving))
         @keys.add("N", filter=Condition(self._approving))
         @keys.add("enter", filter=Condition(self._approving))
         def _no(event):
-            self._answer(False)
+            self._answer(self.pane, False)
+
+        # Switching panes. Ctrl+arrows rather than tab, which belongs to
+        # completion, or plain arrows, which belong to the choice picker.
+        @keys.add("enter", filter=Condition(lambda: self._picking))
+        def _take_pick(event):
+            self._take_pick()
+
+        @keys.add("escape", filter=Condition(lambda: self._picking))
+        def _cancel_pick(event):
+            self._pick_mode(False)
+
+        @keys.add("c-up")
+        def _pick_up(event):
+            self._move_pick(-1)
+
+        @keys.add("c-down")
+        def _pick_down(event):
+            self._move_pick(1)
+
+        @keys.add("c-right")
+        def _next_pane(event):
+            self.cycle(1)
+
+        @keys.add("c-left")
+        def _previous_pane(event):
+            self.cycle(-1)
 
         # Keyboard scrolling, for the same reasons a pager has it.
         @keys.add("pageup")
         def _page_up(event):
-            self.transcript.scroll_by(-(self.transcript._last_height - 1),
-                                       self.transcript._last_height)
+            height = self.pane.transcript._last_height
+            self.pane.transcript.scroll_by(-(height - 1), height)
 
         @keys.add("pagedown")
         def _page_down(event):
-            self.transcript.scroll_by(self.transcript._last_height - 1,
-                                       self.transcript._last_height)
+            height = self.pane.transcript._last_height
+            self.pane.transcript.scroll_by(height - 1, height)
 
         @keys.add("escape", "g")
         def _to_bottom(event):
-            self.transcript.scroll_to_bottom()
+            self.pane.transcript.scroll_to_bottom()
 
         return keys
 
@@ -570,10 +921,11 @@ class TuiApp:
             self._ticker = None
 
     async def _tick(self, interval: float = 0.1):
-        """Repaint while busy, so the spinner turns and the counter climbs."""
+        """Repaint while anything is working, so spinners turn and counters
+        climb — including a subagent's, which shows in its tab."""
         try:
             while True:
-                if self._busy():
+                if any(p.busy for p in self.panes):
                     self.invalidate()
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -588,70 +940,87 @@ class TuiApp:
             pass
 
     async def next_instruction(self):
-        """The next thing typed, or None when the session should end."""
+        """The next (pane, text) typed, or (None, None) to end the session."""
         return await self._queue.get()
 
-    # ---- modes ----
+    # ---- status ----
 
-    def set_busy(self, label: str = "Thinking…"):
-        self._status = label
-        self._phase_start = __import__("time").monotonic()
-        self._mode = "busy"
+    def set_busy(self, label: str = "Thinking…", pane: Pane = None):
+        pane = pane or current_pane.get() or self.pane
+        pane.busy = True
+        pane.done = False
+        pane.status = label
+        pane.phase_start = time.monotonic()
         self.invalidate()
 
-    def set_label(self, label: str):
-        self._status = label
-        self._phase_start = __import__("time").monotonic()
+    def set_label(self, label: str, pane: Pane = None):
+        pane = pane or current_pane.get() or self.pane
+        pane.status = label
+        pane.phase_start = time.monotonic()
         self.invalidate()
 
-    def set_idle(self):
-        self._mode = "idle"
-        self.invalidate()
+    def set_interrupt(self, callback, pane: Pane = None):
+        """What Ctrl+C should cancel while this pane is working. Per pane, so
+        interrupting the agent you're looking at doesn't stop another."""
+        pane = pane or current_pane.get() or self.pane
+        pane.on_interrupt = callback
 
-    async def ask_approval(self, question: str) -> bool:
+    def set_idle(self, pane: Pane = None, done: bool = False):
+        pane = pane or current_pane.get() or self.pane
+        pane.busy = False
+        pane.status = ""
+        # done shows a green ● in the tree, so you can see it landed without
+        # switching to it. Once every subagent is done the tree folds away.
+        pane.done = done and pane.kind == "subagent"
+        self.invalidate()
+        if self._all_subagents_finished():
+            self._schedule_fold()
+
+    # ---- questions ----
+
+    async def ask_approval(self, question: str, pane: Pane = None) -> bool:
         """Ask y/n in the frame, where every other prompt lives, instead of
-        reading a line from a terminal this app is holding in raw mode."""
-        previous = self._mode
+        reading a line from a terminal this app is holding in raw mode.
+
+        The question belongs to its own pane: a background subagent's write
+        waits in its tab (flagged !) rather than seizing the screen from
+        whatever you were reading."""
+        pane = pane or current_pane.get() or self.pane
         future = asyncio.get_running_loop().create_future()
-        self._approval = (question, future)
-        self._mode = "approve"
+        pane.approval = (question, future)
         self.invalidate()
         try:
             return await future
         finally:
-            self._approval = None
-            self._mode = previous
+            pane.approval = None
             self.invalidate()
 
-    def _answer(self, verdict: bool):
-        if self._approval and not self._approval[1].done():
-            self._approval[1].set_result(verdict)
+    def _answer(self, pane: Pane, verdict: bool):
+        if pane.approval and not pane.approval[1].done():
+            pane.approval[1].set_result(verdict)
 
-    async def ask_text(self, hint: str, options: list = None) -> str:
+    async def ask_text(self, hint: str, options: list = None, pane: Pane = None) -> str:
         """Answer a question the model asked (the ask_user tool), rather than
         start a new turn. Same input row — there is still only one place to
         type — but the line goes back to the tool, and when options were
         offered they are shown as a picker above it: arrow or click to choose,
         or ignore it and type something else entirely."""
-        previous = self._mode
+        pane = pane or current_pane.get() or self.pane
         future = asyncio.get_running_loop().create_future()
-        self._ask = (hint, future)
-        self._options = list(options or [])
-        self._choice = 0
-        self._mode = "ask"
+        pane.ask = (hint, future)
+        pane.options = list(options or [])
+        pane.choice = 0
         self.invalidate()
         try:
             return await future
         finally:
-            self._ask = None
-            self._options = []
-            self._mode = previous
+            pane.ask = None
+            pane.options = []
             self.invalidate()
 
-    def _resolve_ask(self, text):
-        if self._ask and not self._ask[1].done():
-            self._ask[1].set_result(text)
+    def _resolve_ask(self, pane: Pane, text):
+        if pane.ask and not pane.ask[1].done():
+            pane.ask[1].set_result(text)
 
 
-_HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  "
-             "wheel/pgup scroll  ·  ctrl+d exit")
+_HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  wheel/pgup scroll  ·  ctrl+d exit")

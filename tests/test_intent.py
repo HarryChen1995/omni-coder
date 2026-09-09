@@ -227,3 +227,38 @@ async def test_extract_intent_logs_giving_up(mocker):
     chat_returning(mocker, "bad")
     await extract_intent("t", "m", max_retries=2, logger=logger)
     assert "gave up" in " ".join(str(c) for c in logger.info.call_args_list)
+
+
+# ---------------- usage ----------------
+
+async def test_usage_is_reported_to_the_caller(mocker):
+    """Intent parsing is a model call like any other; the agent folds this
+    into what the turn cost."""
+    async def fake(*args, **kwargs):
+        kwargs["usage"].update({"prompt_tokens": 120, "completion_tokens": 8})
+        return {"content": '{"task_type": "bugfix", "summary": "s", "target_files": [], '
+                            '"constraints": [], "risk_level": "low"}'}
+
+    mocker.patch.object(intent_mod, "chat", side_effect=fake)
+    usage = {}
+    await extract_intent("fix it", "m", usage=usage)
+    assert usage == {"prompt_tokens": 120, "completion_tokens": 8}
+
+
+async def test_usage_adds_up_across_retries(mocker):
+    """A retried parse costs real tokens, so the total says so."""
+    calls = {"n": 0}
+
+    async def fake(*args, **kwargs):
+        calls["n"] += 1
+        kwargs["usage"].update({"prompt_tokens": 100, "completion_tokens": 5})
+        if calls["n"] == 1:
+            return {"content": "not json at all"}
+        return {"content": '{"task_type": "other", "summary": "", "target_files": [], '
+                            '"constraints": [], "risk_level": "low"}'}
+
+    mocker.patch.object(intent_mod, "chat", side_effect=fake)
+    mocker.patch.object(intent_mod.asyncio, "sleep", mocker.AsyncMock())
+    usage = {}
+    await extract_intent("x", "m", max_retries=3, usage=usage)
+    assert usage == {"prompt_tokens": 200, "completion_tokens": 10}
