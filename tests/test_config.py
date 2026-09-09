@@ -37,7 +37,7 @@ def test_read_only_tools_are_safe_and_writes_are_not():
     safe = set(AgentConfig().safe_tools)
     for tool in ("read_file", "list_dir", "search_files", "glob_files",
                  "git_diff", "git_status", "git_log", "git_show", "git_branch",
-                 "git_fetch", "save_memory", "search_tools",
+                 "git_fetch", "save_memory", "search_tools", "ask_user",
                  "list_resources", "read_resource"):
         assert tool in safe, f"{tool} should run without approval"
     for tool in ("write_file", "edit_file", "run_shell",

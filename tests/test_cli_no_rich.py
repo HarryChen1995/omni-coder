@@ -104,12 +104,6 @@ async def test_restart_falls_back_to_no_spinner(no_ui, mocker):
     assert out["connected"] is True            # works without the spinner
 
 
-async def test_read_task_falls_back_to_input(mocker):
-    """prompt_session is None when prompt_toolkit is missing."""
-    mocker.patch("builtins.input", return_value="typed plainly")
-    assert await cli_mod._read_task(None) == "typed plainly"
-
-
 def test_server_tools_fall_back_to_plain_lines(no_ui, capsys):
     cli_mod._print_server_tools("docs", [
         {"name": "docs__search", "real_name": "search", "description": "Search the docs",

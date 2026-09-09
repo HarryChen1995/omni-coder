@@ -23,6 +23,7 @@ class AgentConfig:
         "read_file", "list_dir", "search_files", "glob_files",
         "git_diff", "git_status", "git_log", "git_show", "git_branch", "git_fetch",
         "save_memory", "search_tools",
+        "ask_user",   # asking the person a question is not a change to anything
         "list_resources", "read_resource",   # MCP Resources capability — read-only
     )
 

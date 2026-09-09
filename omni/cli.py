@@ -57,12 +57,14 @@ _STATIC_COMMANDS = {
     "/sessions": "list saved sessions",
     "/delete ": "delete a saved session — /delete <id-or-name>",
     "/compact": "summarize this session's history down to a briefing",
-    "/reasoning": "show the last reply's chain of thought in full",
+    "/reasoning": "show a reply's chain of thought in full — /reasoning [n]",
+    "/expand ": "reprint one tool call whole, arguments and result — /expand <n>",
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
     "/mcp restart ": "reconnect an MCP server after changing it — /mcp restart <name|all>",
     "/mcp tools ": "list the tools one MCP server exposes — /mcp tools <name>",
+    "/mcp remove ": "disconnect a server and stop loading it — /mcp remove <name>",
     "/resources": "list resources published by connected MCP servers — /resources <uri> reads one",
 }
 
@@ -393,30 +395,15 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
     # of the box landing in the middle of the transcript.
     commands = dict(_STATIC_COMMANDS)  # mutated in place below once MCP prompts are discovered
 
-    try:
-        from . import ui
-        from prompt_toolkit.patch_stdout import patch_stdout
-        _print_header(cfg, session_label())
-        _set_title(session_title())
-        # The input box owns four lines directly under the transcript (rule +
-        # session chip, the ❯ line, closing rule, key hint) and repaints them
-        # in place, including on a terminal resize.
-        prompt_session = ui.PromptBox(commands)
-        # Hand the box to ui: it owns the bottom of the terminal for the whole
-        # session, idle (input) and busy (running a turn) alike. Cleared again
-        # when the REPL exits (below) so nothing keeps a dead box registered.
-        ui.register_box(prompt_session)
-        # raw=True: pass Rich's ANSI-coded output straight through instead of
-        # patch_stdout()'s default write() path, which sanitizes/escapes text
-        # (it assumes plain text) and mangles embedded escape codes into
-        # literal garbage like "?[32m" on the screen.
-        stdout_cm = patch_stdout(raw=True)
-    except ImportError:
-        typer.echo(f"Interactive mode (model: {cfg.model}). Type a task, /sessions to list, "
+    tui = _make_tui(commands, session_label(), cfg.model)
+    _set_title(session_title())
+    # In a full-screen session this is the transcript's first block; without
+    # one it is printed to the terminal, as before.
+    _print_header(cfg, session_label())
+    if tui is None:
+        _echo(f"Interactive mode (model: {cfg.model}). Type a task, /sessions to list, "
                    "/compact to summarize a long session's history, /model to list/switch models, "
-                   "/exit to quit. Ctrl+C interrupts the current turn without leaving the session.\n")
-        prompt_session = None
-        stdout_cm = nullcontext()
+                   "/exit to quit. Ctrl+C interrupts the current turn without leaving the session.")
 
     if resume:
         _show_resumed_history(cfg.db_path, resume)
@@ -443,7 +430,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         await client.list_llm_tools()  # populate tool counts for /mcp before any task runs
         for e in client.server_status():
             if not e["connected"]:
-                typer.echo(f"Warning: MCP server {e['name']!r} failed to connect: {e['error']}", err=True)
+                _echo(f"Warning: MCP server {e['name']!r} failed to connect: {e['error']}", err=True)
 
         prompts = {}
         prompt_command_keys = set()  # which `commands` entries came from MCP prompts
@@ -470,6 +457,8 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         for server in client.server_names():
             commands[f"/mcp restart {server}"] = "reconnect this MCP server"
             commands[f"/mcp tools {server}"] = "list the tools this MCP server exposes"
+            if server != "built-in":
+                commands[f"/mcp remove {server}"] = "disconnect and stop loading this server"
         commands["/mcp restart all"] = "reconnect every MCP server"
 
         try:
@@ -482,12 +471,15 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         except LLMError:
             pass
 
-        with stdout_cm:
+        runner = asyncio.ensure_future(tui.run()) if tui is not None else None
+        try:
             while True:
                 try:
-                    task = await _read_task(prompt_session, session_label(), cfg.model)
+                    task = await _next_instruction(tui, session_label(), cfg.model)
                 except (EOFError, KeyboardInterrupt):
-                    typer.echo()
+                    _echo("")
+                    break
+                if task is None:      # ctrl+d, or the app exited
                     break
 
                 task = task.strip()
@@ -501,27 +493,34 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 if task.startswith("/delete "):
                     target = task[len("/delete "):].strip()
                     if agent.store.delete_session(target):
-                        typer.echo(f"Deleted session {target!r}.")
+                        _echo(f"Deleted session {target!r}.")
                         if session_id is not None and agent.store.resolve_session_id(session_id) is None:
                             session_id = None  # the session we were resuming just got deleted
                     else:
-                        typer.echo(f"No session found with id or name {target!r}.", err=True)
+                        _echo(f"No session found with id or name {target!r}.", err=True)
                     continue
                 if task == "/compact":
                     if session_id is None:
-                        typer.echo("No active session yet — run a task first.")
+                        _echo("No active session yet — run a task first.")
                     else:
-                        typer.echo(await agent.compact_history(session_id))
+                        _echo(await agent.compact_history(session_id))
                     continue
-                if task == "/reasoning":
+                if task == "/expand" or task.startswith("/expand "):
+                    _expand_call(agent, task[len("/expand"):].strip())
+                    continue
+                if task == "/reasoning" or task.startswith("/reasoning "):
+                    which = task[len("/reasoning"):].strip()
+                    if which:
+                        _expand_reasoning(agent, which)
+                        continue
                     if agent.last_reasoning:
                         try:
                             from . import ui
                             ui.reasoning_full(agent.last_reasoning)
                         except ImportError:
-                            typer.echo(agent.last_reasoning)
+                            _echo(agent.last_reasoning)
                     else:
-                        typer.echo("No reasoning recorded yet — no reply this session "
+                        _echo("No reasoning recorded yet — no reply this session "
                                    "carried a reasoning_content field.")
                     continue
                 if task == "/mcp":
@@ -530,20 +529,49 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 if task.startswith("/mcp tools"):
                     target = task[len("/mcp tools"):].strip()
                     if not target:
-                        typer.echo("Usage: /mcp tools <name>  —  names: "
+                        _echo("Usage: /mcp tools <name>  —  names: "
                                    f"{', '.join(client.server_names())}", err=True)
                         continue
                     try:
                         tools = await client.server_tools(target)
                     except ValueError as e:
-                        typer.echo(f"Error: {e}", err=True)
+                        _echo(f"Error: {e}", err=True)
                         continue
                     _print_server_tools(target, tools)
+                    continue
+                if task.startswith("/mcp remove"):
+                    target = task[len("/mcp remove"):].strip()
+                    if not target:
+                        _echo("Usage: /mcp remove <name>  —  names: "
+                                   f"{', '.join(client.server_names())}", err=True)
+                        continue
+                    try:
+                        removed = await client.remove_server(target)
+                    except ValueError as e:
+                        _echo(f"Error: {e}", err=True)
+                        continue
+                    # Gone from this session; also unregister it if it came
+                    # from the settings file, otherwise it returns next run.
+                    path = default_mcp_config_path()
+                    registered = load_mcp_config(path) if os.path.exists(path) else {}
+                    if removed in registered:
+                        del registered[removed]
+                        save_mcp_config(path, registered)
+                        _echo(f"Removed MCP server {removed!r} — disconnected now, and "
+                                   f"unregistered from {path}.")
+                    else:
+                        _echo(f"Disconnected MCP server {removed!r} for this session. It "
+                                   "wasn't in the settings file, so nothing to unregister.")
+                    for stale in [c for c in commands
+                                   if c.endswith(f" {removed}") and c.startswith("/mcp ")]:
+                        del commands[stale]
+                    await refresh_prompt_commands()
+                    _print_mcp_status(client.server_status())
                     continue
                 if task.startswith("/mcp restart"):
                     target = task[len("/mcp restart"):].strip()
                     if not target:
-                        typer.echo("Usage: /mcp restart <name|all>  —  names: "
+                        _echo("Usage: /mcp restart <name|all>  —  names: "
                                    f"{', '.join(client.server_names())}", err=True)
                         continue
                     targets = client.server_names() if target == "all" else [target]
@@ -551,13 +579,13 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         try:
                             entry = await _restart_mcp_server(client, name)
                         except ValueError as e:
-                            typer.echo(f"Error: {e}", err=True)
+                            _echo(f"Error: {e}", err=True)
                             continue
                         if entry["connected"]:
-                            typer.echo(f"Restarted MCP server {entry['name']!r} "
+                            _echo(f"Restarted MCP server {entry['name']!r} "
                                        f"({entry['tool_count']} tools).")
                         else:
-                            typer.echo(f"MCP server {entry['name']!r} failed to reconnect: "
+                            _echo(f"MCP server {entry['name']!r} failed to reconnect: "
                                        f"{entry['error']}", err=True)
                     await refresh_prompt_commands()  # a restarted server may expose different prompts
                     _print_mcp_status(client.server_status())
@@ -567,7 +595,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     try:
                         resources = await client.list_resources(include_templates=True)
                     except Exception as e:
-                        typer.echo(f"Error listing resources: {e}", err=True)
+                        _echo(f"Error listing resources: {e}", err=True)
                         continue
                     # Keep "/resources <uri>" completions in sync with what's
                     # actually published right now, not just at startup.
@@ -583,13 +611,13 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     try:
                         content = await client.read_resource(target)
                     except Exception as e:
-                        typer.echo(f"Error reading resource {target!r}: {e}", err=True)
+                        _echo(f"Error reading resource {target!r}: {e}", err=True)
                         continue
                     try:
                         from . import ui
                         ui.resource_content(target, content)
                     except ImportError:
-                        typer.echo(f"--- {target} ---\n{content}")
+                        _echo(f"--- {target} ---\n{content}")
                     continue
                 if task == "/btw" or task.startswith("/btw "):
                     # A one-off question at the idle prompt: answered by its
@@ -599,13 +627,13 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     if question:
                         await _handle_btw(cfg, question)
                     else:
-                        typer.echo("Usage: /btw <question>")
+                        _echo("Usage: /btw <question>")
                     continue
                 if task == "/model":
                     try:
                         models = await list_models(cfg.llm_host or None, cfg.llm_api_key or None)
                     except LLMError as e:
-                        typer.echo(f"Error: {e}", err=True)
+                        _echo(f"Error: {e}", err=True)
                         continue
                     for m in models:
                         commands[f"/model {m}"] = "switch to this model"
@@ -614,9 +642,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         # No prompt_toolkit (plain input() fallback), or the
                         # server returned no models: fall back to a static
                         # list — pick with "/model <name>" instead.
-                        typer.echo(f"Current model: {cfg.model}")
+                        _echo(f"Current model: {cfg.model}")
                         for m in models:
-                            typer.echo(f"  {'* ' if m == cfg.model else '  '}{m}")
+                            _echo(f"  {'* ' if m == cfg.model else '  '}{m}")
                         continue
 
                     from prompt_toolkit.shortcuts import radiolist_dialog
@@ -641,11 +669,11 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         try:
                             values = shlex.split(rest)
                         except ValueError as e:
-                            typer.echo(f"Error parsing arguments: {e}", err=True)
+                            _echo(f"Error parsing arguments: {e}", err=True)
                             continue
                         if len(values) > len(arg_specs):
                             names = ", ".join(a["name"] for a in arg_specs) or "(none)"
-                            typer.echo(
+                            _echo(
                                 f"Error: /{prompt_name} takes at most {len(arg_specs)} "
                                 f"argument(s): {names}", err=True,
                             )
@@ -655,15 +683,15 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         prompt_args = {a["name"]: v for a, v in zip(arg_specs, values)}
                         missing = [a["name"] for a in arg_specs if a["required"] and a["name"] not in prompt_args]
                         if missing:
-                            typer.echo(f"Error: /{prompt_name} missing required argument(s): "
+                            _echo(f"Error: /{prompt_name} missing required argument(s): "
                                        f"{', '.join(missing)}", err=True)
                             continue
                         try:
                             task = await client.get_prompt(prompt_name, prompt_args)
                         except Exception as e:
-                            typer.echo(f"Error resolving prompt {prompt_name!r}: {e}", err=True)
+                            _echo(f"Error resolving prompt {prompt_name!r}: {e}", err=True)
                             continue
-                        typer.echo(f"--- resolved /{prompt_name} ---\n{task}\n")
+                        _echo(f"--- resolved /{prompt_name} ---\n{task}\n")
 
                 # Run the turn as a Task so Ctrl+C can cancel just this turn
                 # (via the SIGINT handler below) instead of killing the whole
@@ -700,7 +728,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                             from . import ui
                             ui.interrupted()
                         except ImportError:
-                            typer.echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
+                            _echo("\n[Interrupted — back to prompt. You can keep chatting in this session.]")
                         continue
                     except (ValueError, RuntimeError, LLMError) as e:
                         # A turn failing (bad session id, or _call_model giving
@@ -711,7 +739,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         # Report it and stay put; session_id is carried forward
                         # so a retry continues the same conversation.
                         session_id = agent.session_id or session_id
-                        typer.echo(f"Error: {e}", err=True)
+                        _echo(f"Error: {e}", err=True)
                         continue
                     finally:
                         signal.signal(signal.SIGINT, previous_sigint)
@@ -726,14 +754,24 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     from . import ui
                     ui.final_result(result)
                 except ImportError:
-                    typer.echo("\n=== RESULT ===")
-                    typer.echo(result)
-
-    try:
-        from . import ui
-        ui.register_box(None)
-    except ImportError:
-        pass
+                    _echo("\n=== RESULT ===")
+                    _echo(result)
+        finally:
+            if tui is not None:
+                tui.stop()
+                if runner is not None:
+                    try:
+                        await runner
+                    except Exception:
+                        pass
+                # A full-screen app restores the terminal's previous contents
+                # on exit, so write the transcript out on the way: the session
+                # stays in scrollback, in whatever open/closed state it was
+                # left in, instead of vanishing. Before unregistering, since
+                # that is what the blocks render against.
+                tui.dump()
+                from . import ui
+                ui.use_tui(None)
 
 
 async def _handle_btw(cfg: AgentConfig, question: str):
@@ -758,7 +796,7 @@ async def _handle_btw(cfg: AgentConfig, question: str):
         from . import ui
         ui.btw_answer(question, answer)
     except ImportError:
-        typer.echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
+        _echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
 
 
 def _set_title(text: str):
@@ -770,6 +808,75 @@ def _set_title(text: str):
         pass
 
 
+def _expand_call(agent, which: str):
+    """/expand <n> — reprint one tool call with nothing abbreviated. The
+    number is the handle the transcript shows next to each call; a terminal
+    cannot make text that has already scrolled clickable."""
+    log = agent.call_log
+    if not log:
+        _echo("No tool calls yet this session.")
+        return
+    if not which:
+        record = log[-1]
+    else:
+        try:
+            index = int(which)
+        except ValueError:
+            _echo(f"Usage: /expand <n> — a call number from the transcript "
+                        f"(1–{log[-1]['index']}).", err=True)
+            return
+        record = next((r for r in log if r["index"] == index), None)
+        if record is None:
+            _echo(f"No call [{index}] in this session — the transcript numbers run "
+                        f"1–{log[-1]['index']}.", err=True)
+            return
+    try:
+        from . import ui
+        ui.call_detail(record)
+    except ImportError:
+        _echo(f"[{record['index']}] {record['name']}({record['args']})\n{record['result']}")
+
+
+def _expand_reasoning(agent, which: str):
+    """/reasoning <n> — an earlier reply's chain of thought, not just the last."""
+    log = agent.reasoning_log
+    if not log:
+        _echo("No reasoning recorded yet — no reply this session carried a "
+                   "reasoning_content field.")
+        return
+    try:
+        index = int(which)
+    except ValueError:
+        _echo(f"Usage: /reasoning [n] — 1–{len(log)}, or bare for the most recent.",
+                    err=True)
+        return
+    if not 1 <= index <= len(log):
+        _echo(f"No reasoning [{index}] this session — they run 1–{len(log)}.", err=True)
+        return
+    try:
+        from . import ui
+        ui.reasoning_full(log[index - 1], index)
+    except ImportError:
+        _echo(log[index - 1])
+
+
+def _echo(text: str, err: bool = False):
+    """One line of feedback from the REPL or one of its commands.
+
+    In a full-screen session there is no free-standing stdout to write to —
+    the app owns the screen — so it becomes a transcript block. Outside one it
+    is an ordinary echo. Every command handler below goes through this rather
+    than deciding for itself."""
+    try:
+        from . import ui
+        if ui.tui_active():
+            (ui.error if err else ui.note)(text)
+            return
+    except ImportError:
+        pass
+    typer.echo(text, err=err)
+
+
 def _announce_model(model: str):
     """Confirm a /model switch. The header isn't redrawn for this — it's
     scrollback by then; the frame's hint line shows the live model instead."""
@@ -777,7 +884,7 @@ def _announce_model(model: str):
         from . import ui
         ui.model_switched(model)
     except ImportError:
-        typer.echo(f"Switched to model {model!r}.")
+        _echo(f"Switched to model {model!r}.")
 
 
 def _print_header(cfg: AgentConfig, session_label: str):
@@ -789,7 +896,7 @@ def _print_header(cfg: AgentConfig, session_label: str):
         from . import ui
         ui.header(session_label, cfg.project_root)
     except ImportError:
-        typer.echo(f"[model: {cfg.model}] [session: {session_label}]")
+        _echo(f"[model: {cfg.model}] [session: {session_label}]")
 
 
 def _show_resumed_history(db_path: str, resume: str):
@@ -805,31 +912,58 @@ def _show_resumed_history(db_path: str, resume: str):
         from . import ui
         ui.history_panel(messages)
     except ImportError:
-        typer.echo(f"--- Resumed history ({len(messages)} messages) ---")
+        _echo(f"--- Resumed history ({len(messages)} messages) ---")
         for m in messages:
             if m.get("role") == "system":
                 continue
-            typer.echo(f"{m.get('role')}: {str(m.get('content'))[:200]}")
-        typer.echo("--- end history ---\n")
+            _echo(f"{m.get('role')}: {str(m.get('content'))[:200]}")
+        _echo("--- end history ---\n")
 
 
-async def _read_task(prompt_session, session_label: str = "", model: str = "") -> str:
-    if prompt_session is not None:
+def _make_tui(commands: dict, session_label: str, model: str):
+    """The full-screen UI for an interactive session, or None to fall back to
+    plain line input.
+
+    The transcript is drawn by us rather than left in the terminal's
+    scrollback: that is the only way a tool call or a reasoning block can be
+    clicked open in place, since a terminal delivers mouse events only to the
+    region an application draws and cannot rewrite what has already scrolled.
+
+    Returning None (no rich/prompt_toolkit installed, or a caller opting out)
+    keeps the old behaviour, printing to the terminal and reading with
+    input()."""
+    try:
         from . import ui
-        return await ui.prompt_task_async(prompt_session, session_label, model)
+        from .tui import TuiApp
+    except ImportError:
+        return None
+    app = TuiApp(commands, session_label, model)
+    ui.use_tui(app)
+    return app
+
+
+async def _next_instruction(tui, session_label: str = "", model: str = ""):
+    """The next thing typed. From the running app's queue when there is one
+    (it owns the screen and the keyboard for the whole session), otherwise
+    from a plain input() — the no-rich fallback. None means "end the
+    session"."""
+    if tui is not None:
+        tui.session_label = session_label
+        tui.model = model
+        return await tui.next_instruction()
     return input("> ")
 
 
 def _print_sessions(sessions: list):
     if not sessions:
-        typer.echo("No saved sessions.")
+        _echo("No saved sessions.")
         return
     try:
         from . import ui
         ui.sessions_table(sessions)
     except ImportError:
         for s in sessions:
-            typer.echo(f"{s['id']}  {s.get('name') or '-'}  [{s['status']}]  {s['updated_at']}  {s['task'][:70]}")
+            _echo(f"{s['id']}  {s.get('name') or '-'}  [{s['status']}]  {s['updated_at']}  {s['task'][:70]}")
 
 
 async def _restart_mcp_server(client: MCPToolClient, name: str) -> dict:
@@ -851,12 +985,12 @@ def _print_resources(resources: dict):
         ui.resources_table(resources)
     except ImportError:
         if not resources:
-            typer.echo("No resources published by the connected MCP servers.")
+            _echo("No resources published by the connected MCP servers.")
             return
         for uri, info in resources.items():
             kind = "template" if info.get("template") else (info.get("mime_type") or "-")
-            typer.echo(f"{uri}  [{info.get('server', '')}]  {kind}  {info.get('description', '')}")
-        typer.echo("Read one with /resources <uri>")
+            _echo(f"{uri}  [{info.get('server', '')}]  {kind}  {info.get('description', '')}")
+        _echo("Read one with /resources <uri>")
 
 
 def _print_server_tools(server: str, tools: list):
@@ -865,12 +999,12 @@ def _print_server_tools(server: str, tools: list):
         ui.server_tools_table(server, tools)
     except ImportError:
         if not tools:
-            typer.echo(f"{server} exposes no tools.")
+            _echo(f"{server} exposes no tools.")
             return
         for t in tools:
             tags = " ".join(k for k in ("internal", "deferred", "revealed") if t.get(k))
             desc = t["description"].splitlines()[0] if t["description"] else ""
-            typer.echo(f"{t['name']}  {f'[{tags}]  ' if tags else ''}{desc[:80]}")
+            _echo(f"{t['name']}  {f'[{tags}]  ' if tags else ''}{desc[:80]}")
 
 
 def _print_mcp_status(entries: list):
@@ -881,10 +1015,10 @@ def _print_mcp_status(entries: list):
         from .agent import _format_elapsed
         for e in entries:
             if e["connected"]:
-                typer.echo(f"[OK]   {e['name']}  connected {_format_elapsed(e['connected_for'])}  "
+                _echo(f"[OK]   {e['name']}  connected {_format_elapsed(e['connected_for'])}  "
                            f"{e['tool_count']} tools  {e['target']}")
             else:
-                typer.echo(f"[FAIL] {e['name']}  {e['error']}", err=True)
+                _echo(f"[FAIL] {e['name']}  {e['error']}", err=True)
 
 
 if __name__ == "__main__":

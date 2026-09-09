@@ -340,17 +340,6 @@ async def test_handle_btw_handles_empty_response(cfg, mocker):
 
 # ---------------- REPL helpers ----------------
 
-async def test_read_task_uses_prompt_session_when_available(mocker):
-    ui_read = mocker.patch("omni.ui.prompt_task_async", mocker.AsyncMock(return_value="typed"))
-    assert await cli_mod._read_task(mocker.Mock()) == "typed"
-    ui_read.assert_awaited_once()
-
-
-async def test_read_task_falls_back_to_input(mocker):
-    mocker.patch("builtins.input", return_value="typed at plain prompt")
-    assert await cli_mod._read_task(None) == "typed at plain prompt"
-
-
 def test_print_header_delegates_to_ui(mocker, cfg):
     """No model in the header: it would be stale after the first /model
     switch, and the frame's hint line carries the live one instead."""

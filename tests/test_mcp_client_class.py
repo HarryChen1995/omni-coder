@@ -41,27 +41,41 @@ def client(tmp_path):
 
 async def test_builtin_tools_keep_plain_names(client, mocker):
     client._sessions[_BUILTIN] = fake_session(mocker, [tool("read_file"), tool("write_file")])
-    names = [s["function"]["name"] for s in await client.list_llm_tools()]
-    assert names == ["read_file", "write_file"]
+    assert model_facing(await client.list_llm_tools()) == ["read_file", "write_file"]
 
 
 async def test_builtin_underscore_tools_are_hidden_from_the_model(client, mocker):
     client._sessions[_BUILTIN] = fake_session(
         mocker, [tool("read_file"), tool("_preview_edit"), tool("_file_exists")])
-    names = [s["function"]["name"] for s in await client.list_llm_tools()]
-    assert names == ["read_file"]
+    assert model_facing(await client.list_llm_tools()) == ["read_file"]
+
+
+def model_facing(schemas):
+    """Tool names the model sees, minus the client's own ask_user, which is
+    always offered and isn't what these tests are about."""
+    return [s["function"]["name"] for s in schemas if s["function"]["name"] != "ask_user"]
 
 
 async def test_custom_server_tools_are_namespaced(client, mocker):
     client._sessions["docs"] = fake_session(mocker, [tool("search")])
+    assert model_facing(await client.list_llm_tools()) == ["docs__search"]
+
+
+async def test_ask_user_is_always_offered(client, mocker):
+    """It is the client's tool, not a server's: the answer has to come from
+    the terminal, which no MCP server subprocess can reach."""
     names = [s["function"]["name"] for s in await client.list_llm_tools()]
-    assert names == ["docs__search"]
+    assert "ask_user" in names
+    schema = next(s for s in await client.list_llm_tools() if s["function"]["name"] == "ask_user")
+    props = schema["function"]["parameters"]["properties"]
+    assert set(props) == {"question", "options"}
+    assert schema["function"]["parameters"]["required"] == ["question"]
 
 
 async def test_custom_server_underscore_tools_are_not_filtered(client, mocker):
     """Only the built-in server's underscore tools are internal."""
     client._sessions["docs"] = fake_session(mocker, [tool("_odd")])
-    assert [s["function"]["name"] for s in await client.list_llm_tools()] == ["docs___odd"]
+    assert model_facing(await client.list_llm_tools()) == ["docs___odd"]
 
 
 async def test_tool_owner_routing_map_is_rebuilt_each_call(client, mocker):
@@ -79,8 +93,7 @@ async def test_tool_owner_routing_map_is_rebuilt_each_call(client, mocker):
 async def test_deferred_server_tools_are_withheld_and_search_tools_offered(client, mocker):
     client._sessions["docs"] = fake_session(mocker, [tool("a"), tool("b")])
     client._deferred_servers.add("docs")
-    names = [s["function"]["name"] for s in await client.list_llm_tools()]
-    assert names == ["search_tools"]
+    assert model_facing(await client.list_llm_tools()) == ["search_tools"]
     assert set(client._deferred_tools) == {"docs__a", "docs__b"}
 
 
@@ -770,3 +783,94 @@ async def test_stop_server_cancels_a_task_that_never_parks(mocker, tmp_path):
     await started.wait()
     await asyncio.wait_for(client._stop_server("x", grace_s=0), timeout=2)
     assert task.cancelled() or task.done()
+
+
+# ---------------- ask_user ----------------
+
+async def test_ask_user_puts_the_question_to_the_ui(client, mocker):
+    ask = mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="Use SQLite"))
+    out = await client.call_tool("ask_user", {"question": "Which store?",
+                                               "options": ["Use SQLite", "Use Postgres"]})
+    ask.assert_awaited_once_with("Which store?", ["Use SQLite", "Use Postgres"])
+    assert out == "The user answered: Use SQLite"
+
+
+async def test_ask_user_works_without_options(client, mocker):
+    mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="both, in that order"))
+    out = await client.call_tool("ask_user", {"question": "What order?"})
+    assert out == "The user answered: both, in that order"
+
+
+async def test_ask_user_requires_a_question(client):
+    assert (await client.call_tool("ask_user", {"question": "  "})).startswith("ERROR")
+    assert (await client.call_tool("ask_user", {})).startswith("ERROR")
+
+
+async def test_a_dismissed_question_tells_the_model_not_to_repeat_it(client, mocker):
+    """Otherwise a model that can't get an answer asks again, forever."""
+    mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value=None))
+    out = await client.call_tool("ask_user", {"question": "Which one?"})
+    assert "dismissed" in out and "Don't ask again" in out
+
+
+async def test_options_that_are_not_a_list_are_tolerated(client, mocker):
+    ask = mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="a"))
+    await client.call_tool("ask_user", {"question": "q", "options": "just one"})
+    assert ask.await_args.args[1] == ["just one"]
+
+
+# ---------------- remove_server ----------------
+
+async def test_removing_a_server_takes_its_tools_with_it(client, mocker):
+    client._sessions["docs"] = fake_session(mocker, [tool("search")])
+    client._server_specs["docs"] = {"command": "node", "args": ["srv.js"]}
+    await client.list_llm_tools()
+    assert "docs__search" in client._tool_owner
+
+    await client.remove_server("docs")
+    assert model_facing(await client.list_llm_tools()) == []
+    assert "docs" not in client._sessions and "docs" not in client._server_specs
+    assert not any(k.startswith("docs__") for k in client._tool_owner)
+
+
+async def test_removing_a_deferred_server_clears_what_it_left_behind(client, mocker):
+    client._sessions["docs"] = fake_session(mocker, [tool("a")])
+    client._server_specs["docs"] = {"command": "x", "defer": True}
+    client._deferred_servers.add("docs")
+    await client.list_llm_tools()
+    client._revealed.add("docs__a")
+    client._tool_embeddings["docs__a"] = [0.1]
+
+    await client.remove_server("docs")
+    assert "docs" not in client._deferred_servers
+    assert client._deferred_tools == {} and client._revealed == set()
+    assert client._tool_embeddings == {}
+
+
+async def test_removing_stops_the_server(client, mocker):
+    stop = mocker.patch.object(client, "_stop_server", mocker.AsyncMock())
+    client._sessions["docs"] = fake_session(mocker, [tool("a")])
+    client._server_specs["docs"] = {"command": "x"}
+    await client.remove_server("docs")
+    stop.assert_awaited_once_with("docs")
+
+
+async def test_the_builtin_server_cannot_be_removed(client):
+    with pytest.raises(ValueError, match="core file, shell and git tools"):
+        await client.remove_server("built-in")
+    with pytest.raises(ValueError):
+        await client.remove_server(_BUILTIN)
+
+
+async def test_removing_an_unknown_server_says_what_is_configured(client, mocker):
+    client._server_specs["docs"] = {"command": "x"}
+    with pytest.raises(ValueError, match="Unknown MCP server 'nope'"):
+        await client.remove_server("nope")
+
+
+async def test_other_servers_are_untouched(client, mocker):
+    client._sessions["docs"] = fake_session(mocker, [tool("a")])
+    client._sessions["notes"] = fake_session(mocker, [tool("b")])
+    client._server_specs.update({"docs": {"command": "x"}, "notes": {"command": "y"}})
+    await client.remove_server("docs")
+    assert model_facing(await client.list_llm_tools()) == ["notes__b"]

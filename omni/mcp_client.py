@@ -312,6 +312,48 @@ def _search_tools_schema() -> dict:
     }
 
 
+_ASK_USER_NAME = "ask_user"
+
+
+def _ask_user_schema() -> dict:
+    """A question for the person at the keyboard.
+
+    Handled by the client, not by any MCP server: the answer has to come from
+    the terminal, and every server — the built-in one included — is a
+    subprocess with no access to it."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _ASK_USER_NAME,
+            "description": (
+                "Ask the person a question and wait for their answer. Use it for a real "
+                "ambiguity you cannot settle from the code or the task — which of two "
+                "designs they want, a missing detail only they know — or to put a plan to "
+                "them before you act on it. Offer `options` when there is a small set of "
+                "sensible answers ('Accept the plan', 'Use SQLite instead'); they can "
+                "always type something else, and their answer comes back as text. Don't "
+                "use it for anything you could find out by reading the project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question, in one or two sentences. Say what you need and why.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("Optional answers to choose from, in order. Each should be a "
+                                         "short phrase. The person may still type their own answer."),
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    }
+
+
 _LIST_RESOURCES_NAME = "list_resources"
 _READ_RESOURCE_NAME = "read_resource"
 
@@ -706,6 +748,54 @@ class MCPToolClient:
         display = "built-in" if key == _BUILTIN else key
         return next(e for e in self.server_status() if e["name"] == display)
 
+    async def remove_server(self, name: str) -> str:
+        """Disconnect a server and forget it for the rest of the session.
+
+        The counterpart to restart_server: everything the server contributed —
+        its session, its tools (deferred, revealed or plain), its resource
+        routing, its cached embeddings — goes with it, so the next turn's tool
+        list simply doesn't have it. Whether it also stops coming back on
+        future runs is the caller's business: that lives in the settings file,
+        which this class doesn't own.
+
+        Raises ValueError for an unknown server, or for the built-in one:
+        that is where read_file and the rest come from."""
+        key = _BUILTIN if name in (_BUILTIN, "built-in", "builtin") else name
+        if key == _BUILTIN:
+            raise ValueError(
+                "The built-in server provides the core file, shell and git tools — "
+                "it can't be removed."
+            )
+        if key not in self._server_specs:
+            known = [n for n in self._server_specs if n != _BUILTIN]
+            raise ValueError(f"Unknown MCP server {name!r} — configured: "
+                              f"{', '.join(known) if known else '(none besides built-in)'}")
+
+        await self._stop_server(key)
+        self._sessions.pop(key, None)
+        self._server_specs.pop(key, None)
+        self._connected_at.pop(key, None)
+        self._connect_errors.pop(key, None)
+        self._deferred_servers.discard(key)
+        self.extra_servers.pop(key, None)
+        prefix = f"{key}__"
+        for exposed in [k for k, owner in self._tool_owner.items() if owner[0] == key]:
+            del self._tool_owner[exposed]
+        for exposed in [k for k in self._deferred_tools if k.startswith(prefix)]:
+            del self._deferred_tools[exposed]
+        for exposed in [k for k in self._tool_embeddings if k.startswith(prefix)]:
+            del self._tool_embeddings[exposed]
+        self._revealed = {r for r in self._revealed if not r.startswith(prefix)}
+        self._prompt_owner = {k: v for k, v in self._prompt_owner.items() if v[0] != key}
+
+        await self.list_llm_tools()   # rebuild what the model is offered
+        try:
+            self._resources = await asyncio.wait_for(self.list_resources(),
+                                                      self.connect_timeout_s)
+        except (Exception, asyncio.TimeoutError):
+            self._resources = {}
+        return key
+
     def server_names(self) -> list:
         """Configured server names as the REPL should show them (built-in
         first), for `/mcp restart <name>` completion."""
@@ -804,6 +894,9 @@ class MCPToolClient:
                     self._deferred_tools[exposed_name] = schema
                 else:
                     schemas.append(schema)
+        # Always offered: asking the person a question is never a server's
+        # capability, it's the client's.
+        schemas.append(_ask_user_schema())
         if self._deferred_tools:
             schemas.append(_search_tools_schema())
         if self._resources:
@@ -1056,6 +1149,20 @@ class MCPToolClient:
         return "\n\n".join(parts)
 
     async def call_tool(self, name: str, args: dict) -> str:
+        if name == _ASK_USER_NAME:
+            question = str(args.get("question") or "").strip()
+            if not question:
+                return "ERROR: ask_user requires a 'question'."
+            options = args.get("options") or []
+            if not isinstance(options, list):
+                options = [options]
+            options = [str(o) for o in options if str(o).strip()]
+            from . import ui
+            answer = await ui.ask_user(question, options)
+            if answer is None:
+                return ("The user dismissed the question without answering. Don't ask again; "
+                         "proceed with your best judgement or stop and explain what you need.")
+            return f"The user answered: {answer}"
         if name == _SEARCH_TOOLS_NAME:
             return await self.search_mcp_tools(args.get("query", ""))
         if name == _LIST_RESOURCES_NAME:

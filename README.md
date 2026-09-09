@@ -1,7 +1,7 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-804%20passed-brightgreen)](#-tests)
-[![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-846%20passed-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -102,6 +102,35 @@ gets appended after whichever prompt is in force.
 The prompt is stored as the session's first message, so `--resume` continues
 with the prompt that session started with — changing the flag later doesn't
 rewrite a conversation already underway.
+
+## ❓ Asking you a question
+
+The model can put a question to you mid-turn with the `ask_user` tool, for a
+genuine ambiguity it can't settle from the code — or to have a plan accepted
+before it acts:
+
+```
+? Store sessions in SQLite or Postgres?
+
+ ▸ 1. Keep SQLite
+   2. Switch to Postgres
+   3. Accept my plan as written
+────────────────────────────────────────────────────────── my-session ──
+❯
+  qwen3.6:35b  ·  ↑↓ or click to choose  ·  or type your own  ·  ⏎ submit
+```
+
+Choices are optional; when the model offers them they become a picker —
+arrow keys or a click to select, Enter to submit. **Typing always wins**: the
+useful answer is often none of the options ("neither, use DuckDB"), so
+anything you type is taken verbatim and sent back as-is. Ctrl+C dismisses the
+question, and the tool tells the model so rather than letting it ask again in
+a loop.
+
+It's the one tool the client answers itself rather than passing to a server:
+the answer has to come from your terminal, and every MCP server — the
+built-in one included — is a subprocess with no access to it. It's in
+`safe_tools`, since asking a question changes nothing.
 
 ## 🧭 Intent parsing
 
@@ -279,6 +308,14 @@ MCP prompt exposed by a connected server. Special inputs:
   resuming doesn't reload everything it just summarized away. Use `--compact-model`
   to run the summarization call itself through a smaller/faster model
   than `--model` (same idea as `--intent-model`).
+- `/expand <n>` — reprint one tool call with nothing abbreviated: every
+  argument, and the entire result the model was given. The number is the one
+  shown next to the call. Clicking the call does the same thing.
+- `/mcp remove <name>` — disconnect a server now *and* unregister it, so it
+  stops loading on future runs. Only affects this session if the server came
+  from `--mcp-server` rather than the settings file; the built-in server
+  can't be removed, since that's where the file, shell and git tools live.
+  `--remove-mcp-server <name>` is the non-interactive equivalent.
 - `/reasoning` — expand the last reply's chain of thought. When a server
   sends reasoning as its own field alongside the answer, the transcript shows
   a collapsed two-line preview (`▸ reasoning · 256 chars`) so the answer isn't
@@ -303,6 +340,37 @@ prompts that show the actual diff/command *before* you approve — not just the
 raw args — and the final response rendered as Markdown (headers, lists, code
 blocks) rather than literal text.
 
+**An interactive session is a full-screen app** (`tui.py`), which is what
+makes the transcript clickable:
+
+```
+● Listing the project first.
+
+▸ [1] 📄 write_file(path="notes.txt", content="line one\nline two…")   ← click
+  ⎿  ✓ notes.txt  +9 -0 · 0.0s
+
+  ▸ reasoning [2]  ·  976 chars  ·  click or /reasoning to expand      ← click
+  │ I can see some files in the project directory. Let me describe…
+────────────────────────────────────────────────────────── my-session ──
+❯
+────────────────────────────────────────────────────────────────────────
+  qwen3.6:35b  ·  ⏎ send  ·  / commands  ·  click ▸ to expand  ·  …
+```
+
+Clicking a `▸` line opens that block in place — a tool call shows every
+argument and its entire result, a reasoning block shows the whole chain of
+thought — and clicking again closes it. The mouse wheel and PageUp/PageDown
+scroll; new output pulls the view back to the bottom unless you have scrolled
+up. `/expand <n>` and `/reasoning [n]` do the same thing from the keyboard,
+by the number each block carries.
+
+Why full-screen at all: a terminal owns everything already printed to it.
+Text that has scrolled cannot be rewritten, and mouse clicks reach only the
+region an application draws — so expanding something in place means drawing
+the transcript ourselves. It costs the terminal's own scrollback while the
+session runs, so the transcript is written out on exit, in whatever
+open/closed state you left it, rather than vanishing with the app.
+
 The terminal window/tab is named after the session, so several sessions side
 by side are tellable apart: `--session-name` if you gave one, otherwise the id
 the session is assigned after its first turn. Two mechanisms cover the
@@ -322,8 +390,9 @@ asked what its title was), but most shells set their own on the next prompt.
   the full text either way; this only changes what's echoed to the terminal.
 
 If `rich` isn't installed, `agent.py` and `cli.py` both detect the missing
-import and fall back to plain `print()` — nothing breaks, it just looks
-like the original CLI.
+import and fall back to plain `print()` and `input()` — no full-screen app,
+no clicking, but nothing breaks; it looks like the original CLI. One-shot runs
+(`omni "task"`) never use the full-screen app either: they print and exit.
 
 ## 🔌 Tools as an MCP server
 
@@ -689,7 +758,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-804 tests, 94% branch coverage (the badge numbers are the full suite,
+846 tests, 88% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
@@ -703,11 +772,17 @@ Per module (branch coverage, whole suite):
 
 | Module | Cover | Module | Cover |
 |---|---|---|---|
-| `config.py` | 100% | `mcp_client.py` | 95% |
-| `mcp_server.py` | 100% | `agent.py` | 93% |
+| `config.py` | 100% | `agent.py` | 94% |
+| `mcp_server.py` | 100% | `mcp_client.py` | 94% |
 | `session_store.py` | 100% | `tools.py` | 93% |
-| `llm_client.py` | 99% | `cli.py` | 92% |
-| `intent.py` | 98% | `ui.py` | 92% |
+| `llm_client.py` | 99% | `tui.py` | 86% |
+| `intent.py` | 98% | `cli.py` | 81% |
+| | | `ui.py` | 78% |
+
+`ui.py` and `tui.py` carry the drawing code, most of which is only exercised
+by rendering it — the numbers there are lower on purpose: the transcript's
+layout, scrolling and click handling are tested directly (`test_tui.py`),
+while the pixel-level output is checked by driving a real terminal.
 
 Almost everything is mocked at the process boundary — `httpx` via
 `MockTransport`, `subprocess.run` for the git tools, `ClientSession` for MCP,
@@ -729,7 +804,8 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 | `test_mcp_server.py` | The exposed MCP tool surface and its delegation to `tools.py` |
 | `test_agent_helpers.py` | Tool-call recovery, history trimming, approval policy |
 | `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits, tool_call_id pairing |
-| `test_ui.py` | Diff rendering, summaries, the input box + bottom frame, every renderer |
+| `test_ui.py` | Diff rendering, summaries, ask_user, every renderer |
+| `test_tui.py` | The clickable transcript: layout, scroll, click-to-toggle, the app's four input modes |
 | `test_cli.py` / `test_cli_interactive.py` | Flags, MCP registry, and every REPL slash command |
 | `test_cli_no_rich.py` | The degraded path when rich/prompt_toolkit aren't installed |
 | `test_config.py` | `AgentConfig` defaults that encode policy (what's auto-approved) |

@@ -1,7 +1,7 @@
 # 🐙 Omni Coder
 
-[![tests](https://img.shields.io/badge/tests-804%20passed-brightgreen)](#-tests)
-[![coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](#-tests)
+[![tests](https://img.shields.io/badge/tests-846%20passed-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -42,12 +42,22 @@ Run `omni --help` for the full option list.
   happens. Resume a previous run by id or a name you gave it
   (`--resume`), browse saved sessions (`--list-sessions`), or delete one
   (`--delete-session`).
-- **Interactive mode** — drop into a REPL that keeps the model connection
-  and tool session alive across turns. Ctrl-C during a running turn cancels
-  just that turn instead of killing the session — you land back at the
-  prompt and can keep going. Type `/` for a completion menu of every
-  command, including `/model` (switch models) and `/server:prompt` (run an
-  MCP prompt template).
+- **Interactive mode** — a full-screen session that keeps the model
+  connection and tool session alive across turns. Ctrl-C during a running
+  turn cancels just that turn instead of killing the session; at the prompt
+  it clears the line. Type `/` for a completion menu of every command,
+  including `/model` (switch models) and `/server:prompt` (run an MCP prompt
+  template).
+- **A clickable transcript** — tool calls and reasoning blocks show
+  abbreviated, and clicking the `▸` opens one in place: every argument and
+  the whole result, or the entire chain of thought. Click again to close;
+  the wheel and PageUp/PageDown scroll. `/expand <n>` and `/reasoning [n]`
+  do the same from the keyboard. The transcript is written out on exit, so
+  it stays in your scrollback.
+- **The model can ask you a question** — `ask_user` puts a genuine ambiguity
+  (or a plan to accept) to you mid-turn. Offered choices become a picker:
+  arrow or click to select, Enter to submit, and anything you type instead
+  wins, because the useful answer is often none of the options.
 - **Automatic context compaction** — once the running conversation exceeds
   `--context-char-budget` (default 200k chars), older messages are replaced
   with an LLM-written summary instead of growing forever or being silently
@@ -74,6 +84,13 @@ Run `omni --help` for the full option list.
   one per run (`--mcp-server`/`--mcp-config`). One server failing to
   connect doesn't take down the session — check `/mcp` for live ✅/❌
   status per server, and `--mcp-log-path` for their stderr output.
+- **Drop a server mid-session** — `/mcp remove <name>` disconnects it now
+  and unregisters it so it stops loading on future runs
+  (`--remove-mcp-server` non-interactively). A server that starts but never
+  completes the MCP handshake is written off after
+  `--mcp-connect-timeout` seconds instead of hanging the session.
+- **Bring your own system prompt** — `--system-prompt` or
+  `--system-prompt-file` replaces the built-in one; omit both to keep it.
 - **Inspect a server's tools** — `/mcp tools <name>` lists what one server
   exposes (the name the model calls each by, plus its description), flagging
   tools that are `deferred`, `revealed`, or `internal`.
@@ -188,7 +205,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-804 tests, 94% branch coverage — hermetic (no model, server, or network
+846 tests, 88% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

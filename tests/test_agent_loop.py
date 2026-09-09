@@ -573,15 +573,16 @@ async def test_reasoning_is_shown_collapsed_beside_an_answer(agent, client, mock
     note = mocker.patch.object(agent_mod.ui, "reasoning_note")
     replies(mocker, reasoning_reply("The answer.", "Long chain of thought."))
     await agent.run("t", client=client)
-    note.assert_called_once_with("Long chain of thought.")
+    note.assert_called_once_with("Long chain of thought.", 1)
     assert agent.last_reasoning == "Long chain of thought."
+    assert agent.reasoning_log == ["Long chain of thought."]
 
 
 async def test_plain_reasoning_key_is_shown_too(agent, client, mocker):
     note = mocker.patch.object(agent_mod.ui, "reasoning_note")
     replies(mocker, reasoning_reply("A.", "Thinking.", key="reasoning"))
     await agent.run("t", client=client)
-    note.assert_called_once_with("Thinking.")
+    note.assert_called_once_with("Thinking.", 1)
 
 
 async def test_reasoning_that_is_the_answer_is_not_echoed(agent, client, mocker):
@@ -608,7 +609,7 @@ async def test_reasoning_on_a_tool_calling_turn_is_shown_above_the_tools(agent, 
     msg["reasoning_content"] = "I should read the file first."
     replies(mocker, msg, text_reply("done"))
     await agent.run("t", client=client)
-    note.assert_called_once_with("I should read the file first.")
+    note.assert_called_once_with("I should read the file first.", 1)
 
 
 # ---------------- system prompt ----------------

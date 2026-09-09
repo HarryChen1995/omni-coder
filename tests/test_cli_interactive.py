@@ -14,6 +14,21 @@ import pytest
 from omni import cli as cli_mod
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(mocker, tmp_path):
+    """Point ~ at tmp_path so the real ~/.omni-coder settings file is never
+    touched by a /mcp remove in these tests."""
+    home = tmp_path / "home"
+    (home / ".omni-coder").mkdir(parents=True)
+    mocker.patch("os.path.expanduser", lambda p: p.replace("~", str(home)))
+    return home
+
+
+@pytest.fixture
+def settings_path(isolated_home):
+    return isolated_home / ".omni-coder" / "omni-coder-settings.json"
+
+
 @pytest.fixture
 def client(mocker):
     """An MCPToolClient stand-in, installed as an async context manager."""
@@ -42,21 +57,30 @@ def repl(mocker, client, cfg):
     mocker.patch("omni.ui.interrupted")
     mocker.patch("omni.ui.thinking")
 
+    captured = {}
+
     def run(inputs, run_result="the answer", run_side_effect=None, **kwargs):
         script = list(inputs) + ["/exit"]
-        mocker.patch.object(cli_mod, "_read_task",
+
+        # No full-screen app in these tests: they assert on what reaches the
+        # terminal, and the app would swallow it into its own transcript. The
+        # TUI has its own tests (test_tui.py) plus the pty checks. The
+        # commands dict it would have been given is captured for the
+        # completion tests, which is where that dict is assembled.
+        def fake_make_tui(commands, session_label, model):
+            captured["commands"] = commands
+            return None
+
+        mocker.patch.object(cli_mod, "_make_tui", fake_make_tui)
+        mocker.patch.object(cli_mod, "_next_instruction",
                             mocker.AsyncMock(side_effect=script))
         agent_run = mocker.patch.object(
             cli_mod.CodingAgent, "run",
             mocker.AsyncMock(return_value=run_result, side_effect=run_side_effect))
-        # prompt_toolkit's PromptSession needs a real terminal; the REPL only
-        # uses the object as an opaque handle here since _read_task is mocked.
-        mocker.patch.object(cli_mod, "_interactive_prompt_session", create=True)
-        mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
-        mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
         asyncio.run(cli_mod._interactive(cfg, kwargs.get("resume"), kwargs.get("session_name")))
         return agent_run
 
+    run.captured = captured
     return run
 
 
@@ -77,7 +101,8 @@ def test_blank_input_is_ignored(repl):
 @pytest.mark.parametrize("quit_cmd", ["/exit", "/quit"])
 def test_exit_commands_leave_the_loop(repl, mocker, quit_cmd):
     """Anything typed after the quit command must never run."""
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=[quit_cmd, "never runs"]))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=[quit_cmd, "never runs"]))
     agent_run = mocker.patch.object(cli_mod.CodingAgent, "run", mocker.AsyncMock())
     repl([quit_cmd])
     agent_run.assert_not_awaited()
@@ -87,7 +112,8 @@ def test_session_id_is_carried_between_turns(mocker, client, cfg):
     """Turn 2 must resume the session turn 1 created, not start a fresh one."""
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch("omni.ui.final_result")
-    mocker.patch.object(cli_mod, "_read_task",
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction",
                         mocker.AsyncMock(side_effect=["first", "second", "/exit"]))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
@@ -111,7 +137,8 @@ def test_the_same_client_is_reused_across_turns(repl, client):
 
 def test_eof_at_the_prompt_exits_cleanly(mocker, client, cfg):
     mocker.patch.object(cli_mod, "_print_header")
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=EOFError))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=EOFError))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     asyncio.run(cli_mod._interactive(cfg, None, None))   # must not raise
@@ -199,6 +226,34 @@ def test_reasoning_command_without_any_says_so(repl, mocker, capsys):
     agent_run.assert_not_awaited()
 
 
+def test_mcp_remove_disconnects_and_unregisters(repl, client, mocker, settings_path, capsys):
+    client.remove_server = mocker.AsyncMock(return_value="docs")
+    settings_path.write_text(json.dumps({"mcpServers": {"docs": {"command": "node srv.js"}}}))
+    repl(["/mcp remove docs"])
+    client.remove_server.assert_awaited_once_with("docs")
+    assert "docs" not in json.loads(settings_path.read_text())["mcpServers"]
+    assert "unregistered" in capsys.readouterr().out
+
+
+def test_mcp_remove_of_an_inline_server_only_affects_the_session(repl, client, mocker,
+                                                                 settings_path, capsys):
+    client.remove_server = mocker.AsyncMock(return_value="inline")
+    settings_path.write_text(json.dumps({"mcpServers": {}}))
+    repl(["/mcp remove inline"])
+    assert "for this session" in capsys.readouterr().out
+
+
+def test_mcp_remove_reports_a_bad_name(repl, client, mocker, capsys):
+    client.remove_server = mocker.AsyncMock(side_effect=ValueError("Unknown MCP server 'nope'"))
+    repl(["/mcp remove nope"])
+    assert "Unknown MCP server" in capsys.readouterr().err
+
+
+def test_mcp_remove_without_a_name_shows_usage(repl, client, capsys):
+    repl(["/mcp remove"])
+    assert "Usage: /mcp remove" in capsys.readouterr().err
+
+
 # ---------------- /sessions, /delete, /compact ----------------
 
 def test_sessions_command_lists_without_running_a_turn(repl, mocker):
@@ -236,7 +291,8 @@ def test_compact_uses_the_resolved_session_id(mocker, client, cfg, capsys):
 
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "_show_resumed_history")
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=["/compact", "/exit"]))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/compact", "/exit"]))
     compact = mocker.patch.object(cli_mod.CodingAgent, "compact_history",
                                  mocker.AsyncMock(return_value="Compacted 30 down to 5"))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
@@ -250,7 +306,8 @@ def test_compact_uses_the_resolved_session_id(mocker, client, cfg, capsys):
 def test_model_command_lists_models(mocker, client, cfg, capsys):
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=["a", "b"]))
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=["/model", "/exit"]))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/model", "/exit"]))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     # No usable picker without a real terminal -> falls back to the printed list.
@@ -280,7 +337,8 @@ def test_model_list_failure_is_reported(mocker, client, cfg, capsys):
     from omni.llm_client import LLMError
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(side_effect=LLMError("no /v1/models")))
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=["/model", "/exit"]))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/model", "/exit"]))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     asyncio.run(cli_mod._interactive(cfg, None, None))
@@ -385,12 +443,9 @@ def test_bare_mcp_still_shows_status_not_tools(repl, client, mocker):
 
 def test_mcp_tools_completions_are_registered_per_server(repl, client, mocker):
     client.server_names.return_value = ["built-in", "docs"]
-    captured = {}
-    mocker.patch("omni.ui.SlashCommandCompleter",
-                 side_effect=lambda commands: captured.setdefault("commands", commands))
     repl([])
-    assert "/mcp tools built-in" in captured["commands"]
-    assert "/mcp tools docs" in captured["commands"]
+    assert "/mcp tools built-in" in repl.captured["commands"]
+    assert "/mcp tools docs" in repl.captured["commands"]
 
 
 # ---------------- /resources ----------------
@@ -508,11 +563,8 @@ def test_prompt_commands_are_registered_for_completion(repl, client, mocker):
         "docs:summarize": {"description": "Summarize", "arguments": [
             {"name": "path", "description": "", "required": True},
             {"name": "style", "description": "", "required": False}]}}
-    captured = {}
-    mocker.patch("omni.ui.SlashCommandCompleter",
-                 side_effect=lambda commands: captured.setdefault("commands", commands))
     repl([])
-    entry = captured["commands"]["/docs:summarize "]
+    entry = repl.captured["commands"]["/docs:summarize "]
     assert "Summarize" in entry and "<path>" in entry and "[style]" in entry
 
 
@@ -536,7 +588,8 @@ def test_failed_server_warning_is_shown_at_startup(repl, client, capsys):
 def test_resumed_history_is_shown_once(mocker, client, cfg):
     mocker.patch.object(cli_mod, "_print_header")
     shown = mocker.patch.object(cli_mod, "_show_resumed_history")
-    mocker.patch.object(cli_mod, "_read_task", mocker.AsyncMock(side_effect=["/exit"]))
+    mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
+    mocker.patch.object(cli_mod, "_next_instruction", mocker.AsyncMock(side_effect=["/exit"]))
     mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
     mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
     asyncio.run(cli_mod._interactive(cfg, "some-session", None))
@@ -545,11 +598,8 @@ def test_resumed_history_is_shown_once(mocker, client, cfg):
 
 def test_model_completions_are_registered_when_available(repl, client, mocker):
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=["m1", "m2"]))
-    captured = {}
-    mocker.patch("omni.ui.SlashCommandCompleter",
-                 side_effect=lambda commands: captured.setdefault("commands", commands))
     repl([])
-    assert "/model m1" in captured["commands"] and "/model m2" in captured["commands"]
+    assert "/model m1" in repl.captured["commands"] and "/model m2" in repl.captured["commands"]
 
 
 def test_missing_v1_models_endpoint_is_tolerated(repl, client, mocker):

@@ -327,6 +327,11 @@ class CodingAgent:
         _quiet_library_logs(cfg.log_path)
         self.force_approval = False  # set True for the run if intent is high-risk
         self.last_reasoning = ""     # chain of thought from the latest reply, for /reasoning
+        self.reasoning_log = []      # every reply's reasoning, for /reasoning <n>
+        # Every tool call this session made, with its full arguments and full
+        # result — what /expand <n> reprints. The transcript only ever shows
+        # an abbreviated version of both.
+        self.call_log = []
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
 
@@ -547,8 +552,9 @@ class CodingAgent:
             reasoning = reasoning.strip() if isinstance(reasoning, str) else ""
             if reasoning and reasoning != (msg.get("content") or "").strip():
                 self.last_reasoning = reasoning
+                self.reasoning_log.append(reasoning)
                 if _HAS_UI:
-                    ui.reasoning_note(reasoning)
+                    ui.reasoning_note(reasoning, len(self.reasoning_log))
 
             # What the model said alongside its tool calls. Shown before the
             # calls run, so the transcript above the prompt reads narration
@@ -677,11 +683,22 @@ class CodingAgent:
                     and c["result"] != "Denied by human reviewer. Choose a different approach."
                 )
 
+            # Number every call within the session and keep the full record,
+            # so an abbreviated line on screen stays recoverable (/expand <n>).
+            for c in calls:
+                c["index"] = len(self.call_log) + 1
+                self.call_log.append({
+                    "index": c["index"], "name": c["name"], "args": c["args"],
+                    "raw_args": c.get("raw"), "result": c["result"],
+                    "ok": c.get("ok"), "duration": c.get("duration"),
+                })
+
             if _HAS_UI:
                 ui.step_display(calls)
             else:
                 for c in calls:
-                    print(f"[step {step}] {c['name']}({c['args']}) -> {str(c['result'])[:200]}")
+                    print(f"[step {step}] [{c['index']}] {c['name']}({c['args']}) "
+                           f"-> {str(c['result'])[:200]}")
 
             for c in calls:
                 self.logger.info(f"[step {step}] {c['name']}({c['args']}) -> {str(c['result'])[:500]}")
