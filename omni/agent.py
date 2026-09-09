@@ -6,6 +6,7 @@ session is async under the hood).
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import signal
 import time
 from contextlib import nullcontext
 
-from .llm_client import add_usage, chat, LLMError
+from .llm_client import add_usage, chat, LLMError, message_text
 
 from .config import AgentConfig
 from .intent import extract_intent
@@ -43,6 +44,46 @@ obvious from the code itself.
 - When the task is fully done, reply with plain text (no tool call) \
 summarizing what changed and how to verify it (e.g. which command to run).
 """
+
+
+def image_part(mime: str, data: bytes) -> dict:
+    """One image, as the content part an OpenAI-compatible server expects.
+
+    The bytes are base64'd into a data: URI because the model is on the other
+    side of an HTTP request and cannot read this machine's disk — a path would
+    be meaningless to it. mime matters: the server decodes by the declared
+    type, so a JPEG announced as PNG is a decode error, not a picture."""
+    encoded = base64.b64encode(data).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime or 'image/png'};base64,{encoded}"},
+    }
+
+
+def build_user_message(task: str, attachments: list = None) -> dict:
+    """The user's turn, as one message — text alone, or text plus images.
+
+    Without attachments this is the plain string form every server accepts,
+    and nothing about a text-only session changes. With images it becomes the
+    multimodal shape: a list of content parts, the text first so the question
+    precedes what it is asking about, then one image_url part per image.
+
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}
+
+    Attachments are {"mime": str, "data": bytes} — what clipboard.grab_image()
+    returns. Anything without bytes is dropped rather than sent as an empty
+    part, and if that leaves nothing the message stays a plain string: the
+    list form is only worth its cost when it carries something."""
+    parts = [{"type": "text", "text": task}]
+    for attachment in attachments or []:
+        data = attachment.get("data")
+        if data:
+            parts.append(image_part(attachment.get("mime"), data))
+    if len(parts) == 1:
+        return {"role": "user", "content": task}
+    return {"role": "user", "content": parts}
 
 
 def _load_project_memory(project_root: str, memory_path: str) -> str:
@@ -232,14 +273,14 @@ def _trim_history(messages: list, budget: int) -> list:
     within a rough character budget. Crude but effective without pulling
     in a tokenizer dependency. Used as a fallback if LLM-based compaction
     (_compact_messages) itself fails."""
-    total = sum(len(str(m.get("content", ""))) for m in messages)
+    total = sum(len(message_text(m)) for m in messages)
     if total <= budget:
         return messages
     head_len = _protected_head_len(messages)
     head, tail = messages[:head_len], messages[head_len:]
     while tail and total > budget:
         removed = tail.pop(0)
-        total -= len(str(removed.get("content", "")))
+        total -= len(message_text(removed))
     return head + tail
 
 
@@ -251,7 +292,7 @@ def _render_for_summary(m: dict, max_len: int = 800) -> str:
             for c in m["tool_calls"]
         )
         return f"assistant: called {calls}"
-    content = (m.get("content") or "").strip()
+    content = message_text(m).strip()
     if len(content) > max_len:
         content = content[:max_len] + "…"
     return f"{role}: {content}"
@@ -412,7 +453,8 @@ class CodingAgent:
         return f"Compacted {len(messages)} messages down to {len(compacted)}."
 
     async def run(self, task: str = "", resume_session_id: str = None, client: MCPToolClient = None,
-                  session_name: str = None, show_banner: bool = True) -> str:
+                  session_name: str = None, show_banner: bool = True,
+                  attachments: list = None) -> str:
         """Run one turn of the agent loop. If `client` is given (an already
         -open MCPToolClient), it's reused instead of spawning a fresh MCP
         server subprocess — used by the interactive REPL so each turn
@@ -436,7 +478,7 @@ class CodingAgent:
                 ui.banner(f"(resumed {session_id}) {label}", self.cfg.model)
             self.logger.info(f"RESUME session={session_id} TASK: {label}")
             if task:
-                messages.append({"role": "user", "content": task})
+                messages.append(build_user_message(task, attachments))
         else:
             if _HAS_UI and show_banner:
                 ui.banner(task, self.cfg.model)
@@ -451,7 +493,7 @@ class CodingAgent:
                 system_content += "\n\n# Project memory (persisted from previous sessions)\n" + memory_text
             messages = [
                 {"role": "system", "content": system_content},
-                {"role": "user", "content": task},
+                build_user_message(task, attachments),
             ]
             persisted = 0
             self.logger.info(f"TASK: {task} (session={session_id})")
@@ -537,7 +579,7 @@ class CodingAgent:
             persisted += 1
 
         for step in range(1, self.cfg.max_steps + 1):
-            total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+            total_chars = sum(len(message_text(m)) for m in messages)
             if total_chars > self.cfg.context_char_budget:
                 compaction_usage = {}
                 compacted = await _compact_messages(

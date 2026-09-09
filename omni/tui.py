@@ -49,6 +49,8 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 
+from . import clipboard
+
 # ui.py, bound on first use. Imported lazily rather than at module scope so
 # the two can reference each other without an import cycle.
 _ui = None
@@ -269,7 +271,11 @@ class Pane:
         self.error = ""
 
         self.task = None              # the turn running now, if any
-        self.pending: list = []       # typed at it while it was busy
+        self.pending: list = []       # (text, attachments) typed while busy
+        # Images pasted at this pane, waiting for the prompt they belong to.
+        # Each is {"mime": str, "data": bytes}; the nth is what "[Image #n]"
+        # in the typed line refers to.
+        self.attachments: list = []
         self.on_interrupt = None
 
         self.approval = None          # (question, Future)
@@ -797,10 +803,32 @@ class TuiApp:
                 # and the turn's output would have nothing above it.
                 token = current_pane.set(self.pane)
                 try:
-                    _ui.instruction(text)
+                    _ui.instruction(text, images=len(self.pane.attachments))
                 finally:
                     current_pane.reset(token)
                 self._queue.put_nowait((self.pane, text))
+
+        @keys.add("c-v", filter=Condition(self._accepts_typing))
+        def _paste(event):
+            """Paste — an image if the clipboard holds one, otherwise text.
+
+            Cmd+V never reaches here: it is the terminal's own paste, and a
+            terminal has no way to deliver image data. So this reads the
+            clipboard itself, and when there is no image it does what the
+            keypress would have done anyway."""
+            grabbed = clipboard.grab_image()
+            if grabbed is None:
+                text = clipboard.clipboard_text()
+                if text:
+                    self._buffer.insert_text(text.replace("\n", " "))
+                return
+            mime, data = grabbed
+            pane = self.pane
+            pane.attachments.append({"mime": mime, "data": data})
+            # The placeholder is what makes the attachment visible: you can
+            # see that an image is going along, refer to it in the sentence
+            # you are writing, and count how many you have pasted.
+            self._buffer.insert_text(f"[Image #{len(pane.attachments)}]")
 
         @keys.add("enter", filter=Condition(lambda: self._asking()))
         def _answer_question(event):

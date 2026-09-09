@@ -201,6 +201,59 @@ the answer has to come from your terminal, and every MCP server — the
 built-in one included — is a subprocess with no access to it. It's in
 `safe_tools`, since asking a question changes nothing.
 
+## 🖼️ Pasting an image
+
+**Ctrl+V** puts whatever image is on your clipboard into the prompt — a
+screenshot of a broken layout, a stack trace you photographed, a diagram:
+
+```
+describe the bug in [Image #1] and fix it
+  1 image attached
+────────────────────────────────────────────────────────── my-session ──
+❯
+```
+
+The placeholder is numbered as you paste, so you can refer to a particular
+image in the sentence you're writing, and paste several into one prompt.
+
+**Ctrl+V, not Cmd+V**: Cmd+V (and Ctrl+Shift+V) is the *terminal's* own paste.
+It inserts text, and there is no escape sequence by which a terminal could
+hand an application image data — so the application has to read the clipboard
+itself, which needs a keystroke the terminal passes through. `osascript` does
+it on macOS, `wl-paste`/`xclip` on Linux, PowerShell on Windows; none is a
+hard dependency, and a clipboard holding a *path* to an image counts as an
+image (copying a file in Finder gives you its path).
+
+When the clipboard holds no image Ctrl+V pastes its text instead, so the key
+does the ordinary thing when there's nothing to attach.
+
+On the wire the turn becomes the OpenAI-compatible multimodal shape, built by
+`agent.build_user_message()` — text part first, then one `image_url` part per
+image, each a base64 data URI:
+
+```json
+{"role": "user", "content": [
+  {"type": "text", "text": "describe the bug in [Image #1] and fix it"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0…"}}]}
+```
+
+Base64 rather than a path because the model is on the other side of an HTTP
+request and can't read your disk. Text-only turns are untouched — they stay
+the plain-string form every server accepts — so nothing changes for a model
+that has no vision at all; the list form appears only when an image does.
+Whether the picture is *understood* is up to the model you're pointing at
+(`llama.cpp` needs an mmproj-capable gguf; a text-only model will say it
+can't see it).
+
+The message is stored with its parts, so a resumed session sends the model
+what it saw the first time, and `/sessions` still shows something readable
+(`what is this? [1 image]`). Images stay in the conversation and therefore in
+every later request of that session, which is why anything over 10 MB is
+refused outright. Everything that measures or summarizes the conversation —
+the `--context-char-budget` check, compaction, the resumed-history panel —
+reads a message by its *words*, so an attached image is worth
+`what is this? [1 image]` there rather than a megabyte of base64.
+
 ## 🧭 Intent parsing
 
 Before the agent takes any action, the raw task string is parsed by the model
@@ -432,6 +485,9 @@ and, live, next to the spinner — taken from the `prompt_tokens` /
 guess. Everything that spends tokens on an agent's behalf is counted, intent
 parsing and history compaction included, and each agent counts only its own:
 switch to a subagent and the number beside its spinner is what *it* has spent.
+
+Ctrl+V attaches an image from the clipboard as `[Image #1]` (see
+[Pasting an image](#-pasting-an-image)) and pastes text when there isn't one.
 
 `--theme-color '#00b4d8'` recolours the accent — prompt, spinners, tool calls,
 the agent tree, panel borders — if the default rust doesn't suit your terminal.
@@ -840,7 +896,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-902 tests, 88% branch coverage (the badge numbers are the full suite,
+965 tests, 88% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
@@ -856,10 +912,10 @@ Per module (branch coverage, whole suite):
 |---|---|---|---|
 | `config.py` | 100% | `agent.py` | 94% |
 | `mcp_server.py` | 100% | `mcp_client.py` | 93% |
-| `session_store.py` | 100% | `tools.py` | 93% |
-| `llm_client.py` | 99% | `tui.py` | 87% |
-| `intent.py` | 98% | `ui.py` | 85% |
-| | | `cli.py` | 76% |
+| `clipboard.py` | 100% | `tools.py` | 93% |
+| `session_store.py` | 99% | `tui.py` | 87% |
+| `llm_client.py` | 99% | `ui.py` | 85% |
+| `intent.py` | 98% | `cli.py` | 77% |
 
 `ui.py` and `tui.py` carry the drawing code, most of which is only exercised
 by rendering it — the numbers there are lower on purpose: the transcript's
@@ -888,6 +944,7 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 | `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits, tool_call_id pairing |
 | `test_ui.py` | Diff rendering, summaries, ask_user, every renderer |
 | `test_tui.py` | The clickable transcript: layout, scroll, click-to-toggle, the app's four input modes |
+| `test_images.py` | Image paste: the clipboard read, the placeholder, the content parts, the stored history |
 | `test_cli.py` / `test_cli_interactive.py` | Flags, MCP registry, and every REPL slash command |
 | `test_cli_no_rich.py` | The degraded path when rich/prompt_toolkit aren't installed |
 | `test_config.py` | `AgentConfig` defaults that encode policy (what's auto-approved) |
@@ -907,6 +964,7 @@ All modules live under `omni/`:
 - `mcp_server.py` — MCP server exposing those tools over stdio
 - `mcp_client.py` — async MCP client the agent uses to reach the server; also merges in any custom MCP servers, and implements deferred tool loading + the `search_tools` tool (semantic ranking via `nomic[local]` or a remote embedding model, falling back to keyword matching)
 - `llm_client.py` — raw `httpx` client for the model's OpenAI-compatible chat-completions endpoint (`chat()`) and embeddings endpoint (`embed()`, used by `mcp_client.py`'s `search_tools`) — no vendor SDK dependency, works against any OpenAI-compatible server
+- `clipboard.py` — reads an image off the system clipboard (Ctrl+V image paste), per platform, with no hard dependencies
 - `session_store.py` — SQLite persistence for sessions and their full message history (resume/list/interactive mode)
 - `ui.py` — rich terminal rendering (diffs, panels, approval prompts, session tables) — purely presentational
 - `agent.py` — the loop: parse intent, call model, approve, execute via MCP, persist, repeat

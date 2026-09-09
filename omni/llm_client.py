@@ -87,6 +87,27 @@ def _content_from_reasoning(message: dict) -> dict:
     return message
 
 
+def message_text(message: dict) -> str:
+    """The readable text of a message, whatever shape its content is.
+
+    `content` is a plain string in the ordinary case and a list of content
+    parts when the turn carries images. Everything that measures, summarizes
+    or displays a conversation wants the words out of it — never the base64
+    of an image, which would swamp a character budget and the screen alike, so
+    images are reduced to a count."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return content or ""
+    texts = [part.get("text", "") for part in content
+             if isinstance(part, dict) and part.get("type") == "text"]
+    images = sum(1 for part in content
+                  if isinstance(part, dict) and part.get("type") == "image_url")
+    text = " ".join(t for t in texts if t).strip()
+    if images:
+        text = f"{text} [{images} image{'s' if images != 1 else ''}]".strip()
+    return text
+
+
 class LLMError(Exception):
     pass
 

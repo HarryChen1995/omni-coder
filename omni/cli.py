@@ -522,18 +522,25 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
         def _turn_finished(pane):
             """Run whatever was typed at this pane while it was working."""
             if pane.pending:
-                _start_turn(pane, pane.pending.pop(0))
+                text, attachments = pane.pending.pop(0)
+                _start_turn(pane, text, attachments)
 
-        def _start_turn(pane, text: str):
+        def _start_turn(pane, text: str, attachments: list = None):
+            # Images pasted at the pane belong to the line that was typed with
+            # them, so they are taken now and cleared: whatever is pasted next
+            # goes with the next prompt, not this one.
+            if attachments is None:
+                attachments, pane.attachments = pane.attachments, []
             if pane.task is not None and not pane.task.done():
-                pane.pending.append(text)
+                pane.pending.append((text, attachments))
                 _echo(f"queued for {pane.name!r} — it's still working")
                 return
             # Recorded synchronously: the exit path waits on in-flight turns,
             # and a task only known once _run_turn starts could be dropped.
             pane.task = asyncio.ensure_future(
                 _run_turn(pane, text, cfg=cfg, client=client, tui=tui,
-                          session_name=session_name, on_finished=_turn_finished))
+                          session_name=session_name, on_finished=_turn_finished,
+                          attachments=attachments))
 
         _RUNTIME["start_turn"] = _start_turn
         runner = asyncio.ensure_future(tui.run()) if tui is not None else None
@@ -817,6 +824,7 @@ class _PlainPane:
         self.session_id = None
         self.task = None
         self.pending: list = []
+        self.attachments: list = []
         self.on_interrupt = None
         self.busy = False
         self.done = False
@@ -824,7 +832,8 @@ class _PlainPane:
         self.error = ""
 
 
-async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finished=None):
+async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finished=None,
+                    attachments: list = None):
     """One turn for one pane.
 
     Its output goes to that pane's transcript (see tui.current_pane), and so
@@ -845,7 +854,7 @@ async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finis
         run_task = asyncio.ensure_future(
             agent.run(task, resume_session_id=pane.session_id, client=client,
                       session_name=session_name if pane.kind == "main" else None,
-                      show_banner=False)
+                      show_banner=False, attachments=attachments)
         )
         if pane.task is None:
             pane.task = asyncio.current_task()   # spawned directly, not dispatched

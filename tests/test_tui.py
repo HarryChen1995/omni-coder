@@ -208,7 +208,7 @@ def test_enter_echoes_the_instruction_into_the_transcript(app, mocker):
     echo = mocker.patch("omni.ui.instruction")
     app._buffer.text = "visible please"
     binding(app, "enter")(mocker.Mock())
-    echo.assert_called_once_with("visible please")
+    echo.assert_called_once_with("visible please", images=0)
 
 
 def test_a_blank_line_is_not_an_instruction(app, mocker):

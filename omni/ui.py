@@ -43,6 +43,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
+from .llm_client import message_text
 
 console = Console()
 
@@ -1269,7 +1270,7 @@ def history_panel(messages: list):
 
     for m in visible:
         role = m.get("role")
-        content = (m.get("content") or "").strip()
+        content = message_text(m).strip()
         if role == "user":
             console.print(f"\n[bold {ACCENT}]❯[/bold {ACCENT}] {content}")
         elif role == "assistant" and m.get("tool_calls"):
@@ -1434,7 +1435,7 @@ def btw_answer(question: str, answer: str):
     console.print(Panel(Markdown(answer), title=f"💬 /btw: {question}", border_style=ACCENT, expand=False))
 
 
-def instruction(text: str):
+def instruction(text: str, images: int = 0):
     """What the user typed, echoed into the transcript.
 
     In a full-screen session the input line is cleared the moment it is
@@ -1443,6 +1444,11 @@ def instruction(text: str):
     part of what was said.)"""
     console.print()
     console.print(Text(text, style="bold"))
+    if images:
+        # The placeholders in the line say where the images go; this says they
+        # are actually going, which is the part you can't see otherwise.
+        console.print(Text(f"  {images} image{'s' if images != 1 else ''} attached",
+                            style="dim"))
 
 
 async def ask_user(question: str, options: list = None) -> str:

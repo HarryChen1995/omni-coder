@@ -66,6 +66,18 @@ Run `omni --help` for the full option list.
   they fold into main as clickable blocks once they've all reported back.
   Interrupting is per agent, and the parent is told in as many words when a
   subagent is interrupted or fails.
+- **Paste an image into the prompt** — Ctrl+V attaches whatever image is on
+  your clipboard (a screenshot of a broken layout, a diagram, a photographed
+  stack trace) as a numbered `[Image #1]` placeholder you can refer to in the
+  sentence you're writing, several per prompt. It goes to the model as the
+  OpenAI-compatible multimodal message — text part first, then one
+  `image_url` part per image as a base64 data URI — and text-only turns are
+  left exactly as they were. Ctrl+V rather than Cmd+V because Cmd+V is the
+  *terminal's* own paste and no terminal can hand an application image data,
+  so the clipboard is read directly (`osascript` / `wl-paste` / `xclip` /
+  PowerShell, none a hard dependency); with no image on the clipboard the key
+  pastes text as usual. Images are stored with the message, so a resumed
+  session still sends what the model saw.
 - **Token counts** — every turn shows what it cost (`Responded (16.0s · ↑ 3.3k
   ↓ 115)`, and live beside the spinner), from the server's own
   `prompt_tokens` / `completion_tokens`. Intent parsing and history
@@ -223,7 +235,7 @@ it with `--llm-timeout <seconds>` (default `300`).
 
 ## 🧪 Tests
 
-902 tests, 88% branch coverage — hermetic (no model, server, or network
+965 tests, 88% branch coverage — hermetic (no model, server, or network
 needed; every external boundary is mocked):
 ```bash
 pip install -e ".[dev]"

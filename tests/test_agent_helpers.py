@@ -155,8 +155,23 @@ def test_trim_history_drops_oldest_but_keeps_system_and_task():
 
 
 def test_trim_history_tolerates_missing_content():
+    """A missing or null content is worth no characters (it used to be
+    measured as the string "None"), so a history of empty messages is already
+    inside any budget and nothing is dropped."""
     m = [{"role": "system"}, {"role": "user"}, {"role": "assistant", "content": None}]
-    assert _trim_history(m, 0) == m[:2]
+    assert _trim_history(m, 0) == m
+
+
+def test_trim_history_measures_text_not_an_image_s_base64():
+    """An attached image must not blow the character budget: the message is
+    measured by its words, so pasting a screenshot doesn't trigger compaction
+    on its own."""
+    big = "x" * 5000
+    m = [{"role": "system", "content": "s"},
+         {"role": "user", "content": [{"type": "text", "text": "look"},
+                                       {"type": "image_url",
+                                        "image_url": {"url": f"data:image/png;base64,{big}"}}]}]
+    assert _trim_history(m, 100) == m
 
 
 # ---------------- _render_for_summary ----------------

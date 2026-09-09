@@ -9,6 +9,20 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 
+from .llm_client import message_text
+
+
+def _split_content(content):
+    """(text, parts_json) for storage.
+
+    Structured content — the multimodal shape, text plus image parts — is
+    stored twice over: as JSON so a resume can restore it exactly, and
+    flattened to its text so anything that just wants to read the
+    conversation still can."""
+    if isinstance(content, list):
+        return message_text({"content": content}), json.dumps(content)
+    return content, None
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -56,6 +70,7 @@ class SessionStore:
                     content TEXT,
                     tool_calls TEXT,
                     tool_call_id TEXT,
+                    content_parts TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
@@ -64,6 +79,13 @@ class SessionStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN name TEXT")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name)")
             message_cols = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "content_parts" not in message_cols:
+                # A message with an image is a *list* of content parts, which
+                # doesn't fit a TEXT column. The parts go here as JSON and
+                # `content` keeps the readable text, so /sessions and the
+                # resumed-history panel stay legible while a resume restores
+                # the message the model actually saw.
+                conn.execute("ALTER TABLE messages ADD COLUMN content_parts TEXT")
             if "tool_call_id" not in message_cols:
                 # Added after the fact: a tool result has to name the call it
                 # answers when the history is replayed to the model, or a
@@ -104,13 +126,15 @@ class SessionStore:
     def load_messages(self, session_id: str) -> list:
         with _connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT role, content, tool_calls, tool_call_id FROM messages "
+                "SELECT role, content, tool_calls, tool_call_id, content_parts FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
         messages = []
         for row in rows:
             msg = {"role": row["role"], "content": row["content"]}
+            if row["content_parts"]:
+                msg["content"] = json.loads(row["content_parts"])
             if row["tool_calls"]:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
             if row["tool_call_id"]:
@@ -120,15 +144,16 @@ class SessionStore:
 
     def append_message(self, session_id: str, seq: int, message: dict) -> None:
         tool_calls = message.get("tool_calls")
+        content, content_parts = _split_content(message.get("content"))
         now = _now()
         with _connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, "
+                "content_parts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    session_id, seq, message.get("role", ""), message.get("content"),
+                    session_id, seq, message.get("role", ""), content,
                     json.dumps(tool_calls) if tool_calls else None,
-                    message.get("tool_call_id"), now,
+                    message.get("tool_call_id"), content_parts, now,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
@@ -144,13 +169,14 @@ class SessionStore:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             for seq, message in enumerate(messages):
                 tool_calls = message.get("tool_calls")
+                content, content_parts = _split_content(message.get("content"))
                 conn.execute(
-                    "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, "
+                    "content_parts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        session_id, seq, message.get("role", ""), message.get("content"),
+                        session_id, seq, message.get("role", ""), content,
                         json.dumps(tool_calls) if tool_calls else None,
-                        message.get("tool_call_id"), now,
+                        message.get("tool_call_id"), content_parts, now,
                     ),
                 )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
