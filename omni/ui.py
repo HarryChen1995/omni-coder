@@ -5,6 +5,7 @@ isn't installed, agent.py falls back to plain print() (see its import guard).
 """
 
 import asyncio
+import colorsys
 import functools
 import getpass
 import io
@@ -222,13 +223,135 @@ _MAX_PANEL_WIDTH = 100
 def _panel_width() -> int:
     return max(min(console.width, _MAX_PANEL_WIDTH), 20)
 
+# The mascot is a sprite, not line art: one character carries *two* pixel
+# rows — "▀" with the upper pixel as the foreground colour and the lower one
+# as the background — which makes each half-block roughly square and buys 26
+# rows of detail out of 13 lines of the header.
+#
+# The cells hold tones rather than colours: "." nothing, "#" outline,
+# "+" shadow, "-" body, ":" highlight, "W" eye. _tone_color mixes the body
+# tones out of ACCENT when the header is drawn, so the octopus follows the
+# theme (see set_accent) instead of being a red sprite pasted into a warm
+# rust box.
 _MASCOT_ART = """
-  ▄▄▄▄▄▄▄
- █  ●  ● █
- █    ▽   █
-  ▀▀▄▄▄▀▀
-  ╱ ╲╱ ╲╱
-""".strip("\n")
+...........########...........
+...........-------+#..........
+..........#------::-#.........
+.....#...#----------#...#.....
+....#+#..#----------#..##+....
+...#+##..#----------#...##+...
+..#+##...#----------#....###..
+..#++#...#----------#....#+#..
+..#++....#+---------#....#++..
+..#+#.....#+------++#....##+#.
+..#+#+#...#W++++++#W....#+#+#.
+..#+#++####W#++++##W###++##+#.
+..#++##+++##+-----###+++##++#.
+.##++######---------######++#.
+###+++++##-----------#+++++#-#
+#+##++++#-#---++----+-#++++#-#
+#+-#####-##---+#+---#--####-+#
+#++-###--#---+..+----+--##-++#
+..++----+#--#....#+--#+---++#.
+..##+++###-#......#--##++++#..
+...####..#-#......#--#.####...
+.........#-#......#--#........
+......##.#-#......#--####.....
+.....#+-#--#......#-+#-+#.....
+......#++--#......#---++#.....
+.......####.........###.......
+"""
+
+# The same octopus at two-thirds the size, for a terminal too narrow to give
+# the header's left column 30 columns. Narrower still and the mascot is
+# dropped: the header box is scrollback the moment it is printed, so a sprite
+# that wrapped on the way out can never be redrawn.
+_MASCOT_ART_SMALL = """
+........#####.......
+.......----:-.......
+......#-------..#...
+...##.#-------..#+..
+..+#..#-------..#+..
+..+...#------#...+#.
+.#+....+----+#...#+.
+.#++...W++++W...+++.
+.#+#++#W----W#++#++.
+.#++###------####++.
+#-++++-------+#+++##
+#+###-#--++--#-###-+
+.++--+---..#--+---+.
+..+##.--....--###+#.
+......--....#-......
+....#.--....#-.#....
+....+---....#--+#...
+.....+-......-+#....
+"""
+
+# Where each tone sits on ACCENT's lightness axis; None keeps ACCENT itself.
+_MASCOT_LIGHTNESS = {"#": 0.17, "+": 0.36, "-": None, ":": 0.82}
+
+
+def _tone_color(tone: str):
+    """The colour one sprite tone draws in, or None for transparent (the
+    terminal's own background shows through). Everything but the eyes is
+    ACCENT's own hue and saturation at a different lightness, so a recoloured
+    UI recolours the octopus with it."""
+    if tone == "W":
+        return "#FFFFFF"
+    if tone not in _MASCOT_LIGHTNESS:
+        return None
+    lightness = _MASCOT_LIGHTNESS[tone]
+    if lightness is None:
+        return ACCENT
+    try:
+        r, g, b = (int(ACCENT[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return ACCENT          # a named colour, not #rrggbb — nothing to mix
+    hue, _, sat = colorsys.rgb_to_hls(r, g, b)
+    r, g, b = colorsys.hls_to_rgb(hue, lightness, sat)
+    return "#%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def _mascot(width: int) -> Text:
+    """The largest octopus that fits in `width` columns, half-block encoded.
+
+    Empty when the terminal can't do it justice: no colour (every tone would
+    come out as the same featureless block), or an output encoding without
+    the half-blocks — a Windows console on a single-byte code page, say.
+    The rest of the header stands on its own without it."""
+    if console.color_system is None or console.no_color:
+        return Text("")
+    try:
+        "\u2580\u2584".encode(console.encoding or "utf-8")
+    except (LookupError, UnicodeEncodeError):
+        return Text("")
+    rows = None
+    for art in (_MASCOT_ART, _MASCOT_ART_SMALL):
+        lines = art.strip("\n").splitlines()
+        if max(len(line) for line in lines) <= width:
+            rows = lines
+            break
+    if rows is None:
+        return Text("")
+    if len(rows) % 2:
+        rows = rows + [""]
+    span = max(len(line) for line in rows)
+    out = Text()
+    for i, (top, bottom) in enumerate(zip(rows[::2], rows[1::2])):
+        if i:
+            out.append("\n")
+        for x in range(span):
+            upper = _tone_color(top[x:x + 1] or ".")
+            lower = _tone_color(bottom[x:x + 1] or ".")
+            if upper and lower:
+                out.append("▀", style=f"{upper} on {lower}")
+            elif upper:
+                out.append("▀", style=upper)
+            elif lower:
+                out.append("▄", style=lower)
+            else:
+                out.append(" ")
+    return out
 
 
 def _greeting() -> str:
@@ -260,10 +383,20 @@ _START_TIPS = (
     "/ opens the command menu",
     "Ctrl+C interrupts a turn",
 )
+# Enough of them to stand as tall as the mascot beside it — the divider
+# between the two columns is drawn the full height of the taller one, so a
+# short list leaves the right half of the box visibly empty. Every entry is
+# a real command; _STATIC_COMMANDS in cli.py is the full list.
 _COMMAND_TIPS = (
-    ("/mcp", "servers and their tools"),
-    ("/model", "switch model mid-session"),
-    ("/compact", "shrink a long history"),
+    ("/mcp", "servers and tools"),
+    ("/model", "switch the model"),
+    ("/agent", "move between agents"),
+    ("/sessions", "list saved sessions"),
+    ("/compact", "shrink the history"),
+    ("/expand", "a tool call in full"),
+    ("/reasoning", "a reply's thinking"),
+    ("/resources", "server resources"),
+    ("/copy", "copy the transcript"),
     ("/btw", "a quick aside"),
 )
 
@@ -277,17 +410,19 @@ def _reference_column() -> Table:
     col.add_row(Rule(style="dim"))
     col.add_row(Text("Handy commands", style=f"bold {ACCENT}"))
     for name, what in _COMMAND_TIPS:
-        line = Text(f"{name:<9}", style="bold")
+        line = Text(f"{name:<11}", style="bold")
         line.append(what, style="dim")
         col.add_row(line)
     return col
 
 
-def _identity_column(session_label: str, project_root: str) -> Table:
+def _identity_column(session_label: str, project_root: str, width: int) -> Table:
     col = Table.grid(padding=(0, 1))
     col.add_column(justify="center")
     col.add_row(Text(_greeting(), style=f"bold {ACCENT}"))
-    col.add_row(Text(_MASCOT_ART, style=ACCENT))
+    mascot = _mascot(width)
+    if mascot.plain:          # a terminal that can't draw it gets no blank row
+        col.add_row(mascot)
     col.add_row(Text(""))
     col.add_row(Text(session_label, style="dim"))
     if project_root:
@@ -355,7 +490,10 @@ def header(session_label: str, project_root: str = ""):
                     width=inner)
     layout.add_column(width=left)
     layout.add_column(width=inner - left - 3)
-    layout.add_row(Align.center(_identity_column(session_label, project_root)),
+    # What the sprite has to fit inside: the column, less the layout's own
+    # padding and the identity grid's. A mascot wider than this would wrap,
+    # and _mascot steps down a size (or to nothing) rather than let it.
+    layout.add_row(Align.center(_identity_column(session_label, project_root, left - 6)),
                     _reference_column())
 
     title = f"[bold {ACCENT}]Omni Coder[/bold {ACCENT}] [dim]v{__version__}[/dim]"
@@ -885,7 +1023,7 @@ _TOOL_EMOJI = {
     "git_diff": "📊", "git_status": "📋", "git_log": "📜", "git_show": "🧾",
     "git_branch": "🌿", "git_fetch": "📥", "git_add": "➕", "git_commit": "💾",
     "git_pull": "🔽", "git_push": "🔼",
-    "save_memory": "🧠", "search_tools": "🧰", "ask_user": "❓", "spawn_agent": "🤖",
+    "save_memory": "🧠", "search_tools": "🧰", "ask_user": "❓", "spawn_agent": "👥",
     "list_resources": "📚", "read_resource": "📖",
 }
 _DEFAULT_TOOL_EMOJI = "🧩"  # fallback for an unnamespaced tool this map doesn't know
@@ -1515,7 +1653,7 @@ def subagent_summary(name: str, steps: int):
     did. The answer itself is already in the conversation, and the session is
     still in the database."""
     line = Text("  ▸ ", style="dim")
-    line.append("🤖 subagent ", style=f"bold {ACCENT}")
+    line.append("👥 subagent ", style=f"bold {ACCENT}")
     line.append(name, style="bold")
     line.append(f"  ·  {steps} block{'s' if steps != 1 else ''}  ·  reported back", style="dim")
     console.print()

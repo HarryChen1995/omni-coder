@@ -25,7 +25,8 @@ from anyio import BrokenResourceError
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 from .llm_client import LLMError, embed
 
@@ -277,7 +278,7 @@ def _mcp_schema_to_tool_schema(tool, exposed_name: str) -> dict:
         "function": {
             "name": exposed_name,
             "description": tool.description or "",
-            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            "parameters": tool.input_schema or {"type": "object", "properties": {}},
         },
     }
 
@@ -550,8 +551,15 @@ class MCPToolClient:
                         transport = spec.get("transport", "sse")
                         headers = _expand_env_values(name, spec.get("headers"), "header")
                         if transport == "streamable_http":
-                            read, write, _ = await stack.enter_async_context(
-                                streamablehttp_client(spec["url"], headers=headers)
+                            # This transport takes its headers on an HTTP
+                            # client rather than as an argument, and a client
+                            # it didn't build is one it won't close — so the
+                            # stack owns both, innermost first.
+                            http = await stack.enter_async_context(
+                                create_mcp_http_client(headers=headers)
+                            )
+                            read, write = await stack.enter_async_context(
+                                streamable_http_client(spec["url"], http_client=http)
                             )
                         else:
                             read, write = await stack.enter_async_context(
@@ -1144,15 +1152,15 @@ class MCPToolClient:
         for server_name, session in self._sessions.items():
             listings = [("list_resources", "resources", False)]
             if include_templates:
-                listings.append(("list_resource_templates", "resourceTemplates", True))
+                listings.append(("list_resource_templates", "resource_templates", True))
             for method, attr, is_template in listings:
                 try:
                     result = await getattr(session, method)()
                 except Exception:
                     continue
                 for r in getattr(result, attr, []) or []:
-                    # Templates carry uriTemplate; concrete resources carry uri.
-                    uri = str(getattr(r, "uriTemplate", None) or getattr(r, "uri", ""))
+                    # Templates carry uri_template; concrete resources carry uri.
+                    uri = str(getattr(r, "uri_template", None) or getattr(r, "uri", ""))
                     if not uri:
                         continue
                     if uri in resources:
@@ -1164,7 +1172,7 @@ class MCPToolClient:
                         "server": server_name,
                         "name": getattr(r, "name", "") or "",
                         "description": getattr(r, "description", "") or "",
-                        "mime_type": getattr(r, "mimeType", None) or "",
+                        "mime_type": getattr(r, "mime_type", None) or "",
                         "size": getattr(r, "size", None),
                         "template": is_template,
                         "shadowed_by": [],
@@ -1199,7 +1207,7 @@ class MCPToolClient:
             if hasattr(content, "text"):
                 parts.append(content.text)
             elif hasattr(content, "blob"):
-                mime = getattr(content, "mimeType", None) or "application/octet-stream"
+                mime = getattr(content, "mime_type", None) or "application/octet-stream"
                 try:
                     size = len(base64.b64decode(content.blob))
                     parts.append(f"[binary {mime}, {size} bytes — not shown]")
@@ -1266,7 +1274,7 @@ class MCPToolClient:
         session = self._sessions[server_name]
         result = await session.call_tool(real_name, args)
         text = "".join(c.text for c in result.content if hasattr(c, "text"))
-        return f"ERROR: {text}" if result.isError else text
+        return f"ERROR: {text}" if result.is_error else text
 
     async def preview_edit(self, path: str, old_str: str, new_str: str):
         raw = await self.call_tool("_preview_edit", {"path": path, "old_str": old_str, "new_str": new_str})

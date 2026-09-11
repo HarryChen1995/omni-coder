@@ -24,8 +24,8 @@ pytestmark = pytest.mark.live
 
 def server_script(path, body, name="toy"):
     path.write_text(textwrap.dedent(f'''
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP({name!r})
+        from mcp.server.mcpserver import MCPServer
+        mcp = MCPServer({name!r})
 {textwrap.indent(textwrap.dedent(body), "        ")}
         if __name__ == "__main__":
             mcp.run()

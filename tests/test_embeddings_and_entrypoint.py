@@ -111,7 +111,7 @@ async def test_semantic_search_falls_back_when_nomic_is_missing(client, mocker):
     search_tools to keyword matching instead of failing the call."""
     def tool(name, description):
         t = type("T", (), {})()
-        t.name, t.description, t.inputSchema = name, description, {"type": "object", "properties": {}}
+        t.name, t.description, t.input_schema = name, description, {"type": "object", "properties": {}}
         return t
 
     session = mocker.AsyncMock()

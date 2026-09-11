@@ -17,7 +17,7 @@ def tool(name, description="d", schema=None):
     t = type("T", (), {})()
     t.name = name
     t.description = description
-    t.inputSchema = schema or {"type": "object", "properties": {}}
+    t.input_schema = schema or {"type": "object", "properties": {}}
     return t
 
 
@@ -26,7 +26,7 @@ def fake_session(mocker, tools=(), prompts=(), resources=(), templates=()):
     s.list_tools.return_value = mocker.Mock(tools=list(tools))
     s.list_prompts.return_value = mocker.Mock(prompts=list(prompts))
     s.list_resources.return_value = mocker.Mock(resources=list(resources))
-    s.list_resource_templates.return_value = mocker.Mock(resourceTemplates=list(templates))
+    s.list_resource_templates.return_value = mocker.Mock(resource_templates=list(templates))
     return s
 
 
@@ -184,7 +184,7 @@ async def test_call_tool_routes_to_the_owning_server(client, mocker):
     builtin = fake_session(mocker, [tool("read_file")])
     docs = fake_session(mocker, [tool("search")])
     for s in (builtin, docs):
-        s.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="ok")])
+        s.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="ok")])
     client._sessions.update({_BUILTIN: builtin, "docs": docs})
     await client.list_llm_tools()
 
@@ -197,7 +197,7 @@ async def test_call_tool_defaults_unknown_names_to_builtin(client, mocker):
     """Internal _preview_* tools aren't in _tool_owner (list_llm_tools filters
     them), so they must fall through to the built-in session."""
     builtin = fake_session(mocker)
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="OK\ndiff")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="OK\ndiff")])
     client._sessions[_BUILTIN] = builtin
     await client.call_tool("_preview_edit", {"path": "x"})
     builtin.call_tool.assert_awaited_once_with("_preview_edit", {"path": "x"})
@@ -205,7 +205,7 @@ async def test_call_tool_defaults_unknown_names_to_builtin(client, mocker):
 
 async def test_call_tool_marks_server_errors(client, mocker):
     s = fake_session(mocker, [tool("boom")])
-    s.call_tool.return_value = mocker.Mock(isError=True, content=[mocker.Mock(text="it failed")])
+    s.call_tool.return_value = mocker.Mock(is_error=True, content=[mocker.Mock(text="it failed")])
     client._sessions["d"] = s
     await client.list_llm_tools()
     assert await client.call_tool("d__boom", {}) == "ERROR: it failed"
@@ -215,7 +215,7 @@ async def test_call_tool_concatenates_text_blocks_and_ignores_others(client, moc
     s = fake_session(mocker, [tool("multi")])
     non_text = mocker.Mock(spec=[])  # no .text attribute
     s.call_tool.return_value = mocker.Mock(
-        isError=False, content=[mocker.Mock(text="a"), non_text, mocker.Mock(text="b")])
+        is_error=False, content=[mocker.Mock(text="a"), non_text, mocker.Mock(text="b")])
     client._sessions["d"] = s
     await client.list_llm_tools()
     assert await client.call_tool("d__multi", {}) == "ab"
@@ -299,17 +299,17 @@ def resource(uri, name="n", description="", mime=None, size=None):
     r.uri = uri
     r.name = name
     r.description = description
-    r.mimeType = mime
+    r.mime_type = mime
     r.size = size
     return r
 
 
 def template(uri_template, name="t", description=""):
     r = type("RT", (), {})()
-    r.uriTemplate = uri_template
+    r.uri_template = uri_template
     r.name = name
     r.description = description
-    r.mimeType = None
+    r.mime_type = None
     r.size = None
     return r
 
@@ -374,9 +374,9 @@ async def test_read_resource_joins_multiple_text_blocks(client, mocker):
 
 async def test_read_resource_replaces_binary_with_a_size_marker(client, mocker):
     import base64
-    blob = mocker.Mock(spec=["blob", "mimeType"])
+    blob = mocker.Mock(spec=["blob", "mime_type"])
     blob.blob = base64.b64encode(b"x" * 108).decode()
-    blob.mimeType = "image/png"
+    blob.mime_type = "image/png"
     s = fake_session(mocker, resources=[resource("file:///logo.png")])
     s.read_resource.return_value = mocker.Mock(contents=[blob])
     client._sessions["d"] = s
@@ -386,9 +386,9 @@ async def test_read_resource_replaces_binary_with_a_size_marker(client, mocker):
 
 
 async def test_read_resource_handles_undecodable_blob(client, mocker):
-    blob = mocker.Mock(spec=["blob", "mimeType"])
+    blob = mocker.Mock(spec=["blob", "mime_type"])
     blob.blob = "!!!not-base64!!!"
-    blob.mimeType = None
+    blob.mime_type = None
     s = fake_session(mocker, resources=[resource("x://1")])
     s.read_resource.return_value = mocker.Mock(contents=[blob])
     client._sessions["d"] = s
@@ -721,10 +721,10 @@ async def test_preview_edit_parses_ok_and_error(client, mocker):
     builtin = fake_session(mocker)
     client._sessions[_BUILTIN] = builtin
 
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="OK\nthe diff")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="OK\nthe diff")])
     assert await client.preview_edit("f", "a", "b") == (True, "the diff")
 
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="ERROR\nnope")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="ERROR\nnope")])
     assert await client.preview_edit("f", "a", "b") == (False, "nope")
 
 
@@ -732,19 +732,19 @@ async def test_preview_write_parses_new_and_diff(client, mocker):
     builtin = fake_session(mocker)
     client._sessions[_BUILTIN] = builtin
 
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="NEW\n+a")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="NEW\n+a")])
     assert await client.preview_write("f", "a") == (True, "+a")
 
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="DIFF\n-a\n+b")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="DIFF\n-a\n+b")])
     assert await client.preview_write("f", "b", overwrite=True) == (False, "-a\n+b")
 
 
 async def test_file_exists_parses_boolean(client, mocker):
     builtin = fake_session(mocker)
     client._sessions[_BUILTIN] = builtin
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="true")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="true")])
     assert await client.file_exists("x") is True
-    builtin.call_tool.return_value = mocker.Mock(isError=False, content=[mocker.Mock(text="false")])
+    builtin.call_tool.return_value = mocker.Mock(is_error=False, content=[mocker.Mock(text="false")])
     assert await client.file_exists("x") is False
 
 

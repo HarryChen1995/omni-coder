@@ -103,7 +103,7 @@ The prompt is stored as the session's first message, so `--resume` continues
 with the prompt that session started with — changing the flag later doesn't
 rewrite a conversation already underway.
 
-## 🤖 Several agents at once
+## 👥 Several agents at once
 
 The agent can hand a self-contained piece of work to another agent with the
 `spawn_agent` tool. Each subagent is a session of its own — its own history,
@@ -112,11 +112,11 @@ model (`--subagent-model`) and its own system prompt, which the parent can
 set per subagent. Only its **final answer** comes back as the tool result:
 
 ```
-▸ [2] 🤖 spawn_agent(task="Read README.md and report its title", name="readme")
+▸ [2] 👥 spawn_agent(task="Read README.md and report its title", name="readme")
   ⎿  ✓ The title of the document is **Test project**. · 56.4s
 
-  ▸ 🤖 subagent files   ·  13 blocks  ·  reported back
-  ▸ 🤖 subagent readme  ·  6 blocks  ·  reported back
+  ▸ 👥 subagent files   ·  13 blocks  ·  reported back
+  ▸ 👥 subagent readme  ·  6 blocks  ·  reported back
   Responded (16.0s · ↑ 3.3k ↓ 115)
 ```
 

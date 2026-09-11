@@ -12,7 +12,7 @@ Claude Desktop, another agent framework, etc. — all sharing the same
 project-scope/approval-preview logic in tools.py.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .config import AgentConfig
 from .tools import Tools
@@ -25,7 +25,7 @@ from .tools import Tools
 cfg = AgentConfig.from_tool_server_env()
 impl = Tools(cfg)
 
-mcp = FastMCP("omni-tools")
+mcp = MCPServer("omni-tools")
 
 
 # ---- Tools exposed to any MCP client (these are what the LLM sees) ----

@@ -46,10 +46,10 @@ def tools(cfg):
 
 
 def write_mcp_server(path, name="toy", tools_src="", prompts_src="", resources_src=""):
-    """Write a runnable FastMCP stdio server script, for the live MCP tests."""
+    """Write a runnable MCPServer stdio server script, for the live MCP tests."""
     path.write_text(textwrap.dedent(f'''
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP({name!r})
+        from mcp.server.mcpserver import MCPServer
+        mcp = MCPServer({name!r})
         {textwrap.indent(textwrap.dedent(tools_src), "        ").strip()}
         {textwrap.indent(textwrap.dedent(prompts_src), "        ").strip()}
         {textwrap.indent(textwrap.dedent(resources_src), "        ").strip()}

@@ -282,7 +282,7 @@ def test_expand_env_reports_every_missing_variable(monkeypatch):
 # ---------------- schema shaping ----------------
 
 def test_mcp_schema_to_tool_schema(mocker):
-    tool = mocker.Mock(description="Reads a file", inputSchema={"type": "object", "properties": {"p": {}}})
+    tool = mocker.Mock(description="Reads a file", input_schema={"type": "object", "properties": {"p": {}}})
     out = _mcp_schema_to_tool_schema(tool, "srv__read")
     assert out["type"] == "function"
     assert out["function"]["name"] == "srv__read"
@@ -291,7 +291,7 @@ def test_mcp_schema_to_tool_schema(mocker):
 
 
 def test_mcp_schema_defaults_for_missing_description_and_schema(mocker):
-    tool = mocker.Mock(description=None, inputSchema=None)
+    tool = mocker.Mock(description=None, input_schema=None)
     out = _mcp_schema_to_tool_schema(tool, "n")["function"]
     assert out["description"] == ""
     assert out["parameters"] == {"type": "object", "properties": {}}
