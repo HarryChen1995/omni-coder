@@ -207,3 +207,25 @@ def grab_image() -> tuple:
     if not data or len(data) > MAX_BYTES:
         return None
     return mime, data
+
+
+def copy_text(text: str) -> bool:
+    """Put `text` on the system clipboard. True if some tool took it.
+
+    The counterpart to clipboard_text: a full-screen app owns the terminal's
+    mouse, so the transcript can also be handed to the clipboard directly
+    rather than only by dragging across what happens to be on screen."""
+    candidates = {
+        "darwin": [["pbcopy"]],
+        "win32": [["clip"]],
+    }.get(sys.platform, [["wl-copy"], ["xclip", "-selection", "clipboard"],
+                          ["xsel", "--clipboard", "--input"]])
+    payload = text.encode("utf-8")
+    for argv in candidates:
+        try:
+            result = _run(argv, input=payload)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return True
+    return False

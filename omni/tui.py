@@ -37,7 +37,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
-from prompt_toolkit.formatted_text.utils import split_lines
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text, split_lines
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
@@ -155,6 +155,19 @@ class Transcript(UIControl):
 
     def total_rows(self) -> int:
         return len(self._rows)
+
+    def plain_text(self, width: int) -> str:
+        """The whole transcript as text, styles dropped.
+
+        Rows are already laid out as fragments, so this is the same wrapping
+        the screen shows — including blocks that are scrolled off, which is
+        the part a drag across the visible screen can never reach."""
+        self._layout(width)
+        # rstrip: a row is padded out to the full width on screen (Rich
+        # centres a heading that way), and pasting those trailing spaces
+        # somewhere else is never what was wanted.
+        return "\n".join(fragment_list_to_text(fragments).rstrip()
+                           for fragments, _ in self._rows)
 
     def max_scroll(self, height: int) -> int:
         return max(len(self._rows) - height, 0)
@@ -357,6 +370,10 @@ class TuiApp:
         self._picking = False      # walking the agent tree with the keyboard
         self._pick_index = 0
         self._fold_task = None
+        # While this is on the app stops asking the terminal for mouse
+        # reports, which hands click-and-drag back to the terminal so its own
+        # selection and copy work. See the ctrl+s binding.
+        self._selecting = False
 
         self._queue: asyncio.Queue = asyncio.Queue()
         self._ticker = None
@@ -373,7 +390,9 @@ class TuiApp:
             key_bindings=self._build_keys(),
             style=_ui._PROMPT_STYLE,
             full_screen=True,
-            mouse_support=True,
+            # A filter, not True: the renderer turns mouse tracking off and on
+            # as this changes, which is what makes selection mode possible.
+            mouse_support=Condition(lambda: not self._selecting),
             erase_when_done=True,
         )
 
@@ -527,6 +546,18 @@ class TuiApp:
                 sys.stdout.write(text)
         sys.stdout.flush()
 
+    def copy_transcript(self, pane: Pane = None) -> tuple:
+        """Put the focused pane's transcript on the system clipboard.
+
+        Returns (copied, lines). Dragging across the screen can only ever
+        reach the rows the screen is showing; this takes the transcript
+        whole, in whatever open/closed state its blocks were left in."""
+        target = pane or self.pane
+        text = target.transcript.plain_text(self.transcript_width())
+        if not text.strip():
+            return False, 0
+        return clipboard.copy_text(text), text.count("\n") + 1
+
     # ---- the frame ----
 
     def _rule_with_chip(self):
@@ -618,6 +649,8 @@ class TuiApp:
 
     def _hint(self):
         switch = "  ·  ctrl+←→ switch" if len(self.panes) > 1 else ""
+        if self._selecting:
+            return _ui._hint_segments(self.model, _HINT_SELECTING)
         if self._choosing():
             return _ui._hint_segments(self.model,
                                        "↑↓ or click to choose  ·  or type your own  ·  "
@@ -936,11 +969,28 @@ class TuiApp:
         def _to_bottom(event):
             self.pane.transcript.scroll_to_bottom()
 
+        @keys.add("c-s")
+        def _toggle_selection(event):
+            """Hand the mouse back to the terminal, so text can be selected.
+
+            A full-screen app asks the terminal to report clicks and drags to
+            it, and a terminal that is reporting them is no longer doing its
+            own selection — which is why dragging across the transcript
+            selects nothing. Turning the reports off restores it; the cost is
+            that clicking ▸ to expand stops working until this is pressed
+            again, hence a toggle rather than a mode you can end up stuck in
+            without noticing. For the whole transcript, scrolled-off parts
+            included, /copy is the better answer."""
+            self._selecting = not self._selecting
+            self.invalidate()
+
         return keys
 
     # ---- running ----
 
     async def run(self):
+        if self._exit_requested:
+            return      # stopped before it ever started; don't take the screen
         self._ticker = asyncio.ensure_future(self._tick())
         try:
             await self._app.run_async()
@@ -1051,4 +1101,7 @@ class TuiApp:
             pane.ask[1].set_result(text)
 
 
-_HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  wheel/pgup scroll  ·  ctrl+d exit")
+_HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  ctrl+s select text  ·  "
+              "ctrl+d exit  ·  wheel/pgup scroll")
+_HINT_SELECTING = ("selecting: drag to select, then copy as usual  ·  "
+                    "ctrl+s back  ·  /copy takes the whole transcript")

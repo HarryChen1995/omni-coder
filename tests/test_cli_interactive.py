@@ -65,6 +65,7 @@ def scripted(mocker, lines):
             if main_pane.task is None or main_pane.task.done():
                 break
             await asyncio.sleep(0.005)
+        await asyncio.sleep(0)      # let the full-screen app, if any, start
         try:
             return main_pane, next(remaining)
         except StopIteration:
@@ -803,3 +804,59 @@ async def test_an_interrupted_subagent_is_marked_in_the_tree(tui_app, mocker, cf
     sub.outcome = "interrupted"
     rows = "".join(f[1] for f in tui_app._agent_tree())
     assert "✕" in rows and "interrupted" in rows
+
+
+# ---------------- /copy ----------------
+
+
+def test_copy_without_a_full_screen_app_points_at_the_scrollback(repl, capsys):
+    repl(["/copy"])
+    assert "scrollback" in capsys.readouterr().out
+
+
+def test_copy_hands_the_transcript_to_the_clipboard(mocker, client, cfg):
+    """End to end: a real TuiApp, running over a pipe, and "/copy" typed at it.
+
+    The app draws the transcript itself, so the terminal has no copy of it to
+    select from — this is the path that gets one out."""
+    import io
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    from rich.text import Text
+
+    from omni import ui
+    from omni.tui import TuiApp
+
+    copy = mocker.patch("omni.clipboard.copy_text", return_value=True)
+    mocker.patch.object(cli_mod, "_print_header")
+    mocker.patch("omni.ui.final_result")
+    apps = []
+
+    def fake_make_tui(commands, session_label, model):
+        app = TuiApp(commands, session_label, model)
+        app.emit(lambda: Text("what the model said"))
+        ui.use_tui(app)
+        apps.append(app)
+        return app
+
+    mocker.patch.object(cli_mod, "_make_tui", fake_make_tui)
+    scripted(mocker, ["/copy", "/exit"])
+
+    with create_pipe_input() as pipe:
+        output = Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=100),
+                               term="xterm-256color")
+        with create_app_session(input=pipe, output=output):
+            asyncio.run(cli_mod._interactive(cfg, None, None))
+
+    assert "what the model said" in copy.call_args.args[0]
+    # The confirmation goes into the transcript, since the app owns the screen.
+    # Blocks render lazily against the registered app, so put it back first.
+    ui.use_tui(apps[0])
+    try:
+        rendered = apps[0].main.transcript.plain_text(80)
+    finally:
+        ui.use_tui(None)
+    assert "Copied 1 line to the clipboard." in rendered

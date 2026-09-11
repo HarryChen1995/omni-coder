@@ -53,7 +53,9 @@ Run `omni --help` for the full option list.
   the whole result, or the entire chain of thought. Click again to close;
   the wheel and PageUp/PageDown scroll. `/expand <n>` and `/reasoning [n]`
   do the same from the keyboard. The transcript is written out on exit, so
-  it stays in your scrollback.
+  it stays in your scrollback. `ctrl+s` hands the mouse back to the terminal
+  when you want to select and copy by hand; `/copy` takes the whole
+  transcript to the clipboard, scrolled-off rows included.
 - **Subagents** — the agent can delegate a self-contained job with
   `spawn_agent`: the subagent gets its own session, step budget, and
   optionally its own model (`--subagent-model`) and system prompt, and only

@@ -426,6 +426,9 @@ MCP prompt exposed by a connected server. Special inputs:
   Arguments are positional, matched in order against the prompt's declared
   argument list (quote a value to include spaces, e.g. `/docs:search "foo bar"`)
 - `/delete <id-or-name>` — delete a saved session without leaving the REPL
+- `/copy` — copy this agent's transcript to the system clipboard, whole,
+  including the parts that have scrolled off screen (`ctrl+s` is the other
+  way: it hands the mouse back to the terminal so you can select by hand)
 - `/compact` — summarize the current session's history down to the system
   prompt, original task, and most recent messages (`--compact-keep-last`,
   default 20), replacing everything older with an LLM-written briefing.
@@ -507,6 +510,18 @@ thought — and clicking again closes it. The mouse wheel and PageUp/PageDown
 scroll; new output pulls the view back to the bottom unless you have scrolled
 up. `/expand <n>` and `/reasoning [n]` do the same thing from the keyboard,
 by the number each block carries.
+
+Selecting text is the other side of that coin. While the application is
+drawing the transcript it asks the terminal to report mouse clicks and drags
+to it, and a terminal that is reporting them is no longer doing its own
+selection — so dragging across the transcript highlights nothing. `ctrl+s`
+hands the mouse back: drag and copy exactly as you would in any other
+terminal window, and `ctrl+s` again returns clicking on `▸`. (Most terminals
+also reserve a modifier that overrides mouse reporting for one drag — ⌥ in
+iTerm2, fn in macOS Terminal.app, ⇧ in xterm and gnome-terminal — which works
+here too and needs no mode.) For the whole transcript rather than what happens
+to be on screen, `/copy` puts it on the system clipboard, scrolled-off rows
+included.
 
 Why full-screen at all: a terminal owns everything already printed to it.
 Text that has scrolled cannot be rewritten, and mouse clicks reach only the

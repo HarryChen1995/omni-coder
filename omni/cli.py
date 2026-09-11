@@ -59,6 +59,7 @@ _STATIC_COMMANDS = {
     "/sessions": "list saved sessions",
     "/delete ": "delete a saved session — /delete <id-or-name>",
     "/compact": "summarize this session's history down to a briefing",
+    "/copy": "copy this agent's transcript to the system clipboard",
     "/reasoning": "show a reply's chain of thought in full — /reasoning [n]",
     "/agent": "the agents in this session — /agent <n> switches, /agent close <n> drops one",
     "/expand ": "reprint one tool call whole, arguments and result — /expand <n>",
@@ -574,6 +575,25 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                             session_id = None  # the session we were resuming just got deleted
                     else:
                         _echo(f"No session found with id or name {target!r}.", err=True)
+                    continue
+                if task == "/copy":
+                    # The full-screen app draws the transcript itself, so the
+                    # terminal has no copy of it to select from — see
+                    # TuiApp.copy_transcript. Without the app the transcript
+                    # is ordinary scrollback and already selectable.
+                    if tui is None:
+                        _echo("Nothing to copy: the transcript is your terminal's own "
+                                   "scrollback here, so select it there.")
+                        continue
+                    copied, lines = tui.copy_transcript(pane)
+                    if not lines:
+                        _echo("Nothing to copy yet — this agent's transcript is empty.")
+                    elif copied:
+                        _echo(f"Copied {lines} line{'s' if lines != 1 else ''} "
+                                   "to the clipboard.")
+                    else:
+                        _echo("Couldn't reach a clipboard tool "
+                                   "(pbcopy / wl-copy / xclip / xsel).", err=True)
                     continue
                 if task == "/compact":
                     if session_id is None:

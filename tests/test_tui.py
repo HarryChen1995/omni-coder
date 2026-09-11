@@ -170,6 +170,9 @@ def test_a_click_maps_through_the_scroll_offset():
 # it should — that is the whole reason there is only ever one place to type.
 
 import asyncio
+import contextlib
+import io
+import re
 
 from omni import ui
 from omni.tui import TuiApp
@@ -605,3 +608,167 @@ def test_closing_a_pane_by_hand(app):
 
 def test_main_cannot_be_closed(app):
     assert app.close_pane(app.main) is False
+
+
+# ---------------- copying the transcript ----------------
+#
+# A full-screen app asks the terminal to report the mouse to it, and a
+# terminal that is reporting the mouse is no longer doing its own selection —
+# which is why dragging across the transcript selected nothing. Two answers,
+# both checked here: ctrl+s hands the mouse back, and /copy takes the whole
+# transcript (scrolled-off rows included) to the clipboard.
+
+from prompt_toolkit.keys import Keys
+
+
+def key_handler(application, *keys):
+    """The handler bound to a key combination and enabled right now."""
+    for b in application._app.key_bindings.bindings:
+        if b.keys == keys and b.filter():
+            return b.handler
+    raise AssertionError(f"no active binding for {keys}")
+
+
+def test_selection_mode_turns_the_mouse_filter_off_and_on(app, mocker):
+    assert app._app.mouse_support() is True
+    key_handler(app, Keys.ControlS)(mocker.Mock())
+    assert app._selecting is True and app._app.mouse_support() is False
+    key_handler(app, Keys.ControlS)(mocker.Mock())
+    assert app._selecting is False and app._app.mouse_support() is True
+
+
+def test_selection_mode_says_how_to_leave(app, mocker):
+    key_handler(app, Keys.ControlS)(mocker.Mock())
+    hint = "".join(t for _, t in app._hint())
+    assert "ctrl+s" in hint and "/copy" in hint
+
+
+def test_the_idle_hint_mentions_selecting(app):
+    assert "ctrl+s" in "".join(t for _, t in app._hint())
+
+
+def test_plain_text_drops_styles_and_padding():
+    t = Transcript()
+    t.add(plain("styled line"))
+    t.add(foldable("B", opened=2))
+    assert t.plain_text(60) == "styled line\nB collapsed"
+    t.blocks[1].toggle()
+    assert t.plain_text(60) == "styled line\nB open 0\nB open 1"
+
+
+def test_copy_takes_rows_the_screen_never_showed(app, mocker):
+    copy = mocker.patch("omni.clipboard.copy_text", return_value=True)
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"line {i}"))
+    app.pane.transcript.create_content(60, 5)     # only five rows on screen
+    copied, lines = app.copy_transcript()
+    assert (copied, lines) == (True, 40)
+    assert "line 0" in copy.call_args.args[0] and "line 39" in copy.call_args.args[0]
+
+
+def test_copy_reports_an_empty_transcript(app):
+    assert app.copy_transcript() == (False, 0)
+
+
+def test_copy_reports_a_clipboard_it_could_not_reach(app, mocker):
+    mocker.patch("omni.clipboard.copy_text", return_value=False)
+    app.emit(lambda: Text("something"))
+    assert app.copy_transcript() == (False, 1)
+
+
+def test_copy_takes_the_pane_it_was_typed_at(app, mocker):
+    copy = mocker.patch("omni.clipboard.copy_text", return_value=True)
+    sub = app.add_pane("audit", depth=1)
+    app.emit(lambda: Text("main output"))
+    app.emit(lambda: Text("subagent output"), pane=sub)
+    app.copy_transcript(sub)
+    assert copy.call_args.args[0] == "subagent output"
+
+
+# ---------------- end to end, against a real VT100 stream ----------------
+#
+# The checks above are about the app's own state; these run the application
+# for real over a pipe and read the bytes it writes, because the thing that
+# was broken lives in those bytes: ?1000h is the terminal being told to send
+# mouse reports here instead of selecting text.
+
+MOUSE_ON = "\x1b[?1000h"
+MOUSE_OFF = "\x1b[?1000l"
+
+
+@contextlib.asynccontextmanager
+async def running_app(mocker, blocks=()):
+    """A TuiApp running over a pipe, plus the terminal stream it writes."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    mocker.patch("omni.ui.instruction")
+    stream = io.StringIO()
+    with create_pipe_input() as pipe:
+        output = Vt100_Output(stream, lambda: Size(rows=24, columns=100),
+                               term="xterm-256color")
+        with create_app_session(input=pipe, output=output):
+            application = TuiApp({"/exit": "leave"}, "my-session", "my-model")
+            ui.use_tui(application)
+            for build in blocks:
+                application.emit(build)
+            runner = asyncio.ensure_future(application.run())
+            await settle()
+            try:
+                yield application, pipe, stream
+            finally:
+                if application._app.is_running:
+                    application._app.exit()
+                await runner
+                ui.use_tui(None)
+
+
+async def settle(rounds: int = 40):
+    """Let the app read its input and repaint."""
+    for _ in range(rounds):
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_s_hands_the_mouse_back_to_the_terminal(mocker):
+    async with running_app(mocker) as (application, pipe, stream):
+        assert MOUSE_ON in stream.getvalue()      # tracking on: no selection
+
+        mark = len(stream.getvalue())
+        pipe.send_text("\x13")                    # ctrl+s
+        await settle()
+        assert application._selecting is True
+        assert MOUSE_OFF in stream.getvalue()[mark:]   # the terminal has it back
+
+        mark = len(stream.getvalue())
+        pipe.send_text("\x13")
+        await settle()
+        assert application._selecting is False
+        assert MOUSE_ON in stream.getvalue()[mark:]    # and clicking works again
+
+
+@pytest.mark.asyncio
+async def test_selection_mode_leaves_the_transcript_and_typing_alone(mocker):
+    from rich.markdown import Markdown
+
+    async with running_app(mocker, [lambda: Markdown("# Title\n\n- one\n- two")]) \
+            as (application, pipe, stream):
+        pipe.send_text("\x13")                    # into selection mode
+        pipe.send_text("hello")
+        await settle()
+        screen = stream.getvalue()
+        assert application._buffer.text == "hello"     # the keyboard still works
+        assert "Title" in screen and "one" in screen   # markdown still rendered
+        # Styled, not flattened: the heading is still bold on the wire.
+        assert re.search(r"\x1b\[[0-9;]*1m", screen)
+
+
+@pytest.mark.asyncio
+async def test_the_running_app_copies_its_transcript(mocker):
+    copy = mocker.patch("omni.clipboard.copy_text", return_value=True)
+    async with running_app(mocker, [lambda: Text("first"), lambda: Text("second")]) \
+            as (application, pipe, stream):
+        assert application.copy_transcript() == (True, 2)
+        assert copy.call_args.args[0] == "first\nsecond"
