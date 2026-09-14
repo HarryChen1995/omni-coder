@@ -2,7 +2,84 @@
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
+
+# ---- the settings file -----------------------------------------------------
+#
+# ~/.omni-coder/omni-coder-settings.json, the same file MCP servers are
+# registered in. It has always been a general settings file rather than an MCP
+# one (save_mcp_config is careful to leave other top-level keys alone); these
+# helpers are the non-MCP half of it, so a preference set once from the REPL
+# survives into every later run.
+
+THEME_COLOR_KEY = "themeColor"
+
+_HEX_COLOR_RE = re.compile(r"#?[0-9a-fA-F]{6}")
+
+
+def normalize_hex_color(value: str) -> str:
+    """`value` as "#rrggbb", or None if it isn't a 6-digit hex colour.
+
+    The leading "#" is optional on the way in because both places a colour is
+    typed — the --theme-color flag and /theme-color — are shells or shell-like
+    prompts where "#" starts a comment often enough to be worth forgiving.
+    Three-digit shorthand is deliberately not accepted: "#abc" is as likely to
+    be a typo for a six-digit value as it is to be shorthand, and guessing
+    wrong here silently recolours the whole UI."""
+    text = (value or "").strip()
+    if not _HEX_COLOR_RE.fullmatch(text):
+        return None
+    return text if text.startswith("#") else f"#{text}"
+
+
+def settings_path() -> str:
+    """Where the settings file lives. Imported lazily: mcp_client owns this
+    path (it also migrates the file's old name), and it pulls in the MCP SDK,
+    which nothing here otherwise needs."""
+    from .mcp_client import default_mcp_config_path
+    return default_mcp_config_path()
+
+
+def load_settings(path: str = None) -> dict:
+    """The settings file as a dict — empty if it's missing, unreadable or
+    corrupt. A broken settings file must not stop the agent from starting; the
+    cost of ignoring it is falling back to defaults, which is what a fresh
+    install does anyway."""
+    path = path or settings_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def save_setting(key: str, value, path: str = None) -> str:
+    """Write one top-level key, preserving everything else in the file
+    (`mcpServers` above all). `value` of None removes the key.
+
+    Returns the path written to, so a caller can tell the user where the
+    preference landed. Raises OSError if the file can't be written — a
+    save that silently didn't is worse than an error message."""
+    path = path or settings_path()
+    data = load_settings(path)
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    return path
+
+
+def saved_theme_color(path: str = None) -> str:
+    """The accent colour saved by /theme-color, or "" if none is set (or what
+    is set isn't a usable hex — a hand-edited settings file shouldn't be able
+    to paint the UI an unparseable colour)."""
+    return normalize_hex_color(load_settings(path).get(THEME_COLOR_KEY)) or ""
 
 
 @dataclass

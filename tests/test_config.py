@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from omni import config
 from omni.config import AgentConfig
 
 
@@ -150,3 +151,68 @@ def test_from_tool_server_env_reads_os_environ_by_default(monkeypatch):
     monkeypatch.setenv("AGENT_SHELL_TIMEOUT_S", "3")
     restored = AgentConfig.from_tool_server_env()
     assert restored.project_root == "/from/environ" and restored.shell_timeout_s == 3
+
+
+# ---------------- the settings file ----------------
+
+@pytest.fixture
+def settings(tmp_path):
+    return str(tmp_path / "omni-coder-settings.json")
+
+
+@pytest.mark.parametrize("given,expected", [
+    ("#00b4d8", "#00b4d8"),
+    ("00b4d8", "#00b4d8"),       # the "#" is optional — shells eat it
+    ("  #00B4D8  ", "#00B4D8"),
+])
+def test_a_hex_colour_is_normalized(given, expected):
+    assert config.normalize_hex_color(given) == expected
+
+
+@pytest.mark.parametrize("bad", ["blue", "#12345", "#1234567", "#gggggg", "", None, "#abc"])
+def test_anything_that_is_not_six_hex_digits_is_refused(bad):
+    """Including "#abc": three-digit shorthand is as likely to be a typo, and
+    guessing wrong silently recolours the whole UI."""
+    assert config.normalize_hex_color(bad) is None
+
+
+def test_a_setting_round_trips(settings):
+    config.save_setting(config.THEME_COLOR_KEY, "#00b4d8", path=settings)
+    assert config.saved_theme_color(settings) == "#00b4d8"
+
+
+def test_saving_a_setting_leaves_the_mcp_servers_alone(settings):
+    """The same file holds registered MCP servers — a preference written here
+    must not cost the user their servers."""
+    with open(settings, "w") as f:
+        json.dump({"mcpServers": {"docs": {"command": "node"}}}, f)
+    config.save_setting(config.THEME_COLOR_KEY, "#00b4d8", path=settings)
+    data = json.load(open(settings))
+    assert data["mcpServers"] == {"docs": {"command": "node"}}
+    assert data[config.THEME_COLOR_KEY] == "#00b4d8"
+
+
+def test_a_setting_can_be_cleared(settings):
+    config.save_setting(config.THEME_COLOR_KEY, "#00b4d8", path=settings)
+    config.save_setting(config.THEME_COLOR_KEY, None, path=settings)
+    assert config.saved_theme_color(settings) == ""
+    assert config.THEME_COLOR_KEY not in json.load(open(settings))
+
+
+def test_a_missing_or_corrupt_settings_file_reads_as_no_settings(tmp_path):
+    """A broken settings file falls back to defaults rather than stopping the
+    agent from starting."""
+    assert config.load_settings(str(tmp_path / "nope.json")) == {}
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not json")
+    assert config.load_settings(str(corrupt)) == {}
+    assert config.saved_theme_color(str(corrupt)) == ""
+    listy = tmp_path / "list.json"
+    listy.write_text("[1, 2]")
+    assert config.load_settings(str(listy)) == {}
+
+
+def test_a_hand_edited_junk_colour_does_not_reach_the_ui(settings):
+    with open(settings, "w") as f:
+        json.dump({config.THEME_COLOR_KEY: "chartreuse"}, f)
+    assert config.saved_theme_color(settings) == ""

@@ -125,6 +125,150 @@ def set_accent(color: str):
     ACCENT = color or DEFAULT_ACCENT
     _PROMPT_STYLE = _build_prompt_style()
 
+
+# --------------------------------------------------------------------------
+# Shimmer
+#
+# A highlight that travels along a label while the turn behind it is still
+# unfinished. It says "still alive" the way a spinner does, but across the
+# words themselves, so a stalled turn is obvious even when the eye is nowhere
+# near the glyph.
+#
+# Everywhere the session is mid-turn and text alone would look frozen:
+#   - what an agent is doing (the status line, and each working row in the
+#     tree), which is the thing a spinner already sits beside
+#   - what an agent is waiting on you for (an approval, a question it asked,
+#     and the tree row that says so), where nothing else on screen moves at
+#     all and a stopped turn is otherwise indistinguishable from a busy one
+#
+# Not the spinner glyph or the tool icons: a glyph that already animates
+# gains nothing from a second animation on top of it.
+#
+# The colours are mixed out of ACCENT rather than picked, for the same reason
+# the mascot's are (see _tone_color): --theme-color has to recolour the whole
+# UI, and a shimmer hard-coded to rust would be the one thing left behind.
+# Resting text sits *below* ACCENT's lightness and the crest goes above it and
+# desaturates toward white, so the band reads as light passing over the word
+# rather than as the word changing colour.
+# --------------------------------------------------------------------------
+
+# Columns per second, not a fixed period: a long label and a short one should
+# shimmer at the same *speed*, or "Running write_file…" and a wrapped tool
+# summary end up visibly racing each other in the same tree.
+_SHIMMER_SPEED = 18.0
+_SHIMMER_BAND = 7.0       # half-width of the crest, in characters
+_SHIMMER_GAP = 11.0       # blank columns after the crest leaves, before the next
+_SHIMMER_REST = 0.52      # lightness of the text the crest hasn't reached...
+_SHIMMER_REST_SAT = 0.82  # ...a touch under ACCENT's own, so it sits back
+_SHIMMER_CREST = 0.93     # lightness at the centre of the crest
+_SHIMMER_CREST_SAT = 0.55  # ...and how much of ACCENT's saturation is left there
+
+
+def _accent_rgb():
+    """ACCENT as (r, g, b) floats, or None if it isn't a #rrggbb hex — a named
+    colour has no channels to mix, and every caller has a flat fallback."""
+    try:
+        return tuple(int(ACCENT[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _accent_at(lightness: float, saturation: float = 1.0):
+    """ACCENT's own hue and saturation at a different lightness, as #RRGGBB.
+
+    One knob for every shade this UI derives from the theme colour, so they
+    all move together when the theme does."""
+    rgb = _accent_rgb()
+    if rgb is None:
+        return None
+    hue, _, sat = colorsys.rgb_to_hls(*rgb)
+    r, g, b = colorsys.hls_to_rgb(hue, min(max(lightness, 0.0), 1.0),
+                                   min(max(sat * saturation, 0.0), 1.0))
+    return "#%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    """`a` and `b` are #rrggbb; t=0 gives a, t=1 gives b."""
+    ar, ag, ab = (int(a[i:i + 2], 16) for i in (1, 3, 5))
+    br, bg, bb = (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02X%02X%02X" % (round(ar + (br - ar) * t), round(ag + (bg - ag) * t),
+                               round(ab + (bb - ab) * t))
+
+
+def shimmer_runs(text: str, now: float = None, offset: float = 0.0) -> list:
+    """`text` cut into [(hex colour, chunk)] for one frame of the shimmer.
+
+    Runs rather than one entry per character: the crest only covers a stretch
+    of the word at a time, so everything it hasn't reached shares the resting
+    colour and collapses into a single chunk. That keeps a 60-character label
+    at a handful of fragments instead of sixty, which matters because this is
+    rebuilt on every repaint.
+
+    `offset` shifts a label's place in the cycle — the agent tree passes each
+    row a different one, so several working subagents don't pulse in lockstep
+    like a row of blinking lights.
+
+    None when the theme colour isn't mixable (a named colour) or there's
+    nothing to shimmer; callers fall back to a flat style."""
+    if not text:
+        return None
+    rest = _accent_at(_SHIMMER_REST, _SHIMMER_REST_SAT)
+    if rest is None:
+        return None
+    crest = _accent_at(_SHIMMER_CREST, _SHIMMER_CREST_SAT)
+    now = time.monotonic() if now is None else now
+    length = len(text)
+    # The crest enters one band-width before the first character and leaves one
+    # past the last, then _SHIMMER_GAP columns of nothing before it comes round
+    # again — a highlight that restarts the instant it arrives reads as a
+    # flicker rather than as something passing over the words.
+    travel = length + 2 * _SHIMMER_BAND + _SHIMMER_GAP
+    centre = -_SHIMMER_BAND + ((now + offset) * _SHIMMER_SPEED) % travel
+
+    runs = []
+    for i, char in enumerate(text):
+        distance = abs(i - centre) / _SHIMMER_BAND
+        k = 0.0 if distance >= 1.0 else 1.0 - distance
+        k = k * k * (3 - 2 * k)      # smoothstep — no hard edge on the band
+        color = rest if k <= 0.0 else _mix(rest, crest, k)
+        if runs and runs[-1][0] == color:
+            runs[-1][1] += char
+        else:
+            runs.append([color, char])
+    return [(color, chunk) for color, chunk in runs]
+
+
+def shimmer_fragments(text: str, handler=None, bold: bool = True, offset: float = 0.0,
+                       flat: str = "class:frame.label", now: float = None) -> list:
+    """The shimmer as prompt_toolkit fragments, for the full-screen UI.
+
+    `handler` is threaded through because the rows this styles are clickable
+    (the agent tree), and prompt_toolkit attaches a mouse handler per
+    fragment — splitting a row into runs would otherwise cost it its click."""
+    runs = shimmer_runs(text, now=now, offset=offset)
+    if runs is None:
+        runs = [(None, text)]
+    weight = "bold " if bold else ""
+    fragments = []
+    for color, chunk in runs:
+        style = flat if color is None else f"{weight}{color}"
+        fragments.append((style, chunk, handler) if handler else (style, chunk))
+    return fragments
+
+
+def shimmer_text(text: str, bold: bool = True, now: float = None) -> Text:
+    """The shimmer as a Rich Text, for the one-shot runs that draw their own
+    frame instead of going through the full-screen app."""
+    runs = shimmer_runs(text, now=now)
+    if runs is None:
+        return Text(text, style=f"bold {ACCENT}" if bold else ACCENT)
+    weight = "bold " if bold else ""
+    out = Text()
+    for color, chunk in runs:
+        out.append(chunk, style=f"{weight}{color}")
+    return out
+
+
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
@@ -303,13 +447,9 @@ def _tone_color(tone: str):
     lightness = _MASCOT_LIGHTNESS[tone]
     if lightness is None:
         return ACCENT
-    try:
-        r, g, b = (int(ACCENT[i:i + 2], 16) / 255 for i in (1, 3, 5))
-    except (ValueError, IndexError):
-        return ACCENT          # a named colour, not #rrggbb — nothing to mix
-    hue, _, sat = colorsys.rgb_to_hls(r, g, b)
-    r, g, b = colorsys.hls_to_rgb(hue, lightness, sat)
-    return "#%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
+    # None when ACCENT is a named colour, not #rrggbb — nothing to mix, so
+    # the tone falls back to the accent itself.
+    return _accent_at(lightness) or ACCENT
 
 
 def _mascot(width: int) -> Text:
@@ -545,8 +685,12 @@ _DEFAULT_LABEL = "omni-coder"
 
 # noreverse/bg:default: prompt_toolkit renders a bottom toolbar as reverse
 # video by default, which would paint a solid bar across the terminal.
-def _hint_segments(model: str, keys: str) -> list:
+def _hint_segments(model: str, keys: str, shimmer: bool = False) -> list:
     """The hint line: the live model name, then the key reminders.
+
+    `shimmer` is for the one thing that appears here and isn't a reminder: a
+    question the model asked you. Nothing else on screen moves while it waits
+    for an answer, so without it the line reads as furniture.
 
     The model belongs here rather than only in the startup header — the header
     is scrollback and can't be updated in place, so a /model switch would
@@ -556,7 +700,10 @@ def _hint_segments(model: str, keys: str) -> list:
     segments = [("class:frame.hint", "  ")]
     if model:
         segments += [("class:frame.model", model), ("class:frame.hint", "  ·  ")]
-    segments.append(("class:frame.hint", keys))
+    if shimmer:
+        segments += shimmer_fragments(keys)
+    else:
+        segments.append(("class:frame.hint", keys))
     return segments
 
 
@@ -578,6 +725,11 @@ def _build_prompt_style() -> Style:
         "agent.attention": "#d29922",     # amber: waiting on you
         "frame.spinner": f"bold {ACCENT}",
         "frame.label": f"bold {ACCENT}",
+        # A label that styled itself is saying something out of the ordinary
+        # (the retry warning is the only one that does). Amber rather than the
+        # accent, and flat rather than shimmering, for the same reason it is
+        # yellow on the Rich side: it should not read as business as usual.
+        "frame.label.attention": "bold #d29922",
         "prompt.arrow": f"bold {ACCENT}",
         # bg:default everywhere except the selected row: prompt_toolkit's stock
         # menu paints a solid block, and since the menu is a full-width member of
@@ -605,6 +757,19 @@ def _plain(label: str) -> str:
     """Rich markup stripped: the busy line is drawn by prompt_toolkit, which
     would print "[bold yellow]…[/bold yellow]" literally."""
     return _MARKUP_RE.sub("", label or "")
+
+
+def _label_text(label: str) -> Text:
+    """A live label as Rich text: the shimmer for a plain one, its own colours
+    for one that arrives already marked up.
+
+    The retry warning is the only label that styles itself ([bold yellow] from
+    agent._call_model), and it is styled precisely so it reads as *not* the
+    ordinary case — shimmering it in the theme colour would erase the one
+    thing it was saying."""
+    if _MARKUP_RE.search(label or ""):
+        return Text.from_markup(label)
+    return shimmer_text(label)
 
 
 def _chip(session_label: str) -> Text:
@@ -655,7 +820,8 @@ class _BottomFrame:
         already sitting in the transcript above, so echoing an idle "❯" here
         would just be furniture claiming to accept input it can't take."""
         elapsed = _format_elapsed(time.monotonic() - self._phase_start)
-        label = Text.from_markup(f"{self._label} [dim]({elapsed})[/dim]")
+        label = _label_text(self._label)
+        label.append(f" ({elapsed})", style="dim")
         # Every line of the frame must occupy exactly one row: Live repaints by
         # moving the cursor back over the previous render, so a line that wraps
         # at one width and not another throws that arithmetic off and leaves
@@ -679,7 +845,10 @@ class _BottomFrame:
         line.append(_HINT_BUSY, style=_FRAME_HINT)
         return line
 
-    async def _tick(self, interval: float = 0.15):
+    async def _tick(self, interval: float = 0.08):
+        # Twice the old rate: a spinner reads fine at 7fps because it only has
+        # ten states, but a highlight sliding along a word shows every dropped
+        # frame as a stutter.
         width = console.width
         try:
             while True:
@@ -710,7 +879,9 @@ class _BottomFrame:
             return
         self._session = session_label
         self._model = model
-        self._label = f"[bold {ACCENT}]{label}[/bold {ACCENT}]"
+        # Stored plain, not pre-styled: _render colours it per frame, which is
+        # what lets the shimmer move along it.
+        self._label = label
         self._phase_start = time.monotonic()
         # transient: erase the frame on close so it doesn't pile up in the
         # scrollback, one copy per turn.
@@ -833,10 +1004,10 @@ class _TickingSpinner:
     colored retry message) — this class only appends the ticking suffix,
     it doesn't impose its own styling on updates."""
 
-    def __init__(self, label: str, interval: float = 0.15):
+    def __init__(self, label: str, interval: float = 0.08):
         self._label = label
         self._interval = interval
-        self._spinner = Spinner("dots", text=label, style=ACCENT)
+        self._spinner = Spinner("dots", text=_label_text(label), style=ACCENT)
         # auto_refresh=False plus redirect_stdout/stderr=False: drive every
         # redraw from this class's own tick loop alone — console.status()'s
         # default Live spawns its OWN background refresh thread and
@@ -856,7 +1027,9 @@ class _TickingSpinner:
             while True:
                 try:
                     elapsed = _format_elapsed(time.monotonic() - self._start)
-                    self._spinner.update(text=f"{self._label} ({elapsed})")
+                    text = _label_text(self._label)
+                    text.append(f" ({elapsed})", style="dim")
+                    self._spinner.update(text=text)
                     self._live.refresh()
                 except Exception:
                     pass  # one bad frame, not a dead ticker (see _BottomFrame._tick)
@@ -887,10 +1060,11 @@ def thinking(label: str = "Thinking…"):
     Either way the returned object is a context manager with .update()."""
     if _tui is not None:
         return _TuiPhase(_tui, label)
-    styled = f"[bold {ACCENT}]{label}[/bold {ACCENT}]"
+    # Passed through unstyled: both renderers below colour the label
+    # themselves, one frame at a time, which is what the shimmer needs.
     if _frame.is_open:
-        return _frame.phase(styled)
-    return _TickingSpinner(styled)
+        return _frame.phase(label)
+    return _TickingSpinner(label)
 
 
 class _TuiPhase:

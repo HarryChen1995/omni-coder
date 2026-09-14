@@ -467,12 +467,20 @@ class TuiApp:
             picked = self._picking and index == self._pick_index
             name_style = ("class:agent.picked" if picked else
                            "class:agent.active" if index == self.focused else "class:agent")
-            note = ""
+            # A working row's note shimmers like the status line does, so a
+            # subagent still going is visible from the tree without switching
+            # to its tab. Each row is offset in the cycle by its position:
+            # three subagents pulsing in lockstep read as one blinking widget
+            # rather than three agents working.
+            note, shimmer = "", None
             if pane.busy and pane.status:
-                note = f"  {_ui._plain(pane.status)} " \
-                        f"({_ui._format_elapsed(time.monotonic() - pane.phase_start)})"
+                shimmer = f"  {_ui._plain(pane.status)}"
+                note = f" ({_ui._format_elapsed(time.monotonic() - pane.phase_start)})"
             elif pane.needs_you:
-                note = "  waiting for you"
+                # Shimmered for the same reason as the approval line: a
+                # subagent blocked on a question is the one row worth walking
+                # over to, and it is also the only row where nothing moves.
+                shimmer = "  waiting for you"
             elif pane.outcome == "interrupted":
                 note = "  interrupted"
             elif pane.outcome == "error":
@@ -490,10 +498,23 @@ class TuiApp:
             # leading 0 beside the session name read like one.
             label = "main" if index == 0 else f"{index} {pane.name}"
             fragments.append((name_style, label, handler))
+            if shimmer:
+                fragments += _ui.shimmer_fragments(shimmer, handler=handler,
+                                                    offset=index * 0.6)
             fragments.append(("class:frame.hint", note, handler))
             if not last:
                 fragments.append(("", "\n"))
         return fragments
+
+    def restyle(self):
+        """Pick up a new accent colour (/theme-color) without a restart.
+
+        The app was constructed with a copy of ui's style map, so recolouring
+        ui alone leaves the frame, the tree and the prompt on the old accent.
+        prompt_toolkit reads Application.style through a DynamicStyle, so
+        replacing it here is enough — the next repaint uses it."""
+        self._app.style = _ui._PROMPT_STYLE
+        self.invalidate()
 
     def invalidate(self):
         try:
@@ -587,15 +608,34 @@ class TuiApp:
             counted = _ui.format_tokens(tokens.get("prompt", 0), tokens.get("completion", 0))
             if counted:
                 detail += f" · {counted}"
-        return [("class:frame.spinner", f"{glyph} "),
-                 ("class:frame.label", _ui._plain(pane.status)),
-                 ("class:frame.hint", f"  ({detail})")]
+        # The glyph and the counter stay put; the shimmer runs along the
+        # words, which is the part worth looking at.
+        # A status that arrived already marked up is the retry warning, the
+        # one label that isn't business as usual. prompt_toolkit can't read
+        # Rich markup, so the markup is stripped either way — but it still
+        # tells us to drop the shimmer and say so in amber, which is what the
+        # Rich frame does with the colours the markup actually carries.
+        label = _ui._plain(pane.status)
+        if _ui._MARKUP_RE.search(pane.status or ""):
+            words = [("class:frame.label.attention", label)]
+        else:
+            words = _ui.shimmer_fragments(label)
+        return ([("class:frame.spinner", f"{glyph} ")] + words
+                 + [("class:frame.hint", f"  ({detail})")])
 
     def _approve_line(self):
+        """The y/n question, shimmering like a working label does.
+
+        It earns the motion more than the status line does: nothing moves
+        while an approval waits, so a turn that has quietly stopped on one
+        looks identical to a turn still thinking. The pane is still marked
+        busy underneath (mode only *reports* "approve" first), which is what
+        keeps the ticker repainting this."""
         pane = self.pane
         question = pane.approval[0] if pane.approval else ""
-        return [("class:prompt.arrow", "❯ "), ("class:frame.label", question),
-                 ("class:frame.hint", "   y / n")]
+        return ([("class:prompt.arrow", "❯ ")]
+                 + _ui.shimmer_fragments(_ui._plain(question))
+                 + [("class:frame.hint", "   y / n")])
 
     def _options_lines(self):
         """The choices, with the highlighted one marked. Each row carries its
@@ -656,7 +696,9 @@ class TuiApp:
                                        "↑↓ or click to choose  ·  or type your own  ·  "
                                        "⏎ submit  ·  ctrl+c dismiss")
         if self._asking():
-            return _ui._hint_segments(self.model, self.pane.ask[0] if self.pane.ask else "")
+            return _ui._hint_segments(self.model,
+                                       _ui._plain(self.pane.ask[0]) if self.pane.ask else "",
+                                       shimmer=True)
         if self._approving():
             return _ui._hint_segments(self.model, "y approve  ·  n deny  ·  ctrl+c interrupt")
         if self._busy():
@@ -998,12 +1040,20 @@ class TuiApp:
             self._ticker.cancel()
             self._ticker = None
 
-    async def _tick(self, interval: float = 0.1):
-        """Repaint while anything is working, so spinners turn and counters
-        climb — including a subagent's, which shows in its tab."""
+    async def _tick(self, interval: float = 0.07):
+        """Repaint while anything is working, so spinners turn, counters climb
+        and the shimmer moves — including a subagent's, which shows in its tab.
+
+        Faster than the spinner alone needs: a highlight travelling along a
+        label shows every dropped frame as a stutter, where a ten-state glyph
+        doesn't."""
         try:
             while True:
-                if any(p.busy for p in self.panes):
+                # needs_you as well as busy: a pane blocked on an approval is
+                # normally still marked busy underneath, but a shimmer that
+                # freezes because it wasn't is the one case where the motion
+                # would be actively misleading.
+                if any(p.busy or p.needs_you for p in self.panes):
                     self.invalidate()
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:

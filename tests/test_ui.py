@@ -661,6 +661,108 @@ async def test_an_empty_answer_counts_as_dismissed(cap, mocker):
     assert await ui.ask_user("q") is None
 
 
+# ---------------- the shimmer ----------------
+
+def _brightness(hex_colour: str) -> int:
+    return sum(int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def test_shimmer_runs_reproduce_the_label_exactly():
+    """Whatever the colouring does, the words must survive it — the status
+    line is text first and an animation second."""
+    label = "Running read_file…"
+    for frame in range(60):
+        runs = ui.shimmer_runs(label, now=frame / 17)
+        assert "".join(chunk for _, chunk in runs) == label
+
+
+def test_the_crest_travels_left_to_right_and_then_rests():
+    label = "Running read_file…"
+
+    def crest_at(now):
+        runs = ui.shimmer_runs(label, now=now)
+        if len(runs) == 1:
+            return None                       # resting: the crest is off the text
+        best = max(range(len(runs)), key=lambda i: _brightness(runs[i][0]))
+        return sum(len(chunk) for _, chunk in runs[:best])
+
+    positions = [p for p in (crest_at(t / 4) for t in range(7)) if p is not None]
+    assert positions == sorted(positions) and positions[-1] > positions[0]
+    # and one full cycle later it is back where it started
+    assert crest_at(0.5) == crest_at(0.5 + (len(label) + 2 * ui._SHIMMER_BAND
+                                             + ui._SHIMMER_GAP) / ui._SHIMMER_SPEED)
+
+
+def test_a_resting_label_is_a_single_run():
+    """Nothing to gradate while the crest is off the text, so it collapses to
+    one fragment — this is rebuilt on every repaint."""
+    label = "Thinking…"
+    travel = (len(label) + 2 * ui._SHIMMER_BAND + ui._SHIMMER_GAP) / ui._SHIMMER_SPEED
+    assert len(ui.shimmer_runs(label, now=travel)) == 1
+
+
+def test_the_shimmer_is_mixed_out_of_the_theme_colour():
+    """A shimmer hard-coded to rust would be the one thing --theme-color left
+    behind."""
+    try:
+        ui.set_accent("#00b4d8")
+        colours = {colour for colour, _ in ui.shimmer_runs("Thinking…", now=0.4)}
+        for colour in colours:
+            r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+            assert b >= r, f"{colour} isn't on the blue accent's hue"
+    finally:
+        ui.set_accent("")
+
+
+def test_the_crest_is_brighter_than_the_rest_of_the_label():
+    runs = ui.shimmer_runs("Running a fairly long tool call…", now=0.8)
+    assert _brightness(max(runs, key=lambda r: _brightness(r[0]))[0]) > \
+            _brightness(min(runs, key=lambda r: _brightness(r[0]))[0])
+
+
+def test_a_named_accent_falls_back_to_a_flat_style():
+    """A named colour has no channels to mix, so every caller needs a
+    fallback rather than a crash."""
+    try:
+        ui.set_accent("magenta")
+        assert ui.shimmer_runs("Thinking…") is None
+        assert ui.shimmer_fragments("Thinking…") == [("class:frame.label", "Thinking…")]
+        assert ui.shimmer_text("Thinking…").style == "bold magenta"
+    finally:
+        ui.set_accent("")
+
+
+def test_an_empty_label_has_nothing_to_shimmer():
+    assert ui.shimmer_runs("") is None
+    assert ui.shimmer_fragments("") == [("class:frame.label", "")]
+
+
+def test_shimmer_fragments_keep_a_row_clickable():
+    """The agent tree's rows are clickable, and prompt_toolkit attaches the
+    handler per fragment — splitting one into runs must not cost it that."""
+    handler = object()
+    # A fixed `now`, since a frame caught mid-rest is legitimately one run.
+    fragments = ui.shimmer_fragments("Searching the repo…", handler=handler, now=0.6)
+    assert len(fragments) > 1
+    assert all(len(f) == 3 and f[2] is handler for f in fragments)
+
+
+def test_offsetting_two_labels_puts_them_out_of_step():
+    """Three subagents pulsing in lockstep read as one blinking widget."""
+    label = "Searching the repo…"
+    assert ui.shimmer_runs(label, now=0.5) != ui.shimmer_runs(label, now=0.5, offset=0.6)
+
+
+def test_a_plain_label_shimmers_and_a_marked_up_one_keeps_its_colours():
+    """The retry warning is the only label that styles itself, and it is
+    styled precisely so it reads as *not* the ordinary case."""
+    plain = ui._label_text("Thinking…")
+    assert len({str(span.style) for span in plain.spans}) >= 1
+    retry = ui._label_text("[bold yellow]Thinking… (retry 1/3)[/bold yellow]")
+    assert "yellow" in str(retry.spans[0].style)
+    assert retry.plain == "Thinking… (retry 1/3)"
+
+
 # ---------------- theme colour ----------------
 
 def test_the_accent_can_be_changed(cap):

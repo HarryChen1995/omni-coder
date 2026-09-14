@@ -416,6 +416,14 @@ MCP prompt exposed by a connected server. Special inputs:
 - `/model` — opens an interactive picker (↑/↓ to move, Enter to select, Esc to
   cancel) of models available on the LLM server, defaulting to the current one
 - `/model <name>` — switch the active model directly, without the picker
+- `/theme-color <#rrggbb>` — recolour the UI accent and **save** it, so every
+  later run starts that colour. Takes effect immediately — the frame, the
+  agent tree, the prompt and the shimmer all change under you, though blocks
+  already in the transcript keep the colour they were drawn in. `/theme-color`
+  on its own reports the current colour and where it came from;
+  `/theme-color reset` clears the saved one and goes back to the built-in
+  rust. Saved to `~/.omni-coder/omni-coder-settings.json` alongside any MCP
+  servers you've registered, which are left untouched
 - `/resources` — list resources published by connected MCP servers (the MCP
   "Resources" capability — readable context addressed by URI);
   `/resources <uri>` prints one. See
@@ -503,6 +511,20 @@ the agent tree, panel borders — if the default rust doesn't suit your terminal
 The hex is matched to whatever colour depth your terminal reports, so on a
 256-colour terminal (macOS Terminal.app, say) you get the nearest palette
 entry rather than the exact value.
+
+The flag is for one session: it overrides the saved colour without replacing
+it, so trying a colour out can't quietly become the colour of every run after
+it. `/theme-color <#rrggbb>` in the REPL is the one that saves.
+
+While a turn is unfinished, a highlight travels along the label that says why
+— "Running read_file…", an approval waiting on a y/n, a question the model
+asked, and each working row in the agent tree. It's the same idea as the
+spinner, moved onto the words: a turn that has quietly stopped is obvious
+without the eye being anywhere near the glyph, and a subagent still going
+shows in the tree without switching to its tab. The shimmer is mixed out of
+the accent, so it follows `--theme-color` and `/theme-color` like everything
+else. The one label that doesn't shimmer is the retry warning, which stays
+flat amber precisely so it doesn't read as business as usual.
 
 Clicking a `▸` line opens that block in place — a tool call shows every
 argument and its entire result, a reasoning block shows the whole chain of

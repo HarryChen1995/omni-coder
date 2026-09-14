@@ -35,7 +35,6 @@ Examples:
 
 import asyncio
 import os
-import re
 import shlex
 import signal
 from contextlib import nullcontext
@@ -45,7 +44,9 @@ from typing import List, Optional
 import typer
 
 from .agent import CodingAgent
-from .config import AgentConfig
+from .config import (
+    AgentConfig, normalize_hex_color, save_setting, saved_theme_color, THEME_COLOR_KEY,
+)
 from .llm_client import LLMError, chat, list_models
 from .mcp_client import (
     MCPToolClient, default_mcp_config_path, load_mcp_config,
@@ -65,6 +66,8 @@ _STATIC_COMMANDS = {
     "/expand ": "reprint one tool call whole, arguments and result — /expand <n>",
     "/btw ": "ask a quick side question without touching this session's history",
     "/model": "list models available on the LLM server (also populates /model <name> below)",
+    "/theme-color": "the UI accent colour — /theme-color #00b4d8 sets and saves it, "
+                     "/theme-color reset restores the built-in one",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
     "/mcp restart ": "reconnect an MCP server after changing it — /mcp restart <name|all>",
     "/mcp tools ": "list the tools one MCP server exposes — /mcp tools <name>",
@@ -135,8 +138,10 @@ def main(
     theme_color: Optional[str] = typer.Option(
         None, "--theme-color",
         help="Accent colour for the UI as a hex value (e.g. --theme-color '#00b4d8'). "
-             "Colours the prompt, spinners, tool calls, the agent tree and every panel "
-             "border. Omit to keep the built-in accent.",
+             "Colours the prompt, spinners, the shimmer on a running label, tool calls, "
+             "the agent tree and every panel border. This session only — it overrides the "
+             "colour saved by /theme-color without replacing it. Omit to use the saved "
+             "colour, or the built-in accent if none is saved.",
     ),
     log_path: str = typer.Option("agent_run.log", "--log-path", help="Where to write the structured run log"),
     mcp_log_path: str = typer.Option(
@@ -289,13 +294,21 @@ def main(
         _print_sessions(SessionStore(db_path).list_sessions())
         raise typer.Exit()
 
+    # --theme-color is a session override: it wins over the saved preference
+    # and is deliberately NOT written back, so trying a colour out for one run
+    # can't quietly become the colour of every run after it. /theme-color in
+    # the REPL is the one that saves.
     if theme_color is not None:
-        colour = theme_color.strip()
-        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", colour):
+        normalized = normalize_hex_color(theme_color)
+        if normalized is None:
             typer.echo(f"Error: --theme-color {theme_color!r} isn't a 6-digit hex colour "
                         "(e.g. '#00b4d8').", err=True)
             raise typer.Exit(code=1)
-        theme_color = colour if colour.startswith("#") else f"#{colour}"
+        theme_color = normalized
+    else:
+        theme_color = saved_theme_color()
+
+    if theme_color:
         try:
             # Applied before anything renders — the full-screen app copies the
             # style map when it's built.
@@ -761,6 +774,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     cfg.model = task[len("/model "):].strip()
                     _announce_model(cfg.model, tui)
                     continue
+                if task == "/theme-color" or task.startswith("/theme-color "):
+                    _theme_color_command(cfg, tui, task[len("/theme-color"):].strip())
+                    continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
                     if prompt_name in prompts:
@@ -1135,6 +1151,72 @@ def _echo(text: str, err: bool = False):
     except ImportError:
         pass
     typer.echo(text, err=err)
+
+
+def _theme_color_command(cfg, tui, argument: str):
+    """/theme-color — read, set or clear the saved accent colour.
+
+    Saving is the point: --theme-color already recolours one session, and the
+    thing it can't do is remember. So this writes to the settings file and
+    applies the colour to the session in hand, which means telling the
+    full-screen app (it holds a copy of the style map built at startup) as
+    well as ui itself.
+
+    Already-printed transcript blocks keep the colour they were rendered in.
+    They're rendered text by then, and re-rendering the session's whole
+    history to recolour it would also lose whatever is in scrollback above
+    it — so the change reads as "from here on", which is what a colour
+    changed mid-session honestly is."""
+    from . import ui
+
+    if not argument:
+        active = cfg.theme_color or ui.DEFAULT_ACCENT
+        saved = saved_theme_color()
+        where = "saved" if saved == active else ("this session only" if cfg.theme_color else "built-in")
+        _echo(f"Accent colour: {active} ({where}).  "
+               f"Set one with /theme-color #00b4d8, or /theme-color reset.")
+        return
+
+    if argument.lower() in ("reset", "default", "clear"):
+        try:
+            path = save_setting(THEME_COLOR_KEY, None)
+        except OSError as e:
+            _echo(f"Error: could not write the settings file: {e}", err=True)
+            return
+        cfg.theme_color = ""
+        _apply_theme_color(ui.DEFAULT_ACCENT, tui)
+        _echo(f"Accent colour reset to the built-in {ui.DEFAULT_ACCENT} (cleared from {path}).")
+        return
+
+    colour = normalize_hex_color(argument)
+    if colour is None:
+        _echo(f"Error: {argument!r} isn't a 6-digit hex colour — try /theme-color #00b4d8.",
+               err=True)
+        return
+
+    try:
+        path = save_setting(THEME_COLOR_KEY, colour)
+    except OSError as e:
+        # Still worth applying: the colour works for this session even if the
+        # preference couldn't be written, and saying so beats refusing.
+        cfg.theme_color = colour
+        _apply_theme_color(colour, tui)
+        _echo(f"Accent colour set to {colour} for this session — could not save it: {e}",
+               err=True)
+        return
+    cfg.theme_color = colour
+    _apply_theme_color(colour, tui)
+    _echo(f"Accent colour → {colour}, saved to {path}.")
+
+
+def _apply_theme_color(colour: str, tui=None):
+    """Recolour the live UI. ui.set_accent covers every Rich renderer, since
+    they build their styles from ACCENT at call time; the full-screen app is
+    the exception, because it was handed the style map at construction."""
+    from . import ui
+    ui.set_accent(colour)
+    if tui is not None:
+        tui.restyle()
 
 
 def _announce_model(model: str, tui=None):

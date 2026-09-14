@@ -247,21 +247,25 @@ def test_ctrl_d_with_text_keeps_the_session(app, mocker):
 
 def test_busy_status_line_advances(app):
     app.set_busy("Running read_file…")
-    first = app._status_line()
-    assert "read_file" in first[1][1]
-    assert app._status_line()[2][1].endswith("s)")   # elapsed counter
+    # Joined, not indexed: the label is split into as many fragments as the
+    # shimmer needs for that frame, which is not a fixed number.
+    assert "read_file" in "".join(f[1] for f in app._status_line())
+    assert app._status_line()[-1][1].endswith("s)")   # elapsed counter
 
 
 def test_set_label_relabels_without_leaving_busy(app):
     app.set_busy("Thinking…")
     app.set_label("Running write_file…")
-    assert app.mode == "busy" and "write_file" in app._status_line()[1][1]
+    assert app.mode == "busy" and "write_file" in "".join(f[1] for f in app._status_line())
 
 
 async def test_approval_is_answered_in_the_frame(app, mocker):
     pending = asyncio.ensure_future(app.ask_approval("Approve write_file?"))
     await asyncio.sleep(0)
-    assert app.mode == "approve" and "write_file" in app._approve_line()[1][1]
+    # Joined, not indexed: the question is split into as many fragments as
+    # the shimmer needs for that frame, which is not a fixed number.
+    assert app.mode == "approve"
+    assert "write_file" in "".join(f[1] for f in app._approve_line())
     binding(app, "y")(mocker.Mock())
     assert await pending is True
     assert app.mode == "idle"                        # restored
@@ -485,6 +489,58 @@ def test_status_and_tokens_are_per_pane(app, mocker):
     assert "↑ 12.1k" in line and "↓ 3.4k" in line
 
 
+def test_the_status_line_shimmers_in_the_theme_colour(app):
+    """The words carry the shimmer; the spinner glyph and the counter don't —
+    a glyph already moves, and a counter already changes."""
+    app.set_busy("Running read_file…")
+    fragments = app._status_line()
+    assert fragments[0][0] == "class:frame.spinner"      # glyph: flat accent
+    assert fragments[-1][0] == "class:frame.hint"        # counter: flat hint
+    label = [f for f in fragments[1:-1]]
+    assert "".join(f[1] for f in label) == "Running read_file…"
+    assert all(f[0].startswith("bold #") for f in label)
+
+
+def test_a_marked_up_status_reads_as_a_warning_not_as_business_as_usual(app):
+    """set_label is handed Rich markup on the retry path. The frame strips it
+    rather than printing "[bold yellow]" at the user — and drops the shimmer,
+    because a warning that looks exactly like ordinary progress isn't one."""
+    app.set_busy("[bold yellow]Thinking… (retry 1/3)[/bold yellow]")
+    fragments = app._status_line()
+    line = "".join(f[1] for f in fragments)
+    assert "retry 1/3" in line and "[bold" not in line
+    assert fragments[1][0] == "class:frame.label.attention"
+    assert not any(f[0].startswith("bold #") for f in fragments)
+
+
+async def test_the_approval_question_shimmers(app, mocker):
+    """Nothing else moves while an approval waits, so a turn stopped on one
+    would otherwise look just like a turn still thinking."""
+    app.set_busy("Running write_file…")
+    pending = asyncio.ensure_future(app.ask_approval("Approve write_file?"))
+    await asyncio.sleep(0)
+    fragments = app._approve_line()
+    assert fragments[0][0] == "class:prompt.arrow"
+    assert fragments[-1][1].strip() == "y / n"
+    question = fragments[1:-1]
+    assert "".join(f[1] for f in question) == "Approve write_file?"
+    assert all(f[0].startswith("bold #") for f in question)
+    binding(app, "y")(mocker.Mock())
+    assert await pending is True
+
+
+async def test_a_question_from_the_model_shimmers_in_the_hint_line(app, mocker):
+    """The hint line is furniture every other time it is drawn; a question
+    waiting on an answer is the one thing there that isn't."""
+    pending = asyncio.ensure_future(app.ask_text("Which file should I edit?"))
+    await asyncio.sleep(0)
+    shimmered = "".join(f[1] for f in app._hint() if f[0].startswith("bold #"))
+    assert shimmered == "Which file should I edit?"
+    app._buffer.text = "a.py"
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "a.py"
+
+
 # ---------------- the agent tree ----------------
 
 async def test_main_is_labelled_main_and_subagents_are_numbered(app):
@@ -507,6 +563,65 @@ async def test_the_tree_marks_each_state(app, mocker):
     assert "○" in rows          # working
     assert "●" in rows          # finished and reported back
     assert "!" in rows          # waiting on you
+
+
+def test_a_working_row_in_the_tree_shimmers_too(app):
+    """A subagent still going should be visible from the tree, without
+    switching to its tab."""
+    sub = app.add_pane("audit", depth=1)
+    app.set_busy("Searching the repo…", pane=sub)
+    row = "".join(f[1] for f in app._agent_tree())
+    assert "Searching the repo…" in row
+    shimmered = [f for f in app._agent_tree() if f[0].startswith("bold #")]
+    assert "".join(f[1] for f in shimmered).strip() == "Searching the repo…"
+
+
+def test_every_tree_fragment_keeps_its_click_handler(app):
+    """Splitting a row into shimmer runs must not cost it its click."""
+    sub = app.add_pane("audit", depth=1)
+    app.set_busy("Searching the repo…", pane=sub)
+    assert all(len(f) == 3 and callable(f[2])
+                for f in app._agent_tree() if f[1] != "\n")
+
+
+def test_two_working_rows_do_not_pulse_in_lockstep(app):
+    """Three subagents in step read as one blinking widget rather than three
+    agents working."""
+    first = app.add_pane("one", depth=1)
+    second = app.add_pane("two", depth=1)
+    app.set_busy("Thinking…", pane=first)
+    app.set_busy("Thinking…", pane=second)
+    # The same label on both rows at the same instant, but each row is offset
+    # by its position in the tree, so the colouring differs.
+    assert _row_colours(app, 1) != _row_colours(app, 2)
+
+
+def _row_colours(app, index):
+    """The shimmer colouring of one tree row, by pane index, at a fixed
+    instant — the rows are built from the clock, so pin it."""
+    from omni import ui
+    return [f[0] for f in ui.shimmer_fragments(f"  {app.panes[index].status}",
+                                                offset=index * 0.6, now=0.7)]
+
+
+def test_restyle_hands_the_app_a_recoloured_style_map(app):
+    """/theme-color recolours ui, but the app was constructed with a copy of
+    the style map — without this the frame keeps the old accent."""
+    from omni import ui
+    before = app._app.style
+    try:
+        ui.set_accent("#00b4d8")
+        app.restyle()
+        assert app._app.style is ui._PROMPT_STYLE and app._app.style is not before
+    finally:
+        ui.set_accent("")
+
+
+async def test_a_row_waiting_on_you_shimmers(app):
+    sub = app.add_pane("audit", depth=1)
+    sub.approval = ("Approve?", asyncio.get_running_loop().create_future())
+    shimmered = "".join(f[1] for f in app._agent_tree() if f[0].startswith("bold #"))
+    assert shimmered.strip() == "waiting for you"
 
 
 def test_a_tree_row_can_be_clicked(app, mocker):

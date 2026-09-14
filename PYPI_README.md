@@ -85,8 +85,14 @@ Run `omni --help` for the full option list.
   ↓ 115)`, and live beside the spinner), from the server's own
   `prompt_tokens` / `completion_tokens`. Intent parsing and history
   compaction are counted too, and each agent counts only its own.
-- **Themeable** — `--theme-color '#00b4d8'` recolours the accent across the
-  whole UI; omit it for the built-in one.
+- **Themeable** — `/theme-color '#00b4d8'` recolours the accent across the
+  whole UI and saves it for every later run (`/theme-color reset` goes back to
+  the built-in one). `--theme-color` does the same for one session only,
+  without replacing what's saved.
+- **A shimmer on anything unfinished** — a highlight travels along the label
+  of whatever a turn is doing or waiting on you for: the status line, an
+  approval, a question the model asked, and each working row in the agent
+  tree. Mixed out of the accent, so it follows your theme colour.
 - **The model can ask you a question** — `ask_user` puts a genuine ambiguity
   (or a plan to accept) to you mid-turn. Offered choices become a picker:
   arrow or click to select, Enter to submit, and anything you type instead

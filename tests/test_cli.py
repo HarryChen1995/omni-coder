@@ -202,6 +202,95 @@ def test_no_theme_colour_leaves_the_default(mocker, tmp_path):
     assert captured["cfg"].theme_color == ""
 
 
+def test_a_saved_theme_colour_is_used_when_the_flag_is_absent(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"themeColor": "#00b4d8"}))
+    accent = mocker.patch("omni.ui.set_accent")
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    accent.assert_called_once_with("#00b4d8")
+    assert captured["cfg"].theme_color == "#00b4d8"
+
+
+def test_the_flag_overrides_the_saved_colour_without_replacing_it(mocker, tmp_path, settings_path):
+    """--theme-color is for trying a colour out. If it wrote itself back, one
+    run with the flag would silently become the colour of every run after."""
+    settings_path.write_text(json.dumps({"themeColor": "#00b4d8"}))
+    accent = mocker.patch("omni.ui.set_accent")
+    captured = captured_cfg(mocker)
+    invoke("t", "--theme-color", "#ff0000", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    accent.assert_called_once_with("#ff0000")
+    assert captured["cfg"].theme_color == "#ff0000"
+    assert json.loads(settings_path.read_text())["themeColor"] == "#00b4d8"
+
+
+# ---------------- /theme-color ----------------
+
+def test_theme_color_command_saves_and_applies(mocker, settings_path):
+    accent = mocker.patch("omni.ui.set_accent")
+    tui = mocker.Mock()
+    cfg = AgentConfig()
+    cli_mod._theme_color_command(cfg, tui, "#00b4d8")
+    accent.assert_called_once_with("#00b4d8")
+    tui.restyle.assert_called_once()            # the app holds its own style map
+    assert cfg.theme_color == "#00b4d8"
+    assert json.loads(settings_path.read_text())["themeColor"] == "#00b4d8"
+
+
+def test_theme_color_command_accepts_a_bare_hex(mocker, settings_path):
+    mocker.patch("omni.ui.set_accent")
+    cli_mod._theme_color_command(AgentConfig(), None, "00b4d8")
+    assert json.loads(settings_path.read_text())["themeColor"] == "#00b4d8"
+
+
+def test_theme_color_command_refuses_junk_and_saves_nothing(mocker, settings_path):
+    accent = mocker.patch("omni.ui.set_accent")
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._theme_color_command(cfg, None, "chartreuse")
+    accent.assert_not_called()
+    assert cfg.theme_color == "" and not settings_path.exists()
+    assert echoed.call_args.kwargs.get("err") is True
+    assert "hex colour" in echoed.call_args.args[0]
+
+
+def test_theme_color_command_resets_to_the_built_in(mocker, settings_path):
+    from omni import ui
+    settings_path.write_text(json.dumps({"themeColor": "#00b4d8", "mcpServers": {"d": {}}}))
+    accent = mocker.patch("omni.ui.set_accent")
+    cfg = AgentConfig(theme_color="#00b4d8")
+    cli_mod._theme_color_command(cfg, None, "reset")
+    accent.assert_called_once_with(ui.DEFAULT_ACCENT)
+    assert cfg.theme_color == ""
+    data = json.loads(settings_path.read_text())
+    assert "themeColor" not in data and data["mcpServers"] == {"d": {}}
+
+
+def test_theme_color_command_with_no_argument_reports(mocker, settings_path):
+    settings_path.write_text(json.dumps({"themeColor": "#00b4d8"}))
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._theme_color_command(AgentConfig(theme_color="#00b4d8"), None, "")
+    said = echoed.call_args.args[0]
+    assert "#00b4d8" in said and "saved" in said
+
+
+def test_theme_color_applies_even_when_the_settings_file_cannot_be_written(mocker):
+    """The colour still works for this session; refusing outright would be
+    worse than saying the preference didn't stick."""
+    accent = mocker.patch("omni.ui.set_accent")
+    mocker.patch.object(cli_mod, "save_setting", side_effect=OSError("read-only"))
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._theme_color_command(cfg, None, "#00b4d8")
+    accent.assert_called_once_with("#00b4d8")
+    assert cfg.theme_color == "#00b4d8"
+    assert "could not save" in echoed.call_args.args[0]
+
+
+def test_theme_color_is_a_listed_command():
+    assert "/theme-color" in cli_mod._STATIC_COMMANDS
+
+
 def test_run_value_error_exits_nonzero(mocker, tmp_path):
     mocker.patch.object(cli_mod.CodingAgent, "run",
                         mocker.AsyncMock(side_effect=ValueError("no session found")))
