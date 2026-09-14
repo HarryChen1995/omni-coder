@@ -424,6 +424,17 @@ def test_history_panel_shows_each_role(cap):
     assert "hidden" not in out          # system messages aren't replayed
 
 
+def test_history_panel_draws_no_box_around_a_reply(cap):
+    """A resumed transcript is read in order to copy out of it, so the reply
+    carries no border: a panel's "│" lands on both ends of every line and
+    comes along with the selection."""
+    ui.history_panel([{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": "the answer\n\nsecond paragraph"}])
+    out = cap.getvalue()
+    assert "the answer" in out and "second paragraph" in out
+    assert not set("│╭╮╰╯┌┐└┘┃┏┓┗┛") & set(out)
+
+
 def test_sessions_table(cap):
     ui.sessions_table([{"id": "abc12345", "name": "nm", "status": "done",
                         "updated_at": "2026-01-01T00:00:00+00:00",

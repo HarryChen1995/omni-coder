@@ -1400,9 +1400,14 @@ def final_result(text: str):
 
 def history_panel(messages: list):
     """Show the prior conversation being resumed, rendered the same way it
-    looked the first time around — assistant replies as Markdown panels,
-    same as final_result() — so it's visibly clear context carried over
-    instead of silently feeding the model in the background."""
+    looked the first time around — assistant replies as bare Markdown, same
+    as final_result() — so it's visibly clear context carried over instead of
+    silently feeding the model in the background.
+
+    Bare, because a resumed transcript is mostly read in order to take
+    something back out of it, and a panel puts a "│" on both ends of every
+    single line: the border comes along with any selection, and there is no
+    way to strip it afterwards that doesn't also eat indentation."""
     visible = [m for m in messages if m.get("role") != "system"]
     console.print(Rule(f"[bold {ACCENT}]Resumed history — {len(visible)} messages[/bold {ACCENT}]"))
 
@@ -1416,8 +1421,8 @@ def history_panel(messages: list):
             console.print(f"[dim]  → called {calls}[/dim]")
         elif role == "assistant":
             if content:
-                console.print(Panel(Markdown(content), border_style=ACCENT, expand=False,
-                                     width=_panel_width()))
+                console.print()
+                console.print(Markdown(content))
         elif role == "tool":
             summary = content.splitlines()[0] if content else ""
             console.print(f"  [dim]✓ {summary[:150]}[/dim]")
