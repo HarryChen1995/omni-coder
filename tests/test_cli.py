@@ -62,7 +62,7 @@ def test_flags_are_threaded_into_agentconfig(mocker, tmp_path):
            "--llm-host", "http://h:1", "--llm-api-key", "sk-k", "--llm-timeout", "42",
            "--max-steps", "7", "--auto-approve", "--skip-intent-parsing",
            "--intent-model", "small", "--compact-model", "tiny",
-           "--compact-keep-last", "9", "--context-char-budget", "1234",
+           "--compact-keep-last", "9", "--context-char-budget", "12340",
            "--embedding-model", "", "--db-path", str(tmp_path / "d.db"),
            "--log-path", str(tmp_path / "l.log"))
     cfg = captured["cfg"]
@@ -71,7 +71,7 @@ def test_flags_are_threaded_into_agentconfig(mocker, tmp_path):
     assert cfg.max_steps == 7 and cfg.auto_approve is True
     assert cfg.parse_intent is False and cfg.intent_model == "small"
     assert cfg.compact_model == "tiny" and cfg.compact_keep_last == 9
-    assert cfg.context_char_budget == 1234 and cfg.embedding_model == ""
+    assert cfg.context_char_budget == 12340 and cfg.embedding_model == ""
 
 
 def test_embedding_model_defaults_when_flag_omitted(mocker, tmp_path):
@@ -289,6 +289,345 @@ def test_theme_color_applies_even_when_the_settings_file_cannot_be_written(mocke
 
 def test_theme_color_is_a_listed_command():
     assert "/theme-color" in cli_mod._STATIC_COMMANDS
+
+
+# ---------------- where the model comes from ----------------
+
+def test_the_model_is_discovered_from_the_server_when_nothing_names_one(mocker, tmp_path):
+    """No model name is compiled in: the server knows which models exist and
+    any built-in default would be the wrong one on most installs."""
+    discover = mocker.patch.object(cli_mod, "_discover_model", return_value="server-model")
+    captured = captured_cfg(mocker)
+    r = invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].model == "server-model"
+    assert "server-model" in r.output
+    assert discover.call_count == 1
+
+
+def test_a_saved_model_is_not_second_guessed_by_the_server(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"model": "saved-model"}))
+    discover = mocker.patch.object(cli_mod, "_discover_model")
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].model == "saved-model"
+    discover.assert_not_called()
+
+
+def test_the_flag_beats_everything(mocker, tmp_path, settings_path, monkeypatch):
+    settings_path.write_text(json.dumps({"model": "saved-model"}))
+    monkeypatch.setenv("DEFAULT_LLM_MODEL", "env-model")
+    discover = mocker.patch.object(cli_mod, "_discover_model")
+    captured = captured_cfg(mocker)
+    invoke("t", "--model", "flag-model", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].model == "flag-model"
+    discover.assert_not_called()
+
+
+def test_the_env_var_names_a_model_when_nothing_is_saved(mocker, tmp_path, monkeypatch):
+    monkeypatch.setenv("DEFAULT_LLM_MODEL", "env-model")
+    discover = mocker.patch.object(cli_mod, "_discover_model")
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].model == "env-model"
+    discover.assert_not_called()
+
+
+def test_a_saved_model_beats_the_env_var(mocker, tmp_path, settings_path, monkeypatch):
+    """$DEFAULT_LLM_MODEL is a default — what to use when nothing else says —
+    not an override of what you deliberately saved."""
+    settings_path.write_text(json.dumps({"model": "saved-model"}))
+    monkeypatch.setenv("DEFAULT_LLM_MODEL", "env-model")
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].model == "saved-model"
+
+
+def test_no_model_anywhere_refuses_to_start(mocker, tmp_path):
+    """Better than a run that gets as far as its first call and fails inside
+    the server, where the fix is much harder to read off."""
+    mocker.patch.object(cli_mod, "_discover_model", return_value="")
+    r = invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1
+    assert "no model set" in r.output and "--model" in r.output
+
+
+def test_discovery_takes_the_first_model_and_swallows_a_dead_server(mocker, no_model_discovery):
+    """The real lookup, not the stand-in every other test runs with."""
+    discover = no_model_discovery.real
+    mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=["a", "b"]))
+    assert discover("", "") == "a"
+    mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=[]))
+    assert discover("", "") == ""
+    mocker.patch.object(cli_mod, "list_models",
+                        mocker.AsyncMock(side_effect=LLMError("nothing listening")))
+    assert discover("", "") == ""
+
+
+def test_config_says_when_a_value_came_from_the_environment(mocker, monkeypatch, settings_path):
+    monkeypatch.setenv("DEFAULT_LLM_MODEL", "env-model")
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._setting_command(AgentConfig(model="env-model"), None,
+                             cli_mod.SETTINGS_BY_NAME["model"], "")
+    assert "[$DEFAULT_LLM_MODEL]" in echoed.call_args.args[0]
+
+
+# ---------------- /system-prompt ----------------
+
+def test_system_prompt_command_saves_and_applies(settings_path):
+    cfg = AgentConfig()
+    cli_mod._system_prompt_command(cfg, "Be terse.")
+    assert cfg.system_prompt == "Be terse."
+    assert json.loads(settings_path.read_text())["systemPrompt"] == "Be terse."
+
+
+def test_system_prompt_command_reads_a_file(tmp_path, settings_path):
+    """A prompt is usually more than one line and the REPL reads one line, so
+    a file is how a real one gets set."""
+    source = tmp_path / "prompt.md"
+    source.write_text("Line one.\nLine two.\n")
+    cfg = AgentConfig()
+    cli_mod._system_prompt_command(cfg, f"file {source}")
+    assert cfg.system_prompt == "Line one.\nLine two.\n"
+    assert json.loads(settings_path.read_text())["systemPrompt"].startswith("Line one.")
+
+
+def test_system_prompt_command_refuses_an_empty_file(mocker, tmp_path, settings_path):
+    """Saving it would clear the prompt rather than replace it, which is not
+    what "set it from this file" asked for."""
+    source = tmp_path / "blank.md"
+    source.write_text("\n \n")
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._system_prompt_command(cfg, f"file {source}")
+    assert cfg.system_prompt == "" and not settings_path.exists()
+    assert echoed.call_args.kwargs.get("err") is True
+
+
+def test_system_prompt_command_reports_a_missing_file(mocker, tmp_path, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._system_prompt_command(AgentConfig(), f"file {tmp_path / 'nope.md'}")
+    assert not settings_path.exists()
+    assert echoed.call_args.kwargs.get("err") is True
+
+
+def test_system_prompt_command_resets_to_the_built_in(settings_path):
+    settings_path.write_text(json.dumps({"systemPrompt": "Be terse.", "mcpServers": {"d": {}}}))
+    cfg = AgentConfig(system_prompt="Be terse.")
+    cli_mod._system_prompt_command(cfg, "reset")
+    assert cfg.system_prompt == ""
+    data = json.loads(settings_path.read_text())
+    assert "systemPrompt" not in data and data["mcpServers"] == {"d": {}}
+
+
+def test_system_prompt_command_with_no_argument_reports(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._system_prompt_command(AgentConfig(), "")
+    assert "built-in" in echoed.call_args.args[0]
+    settings_path.write_text(json.dumps({"systemPrompt": "Be terse."}))
+    cli_mod._system_prompt_command(AgentConfig(system_prompt="Be terse."), "")
+    said = echoed.call_args.args[0]
+    assert "Be terse." in said and "saved" in said
+
+
+def test_system_prompt_applies_even_when_the_settings_file_cannot_be_written(mocker):
+    mocker.patch.object(cli_mod, "save_setting", side_effect=OSError("read-only"))
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._system_prompt_command(cfg, "Be terse.")
+    assert cfg.system_prompt == "Be terse."
+    assert "could not save" in echoed.call_args.args[0]
+
+
+def test_a_saved_system_prompt_is_used_when_the_flag_is_absent(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"systemPrompt": "Be terse."}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].system_prompt == "Be terse."
+
+
+def test_the_flag_overrides_the_saved_system_prompt_without_replacing_it(mocker, tmp_path,
+                                                                        settings_path):
+    settings_path.write_text(json.dumps({"systemPrompt": "Be terse."}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--system-prompt", "Be verbose.", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].system_prompt == "Be verbose."
+    assert json.loads(settings_path.read_text())["systemPrompt"] == "Be terse."
+
+
+# ---------------- /context-char-budget ----------------
+
+def test_context_char_budget_command_saves_and_applies(settings_path):
+    cfg = AgentConfig()
+    cli_mod._context_char_budget_command(cfg, "50_000")
+    assert cfg.context_char_budget == 50_000
+    assert json.loads(settings_path.read_text())["contextCharBudget"] == 50_000
+
+
+def test_context_char_budget_command_refuses_junk_and_saves_nothing(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._context_char_budget_command(cfg, "lots")
+    assert cfg.context_char_budget == AgentConfig.context_char_budget
+    assert not settings_path.exists()
+    assert echoed.call_args.kwargs.get("err") is True
+
+
+def test_context_char_budget_command_refuses_a_budget_under_the_floor(mocker, settings_path):
+    """Under the floor the loop compacts on every step — a summarization call
+    per turn that saves nothing."""
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._context_char_budget_command(cfg, "12")
+    assert cfg.context_char_budget == AgentConfig.context_char_budget
+    assert not settings_path.exists()
+    assert echoed.call_args.kwargs.get("err") is True
+
+
+def test_context_char_budget_command_resets_to_the_default(settings_path):
+    settings_path.write_text(json.dumps({"contextCharBudget": 50_000, "mcpServers": {"d": {}}}))
+    cfg = AgentConfig(context_char_budget=50_000)
+    cli_mod._context_char_budget_command(cfg, "reset")
+    assert cfg.context_char_budget == AgentConfig.context_char_budget
+    data = json.loads(settings_path.read_text())
+    assert "contextCharBudget" not in data and data["mcpServers"] == {"d": {}}
+
+
+def test_context_char_budget_command_with_no_argument_reports(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._context_char_budget_command(AgentConfig(), "")
+    said = echoed.call_args.args[0]
+    assert f"{AgentConfig.context_char_budget:,}" in said and "[saved]" not in said
+    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
+    cli_mod._context_char_budget_command(AgentConfig(context_char_budget=50_000), "")
+    assert "[saved]" in echoed.call_args.args[0]
+
+
+def test_context_char_budget_applies_even_when_the_settings_file_cannot_be_written(mocker):
+    mocker.patch.object(cli_mod, "save_setting", side_effect=OSError("read-only"))
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._context_char_budget_command(cfg, "50000")
+    assert cfg.context_char_budget == 50_000
+    assert "could not save" in echoed.call_args.args[0]
+
+
+def test_a_saved_context_char_budget_is_used_when_the_flag_is_absent(mocker, tmp_path,
+                                                                    settings_path):
+    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].context_char_budget == 50_000
+
+
+def test_the_flag_overrides_the_saved_budget_without_replacing_it(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--context-char-budget", "90000", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].context_char_budget == 90_000
+    assert json.loads(settings_path.read_text())["contextCharBudget"] == 50_000
+
+
+def test_a_budget_flag_under_the_floor_exits_nonzero(tmp_path):
+    r = invoke("t", "--context-char-budget", "12", "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "compacts on every step" in r.output
+
+
+def test_every_setting_is_a_listed_command():
+    """The completion menu is generated from the registry, so a new setting
+    is a new command without a second list to keep in step."""
+    for setting in cli_mod.SETTINGS:
+        assert f"/{setting.name}" in cli_mod._STATIC_COMMANDS
+    assert "/config" in cli_mod._STATIC_COMMANDS
+
+
+# ---------------- the rest of the registry ----------------
+
+def test_any_setting_saves_and_applies(settings_path):
+    cfg = AgentConfig()
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["max-steps"], "7")
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["parse-intent"], "off")
+    assert cfg.max_steps == 7 and cfg.parse_intent is False
+    saved = json.loads(settings_path.read_text())
+    assert saved == {"maxSteps": 7, "parseIntent": False}
+
+
+def test_a_setting_that_only_takes_hold_later_says_so(mocker, settings_path):
+    """The tool-side knobs are handed to the MCP server process as
+    environment when it connects, so a change now is a change next run."""
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._setting_command(AgentConfig(), None, cli_mod.SETTINGS_BY_NAME["shell-timeout"], "60")
+    assert "next time omni starts" in echoed.call_args.args[0]
+
+
+def test_switching_model_through_a_setting_announces_it(mocker, settings_path):
+    announced = mocker.patch.object(cli_mod, "_announce_model")
+    cfg = AgentConfig()
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["model"], "other-model")
+    announced.assert_called_once_with("other-model", None)
+    assert json.loads(settings_path.read_text())["model"] == "other-model"
+
+
+def test_config_lists_every_setting_and_marks_the_saved_ones(mocker, settings_path):
+    settings_path.write_text(json.dumps({"maxSteps": 7}))
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._config_command(AgentConfig(max_steps=7), None, "")
+    listing = echoed.call_args.args[0]
+    for setting in cli_mod.SETTINGS:
+        assert f"/{setting.name}" in listing
+    assert "[saved]" in listing
+
+
+def test_config_reset_clears_every_saved_setting_but_not_the_mcp_servers(settings_path):
+    settings_path.write_text(json.dumps({"maxSteps": 7, "parseIntent": False,
+                                         "mcpServers": {"docs": {"command": "node"}}}))
+    cfg = AgentConfig(max_steps=7, parse_intent=False)
+    cli_mod._config_command(cfg, None, "reset")
+    assert cfg.max_steps == AgentConfig.max_steps and cfg.parse_intent is True
+    assert json.loads(settings_path.read_text()) == {"mcpServers": {"docs": {"command": "node"}}}
+
+
+def test_config_reset_with_nothing_saved_says_so(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._config_command(AgentConfig(), None, "reset")
+    assert "already at its default" in echoed.call_args.args[0]
+
+
+def test_config_reports_one_setting_by_name(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._config_command(AgentConfig(), None, "max_steps")
+    assert echoed.call_args.args[0].startswith("max-steps:")
+
+
+def test_a_saved_setting_is_used_when_its_flag_is_absent(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"maxSteps": 7, "model": "saved-model",
+                                         "parseIntent": False, "shellTimeoutS": 60}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    cfg = captured["cfg"]
+    assert cfg.max_steps == 7 and cfg.model == "saved-model"
+    assert cfg.parse_intent is False and cfg.shell_timeout_s == 60
+
+
+def test_a_flag_overrides_the_saved_setting_without_replacing_it(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"maxSteps": 7, "model": "saved-model"}))
+    captured = captured_cfg(mocker)
+    invoke("t", "--max-steps", "9", "--db-path", str(tmp_path / "d.db"),
+           "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].max_steps == 9 and captured["cfg"].model == "saved-model"
+    assert json.loads(settings_path.read_text())["maxSteps"] == 7
+
+
+def test_a_flag_value_the_setting_would_refuse_exits_nonzero(tmp_path):
+    """The flags are validated the same way the slash commands are, so
+    --max-steps 0 is refused at the door instead of producing a run that
+    ends before its first step."""
+    r = invoke("t", "--max-steps", "0", "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "--max-steps" in r.output
 
 
 def test_run_value_error_exits_nonzero(mocker, tmp_path):

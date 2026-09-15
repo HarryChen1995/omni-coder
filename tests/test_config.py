@@ -12,6 +12,7 @@ from omni.config import AgentConfig
 
 def test_defaults_are_conservative():
     cfg = AgentConfig()
+    assert cfg.model == ""                  # no model name is compiled in; ask the server
     assert cfg.auto_approve is False        # never skip approval unasked
     assert cfg.parse_intent is True
     assert cfg.project_root == "."
@@ -160,6 +161,11 @@ def settings(tmp_path):
     return str(tmp_path / "omni-coder-settings.json")
 
 
+def _saved(name, path):
+    """One setting's saved value, by the name its slash command goes by."""
+    return config.saved_setting(config.SETTINGS_BY_NAME[name], path)
+
+
 @pytest.mark.parametrize("given,expected", [
     ("#00b4d8", "#00b4d8"),
     ("00b4d8", "#00b4d8"),       # the "#" is optional — shells eat it
@@ -178,7 +184,7 @@ def test_anything_that_is_not_six_hex_digits_is_refused(bad):
 
 def test_a_setting_round_trips(settings):
     config.save_setting(config.THEME_COLOR_KEY, "#00b4d8", path=settings)
-    assert config.saved_theme_color(settings) == "#00b4d8"
+    assert _saved("theme-color", settings) == "#00b4d8"
 
 
 def test_saving_a_setting_leaves_the_mcp_servers_alone(settings):
@@ -195,7 +201,7 @@ def test_saving_a_setting_leaves_the_mcp_servers_alone(settings):
 def test_a_setting_can_be_cleared(settings):
     config.save_setting(config.THEME_COLOR_KEY, "#00b4d8", path=settings)
     config.save_setting(config.THEME_COLOR_KEY, None, path=settings)
-    assert config.saved_theme_color(settings) == ""
+    assert _saved("theme-color", settings) is None
     assert config.THEME_COLOR_KEY not in json.load(open(settings))
 
 
@@ -206,7 +212,7 @@ def test_a_missing_or_corrupt_settings_file_reads_as_no_settings(tmp_path):
     corrupt = tmp_path / "corrupt.json"
     corrupt.write_text("{not json")
     assert config.load_settings(str(corrupt)) == {}
-    assert config.saved_theme_color(str(corrupt)) == ""
+    assert _saved("theme-color", str(corrupt)) is None
     listy = tmp_path / "list.json"
     listy.write_text("[1, 2]")
     assert config.load_settings(str(listy)) == {}
@@ -215,4 +221,130 @@ def test_a_missing_or_corrupt_settings_file_reads_as_no_settings(tmp_path):
 def test_a_hand_edited_junk_colour_does_not_reach_the_ui(settings):
     with open(settings, "w") as f:
         json.dump({config.THEME_COLOR_KEY: "chartreuse"}, f)
-    assert config.saved_theme_color(settings) == ""
+    assert _saved("theme-color", settings) is None
+
+
+@pytest.mark.parametrize("given,expected", [
+    (200_000, 200_000),
+    ("200000", 200_000),
+    ("200_000", 200_000),        # the separators the default is written with
+    ("200,000", 200_000),
+    ("  50000 ", 50_000),
+])
+def test_a_char_budget_is_normalized(given, expected):
+    assert config.SETTINGS_BY_NAME["context-char-budget"].parse(given) == expected
+
+
+@pytest.mark.parametrize("bad", ["", None, "lots", "-5", "1e5", "20.5", True, "1999"])
+def test_anything_that_is_not_a_usable_budget_is_refused(bad):
+    """Including 1999: under the floor the history compacts on every step and
+    spends a summarization call per turn to save nothing."""
+    assert config.SETTINGS_BY_NAME["context-char-budget"].parse(bad) is None
+
+
+def test_a_system_prompt_round_trips(settings):
+    config.save_setting(config.SYSTEM_PROMPT_KEY, "Be terse.", path=settings)
+    assert _saved("system-prompt", settings) == "Be terse."
+
+
+def test_a_blank_saved_system_prompt_reads_as_none(settings):
+    """A prompt of blank lines would replace the built-in one with nothing,
+    which reads as the agent forgetting how to use its own tools."""
+    config.save_setting(config.SYSTEM_PROMPT_KEY, "  \n ", path=settings)
+    assert _saved("system-prompt", settings) is None
+    config.save_setting(config.SYSTEM_PROMPT_KEY, 17, path=settings)
+    assert _saved("system-prompt", settings) is None
+
+
+def test_a_char_budget_round_trips_and_clears(settings):
+    config.save_setting(config.CONTEXT_CHAR_BUDGET_KEY, 50_000, path=settings)
+    assert _saved("context-char-budget", settings) == 50_000
+    config.save_setting(config.CONTEXT_CHAR_BUDGET_KEY, None, path=settings)
+    assert _saved("context-char-budget", settings) is None
+
+
+def test_a_hand_edited_junk_budget_does_not_reach_the_loop(settings):
+    """Nothing usable saved is the same as nothing saved — a hand-edited file
+    shouldn't be able to put the loop into permanent compaction."""
+    with open(settings, "w") as f:
+        json.dump({config.CONTEXT_CHAR_BUDGET_KEY: 12}, f)
+    assert _saved("context-char-budget", settings) is None
+
+
+# ---------------- the settings registry ----------------
+
+def test_every_setting_names_a_real_config_field_and_a_distinct_key():
+    fields = {f.name for f in dataclasses.fields(AgentConfig)}
+    keys, names = set(), set()
+    for setting in config.SETTINGS:
+        assert setting.field in fields, setting.name
+        assert setting.key not in keys and setting.name not in names
+        assert setting.scope in ("now", "session", "run")
+        keys.add(setting.key)
+        names.add(setting.name)
+
+
+def test_every_settings_default_survives_its_own_parser():
+    """A default the setting would refuse if it were typed means /<name> reset
+    lands on a value /<name> <that value> won't accept."""
+    for setting in config.SETTINGS:
+        default = getattr(AgentConfig, setting.field)
+        if default in ("", 0):
+            continue          # unset is a state, not a value you can type
+        assert setting.parse(default) == default, setting.name
+
+
+def test_secrets_and_footguns_are_not_saveable():
+    """--auto-approve outliving the run that wanted it is a footgun, and a
+    key in a plaintext settings file is a leak — neither is a preference."""
+    saveable = {s.field for s in config.SETTINGS}
+    assert "auto_approve" not in saveable and "llm_api_key" not in saveable
+    assert not saveable & {"project_root", "db_path", "log_path", "mcp_log_path"}
+
+
+@pytest.mark.parametrize("typed,expected", [
+    ("/max-steps", "max-steps"),
+    ("max_steps", "max-steps"),
+    ("/SYSTEM_PROMPT", "system-prompt"),
+    ("/context_chart_budget", "context-char-budget"),   # the typo the name invites
+    ("context-chart-budget", "context-char-budget"),
+])
+def test_a_setting_is_found_however_its_name_is_spelled(typed, expected):
+    assert config.find_setting(typed).name == expected
+
+
+@pytest.mark.parametrize("typed", ["", None, "/nope", "compact"])
+def test_anything_else_is_not_a_setting(typed):
+    assert config.find_setting(typed) is None
+
+
+@pytest.mark.parametrize("given,expected", [("on", True), ("off", False), ("yes", True),
+                                            ("0", False), ("TRUE", True)])
+def test_a_flag_setting_reads_how_it_was_typed(given, expected):
+    assert config.SETTINGS_BY_NAME["parse-intent"].parse(given) is expected
+
+
+def test_an_unrecognized_word_is_not_a_flag():
+    """It must not quietly read as False — "parse-intent maybe" would then
+    silently turn intent parsing off."""
+    assert config.SETTINGS_BY_NAME["parse-intent"].parse("maybe") is None
+
+
+def test_the_embedding_backend_can_be_turned_off_by_name():
+    """"" can be passed to the flag but not typed at a slash command."""
+    assert config.SETTINGS_BY_NAME["embedding-model"].parse("off") == ""
+    assert config.SETTINGS_BY_NAME["embedding-model"].parse("mxbai") == "mxbai"
+
+
+def test_a_system_prompt_from_a_file_keeps_its_formatting():
+    """Unlike the one-line settings it is not stripped: the trailing newline
+    and the indentation are the user's."""
+    assert config.SETTINGS_BY_NAME["system-prompt"].parse("A.\n\n  B.\n") == "A.\n\n  B.\n"
+    assert config.SETTINGS_BY_NAME["system-prompt"].parse(" \n ") is None
+
+
+def test_saved_settings_collects_every_usable_value_and_skips_junk(settings):
+    with open(settings, "w") as f:
+        json.dump({"maxSteps": 7, "themeColor": "chartreuse", "parseIntent": False,
+                   "mcpServers": {"docs": {}}}, f)
+    assert config.saved_settings(settings) == {"max_steps": 7, "parse_intent": False}

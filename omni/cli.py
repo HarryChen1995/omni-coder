@@ -43,11 +43,12 @@ from typing import List, Optional
 
 import typer
 
-from .agent import CodingAgent
+from .agent import CodingAgent, SYSTEM_PROMPT
 from .config import (
-    AgentConfig, normalize_hex_color, save_setting, saved_theme_color, THEME_COLOR_KEY,
+    AgentConfig, env_setting, find_setting, save_setting, saved_setting,
+    SETTINGS, SETTINGS_BY_NAME,
 )
-from .llm_client import LLMError, chat, list_models
+from .llm_client import DEFAULT_BASE_URL, LLMError, chat, list_models
 from .mcp_client import (
     MCPToolClient, default_mcp_config_path, load_mcp_config,
     parse_mcp_server_specs, save_mcp_config,
@@ -65,15 +66,26 @@ _STATIC_COMMANDS = {
     "/agent": "the agents in this session — /agent <n> switches, /agent close <n> drops one",
     "/expand ": "reprint one tool call whole, arguments and result — /expand <n>",
     "/btw ": "ask a quick side question without touching this session's history",
-    "/model": "list models available on the LLM server (also populates /model <name> below)",
-    "/theme-color": "the UI accent colour — /theme-color #00b4d8 sets and saves it, "
-                     "/theme-color reset restores the built-in one",
+    "/model": "list models available on the LLM server and switch (the choice is saved; "
+               "also populates /model <name> below)",
+    "/config": "every saved setting at once — /config reset restores all of them to defaults",
     "/mcp": "show connected MCP servers, connect time, and tool counts",
     "/mcp restart ": "reconnect an MCP server after changing it — /mcp restart <name|all>",
     "/mcp tools ": "list the tools one MCP server exposes — /mcp tools <name>",
     "/mcp remove ": "disconnect a server and stop loading it — /mcp remove <name>",
     "/resources": "list resources published by connected MCP servers — /resources <uri> reads one",
 }
+
+# One command per saved preference, off the same registry that defines what
+# the settings are and how they're parsed — so a new row there is a new
+# command here, listed in the completion menu, without a second list to keep
+# in step. /model is the exception already spelled out above: bare it opens
+# the picker rather than reporting a value.
+_STATIC_COMMANDS.update({
+    f"/{setting.name}": f"{setting.summary} — /{setting.name} <value> sets and saves it, "
+                        f"/{setting.name} reset restores the default"
+    for setting in SETTINGS if setting.name != "model"
+})
 
 app = typer.Typer(add_completion=False, help="Coding agent (Qwen Coder or any OpenAI-compatible model)")
 
@@ -85,7 +97,13 @@ def main(
                    "with no new instruction) or --list-sessions.",
     ),
     project_root: str = typer.Option(".", "--project-root", "-p", help="Directory the agent is scoped to"),
-    model: str = typer.Option("qwen3.6:35b", "--model", "-m", help="Model name to drive the agent"),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m",
+        help="Model name to drive the agent. This session only — it overrides the model saved "
+             "by /model without replacing it. Omit to use the saved model; with none saved, "
+             "the first model the LLM server lists is used, so there is nothing to pass on a "
+             "working server.",
+    ),
     llm_host: Optional[str] = typer.Option(
         None, "--llm-host", help="OpenAI-compatible server URL (defaults to $LLM_HOST or http://localhost:11434)",
     ),
@@ -95,20 +113,23 @@ def main(
              "(defaults to $LLM_API_KEY — prefer the env var over this flag "
              "so the key doesn't end up in your shell history).",
     ),
-    llm_timeout: float = typer.Option(
-        AgentConfig.llm_timeout_s, "--llm-timeout",
+    llm_timeout: Optional[float] = typer.Option(
+        None, "--llm-timeout",
         help="Per-request timeout (seconds) for calls to the LLM server (chat, intent parsing, "
              "history compaction). Raise this if you're seeing repeated retries with a slow/large "
              "local model — that's usually a client-side timeout, not the server being unreachable.",
     ),
-    max_steps: int = typer.Option(100, "--max-steps", help="Hard cap on agent loop iterations"),
+    max_steps: Optional[int] = typer.Option(
+        None, "--max-steps", help="Hard cap on agent loop iterations "
+                                  f"(default {AgentConfig.max_steps}, or whatever /max-steps saved)",
+    ),
     subagent_model: Optional[str] = typer.Option(
         None, "--subagent-model",
         help="Model for subagents the agent spawns (defaults to --model). Exploration and "
              "review are where a smaller, faster model pays off.",
     ),
-    subagent_max_steps: int = typer.Option(
-        AgentConfig.subagent_max_steps, "--subagent-max-steps",
+    subagent_max_steps: Optional[int] = typer.Option(
+        None, "--subagent-max-steps",
         help="Step cap for one subagent, separate from --max-steps so a runaway subagent "
              "can't eat the whole run's allowance.",
     ),
@@ -125,10 +146,12 @@ def main(
     ),
     system_prompt: Optional[str] = typer.Option(
         None, "--system-prompt",
-        help="Replace the built-in system prompt with this text. Omit to use the built-in one, "
-             "which is what tells the model the tool discipline the loop expects (prefer "
-             "edit_file over write_file, finish with plain text, save_memory for durable "
-             "facts) — a replacement should cover the same ground.",
+        help="Replace the built-in system prompt with this text. This session only — it "
+             "overrides the prompt saved by /system-prompt without replacing it. Omit to use "
+             "the saved prompt, or the built-in one if none is saved, which is what tells the "
+             "model the tool discipline the loop expects (prefer edit_file over write_file, "
+             "finish with plain text, save_memory for durable facts) — a replacement should "
+             "cover the same ground.",
     ),
     system_prompt_file: Optional[str] = typer.Option(
         None, "--system-prompt-file",
@@ -156,14 +179,16 @@ def main(
     intent_model: Optional[str] = typer.Option(
         None, "--intent-model", help="Smaller/faster model to use just for intent parsing (defaults to --model)",
     ),
-    context_char_budget: int = typer.Option(
-        AgentConfig.context_char_budget, "--context-char-budget",
+    context_char_budget: Optional[int] = typer.Option(
+        None, "--context-char-budget",
         help="Rough character budget (not tokens) for the running conversation. Once exceeded, "
              "history is compacted — an LLM call summarizes everything except the system+task "
-             "messages and the most recent --compact-keep-last messages.",
+             "messages and the most recent --compact-keep-last messages. This session only — it "
+             "overrides the budget saved by /context-char-budget without replacing it. Omit to "
+             f"use the saved budget, or {AgentConfig.context_char_budget} if none is saved.",
     ),
-    compact_keep_last: int = typer.Option(
-        AgentConfig.compact_keep_last, "--compact-keep-last",
+    compact_keep_last: Optional[int] = typer.Option(
+        None, "--compact-keep-last",
         help="How many of the most recent messages to keep verbatim (not summarized) when "
              "history is compacted, either automatically (--context-char-budget) or via /compact.",
     ),
@@ -193,8 +218,8 @@ def main(
     delete_session: Optional[str] = typer.Option(
         None, "--delete-session", help="Delete a saved session (by id or --session-name) and exit",
     ),
-    mcp_connect_timeout: float = typer.Option(
-        AgentConfig.mcp_connect_timeout_s, "--mcp-connect-timeout",
+    mcp_connect_timeout: Optional[float] = typer.Option(
+        None, "--mcp-connect-timeout",
         help="Seconds one MCP server gets to complete its handshake before the session "
              "carries on without it. A server that starts but never speaks MCP (or an "
              "unreachable URL) is reported as failed instead of blocking startup; "
@@ -294,29 +319,6 @@ def main(
         _print_sessions(SessionStore(db_path).list_sessions())
         raise typer.Exit()
 
-    # --theme-color is a session override: it wins over the saved preference
-    # and is deliberately NOT written back, so trying a colour out for one run
-    # can't quietly become the colour of every run after it. /theme-color in
-    # the REPL is the one that saves.
-    if theme_color is not None:
-        normalized = normalize_hex_color(theme_color)
-        if normalized is None:
-            typer.echo(f"Error: --theme-color {theme_color!r} isn't a 6-digit hex colour "
-                        "(e.g. '#00b4d8').", err=True)
-            raise typer.Exit(code=1)
-        theme_color = normalized
-    else:
-        theme_color = saved_theme_color()
-
-    if theme_color:
-        try:
-            # Applied before anything renders — the full-screen app copies the
-            # style map when it's built.
-            from . import ui
-            ui.set_accent(theme_color)
-        except ImportError:
-            pass
-
     if system_prompt is not None and system_prompt_file is not None:
         typer.echo("Error: pass --system-prompt or --system-prompt-file, not both.", err=True)
         raise typer.Exit(code=1)
@@ -333,6 +335,62 @@ def main(
             # flag was ignored, which is worse than refusing.
             typer.echo(f"Error: --system-prompt-file {system_prompt_file!r} is empty.", err=True)
             raise typer.Exit(code=1)
+
+    # Every preference in the settings registry is resolved the same way:
+    # the flag if it was passed, else what the matching slash command saved,
+    # else the built-in default. The flags are session overrides and are
+    # deliberately never written back — trying a model or a colour out for one
+    # run must not quietly become the setting for every run after it.
+    preferences = _resolve_preferences({
+        "model": model,
+        "llm_host": llm_host,
+        "llm_timeout_s": llm_timeout,
+        "max_steps": max_steps,
+        "subagent_model": subagent_model,
+        "subagent_max_steps": subagent_max_steps,
+        # --skip-intent-parsing is the flag; parse_intent is the preference,
+        # so the flag only speaks when it is actually passed.
+        "parse_intent": False if skip_intent_parsing else None,
+        "intent_model": intent_model,
+        "compact_model": compact_model,
+        "compact_keep_last": compact_keep_last,
+        "context_char_budget": context_char_budget,
+        "embedding_model": embedding_model,
+        "mcp_connect_timeout_s": mcp_connect_timeout,
+        "system_prompt": system_prompt,
+        "theme_color": theme_color,
+    })
+
+    # Nothing chose a model — not the flag, not the settings file, not
+    # $DEFAULT_LLM_MODEL — so ask the server what it has. There is no name
+    # compiled in to fall back on, by design: any default is the wrong model
+    # on every install that doesn't happen to run it, and the server already
+    # knows the right answer.
+    host = preferences["llm_host"] or DEFAULT_BASE_URL
+    if not preferences["model"]:
+        preferences["model"] = _discover_model(preferences["llm_host"], llm_api_key or "")
+        if preferences["model"]:
+            typer.echo(f"No model set — using {preferences['model']}, the first one {host} "
+                       "lists. /model switches and saves.")
+
+    if not preferences["model"]:
+        # Refusing here is the whole point of having no default: the
+        # alternative is a run that gets as far as its first call and fails
+        # inside the server, where the fix is much harder to read off.
+        typer.echo(f"Error: no model set, and {host} couldn't be asked which it has. "
+                   "Start the LLM server, or name a model with --model <name>, "
+                   "$DEFAULT_LLM_MODEL, or /model (which saves it for every later "
+                   "run).", err=True)
+        raise typer.Exit(code=1)
+
+    if preferences["theme_color"]:
+        try:
+            # Applied before anything renders — the full-screen app copies the
+            # style map when it's built.
+            from . import ui
+            ui.set_accent(preferences["theme_color"])
+        except ImportError:
+            pass
 
     try:
         extra_mcp_servers = parse_mcp_server_specs(mcp_server)
@@ -357,32 +415,16 @@ def main(
     )
 
     cfg = AgentConfig(
-        model=model,
-        llm_host=llm_host or "",
         llm_api_key=llm_api_key or "",
-        llm_timeout_s=llm_timeout,
         project_root=project_root,
-        max_steps=max_steps,
         auto_approve=auto_approve,
         log_path=log_path,
         mcp_log_path=mcp_log_path,
-        system_prompt=system_prompt or "",
-        theme_color=theme_color or "",
-        subagent_model=subagent_model or "",
-        subagent_max_steps=subagent_max_steps,
-        parse_intent=not skip_intent_parsing,
-        intent_model=intent_model or "",
-        context_char_budget=context_char_budget,
-        compact_keep_last=compact_keep_last,
-        compact_model=compact_model or "",
         db_path=db_path,
-        mcp_connect_timeout_s=mcp_connect_timeout,
         mcp_config_path=effective_mcp_config_path,
         mcp_servers=extra_mcp_servers,
         safe_tools=AgentConfig.safe_tools + tuple(safe_tool),
-        # None (flag omitted) -> AgentConfig's own default ("nomic-local");
-        # "" (--embedding-model "" explicitly) -> disabled.
-        embedding_model=embedding_model if embedding_model is not None else AgentConfig.embedding_model,
+        **preferences,
     )
 
     if task is None:
@@ -767,15 +809,24 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         default=cfg.model if cfg.model in models else None,
                     ).run_async()
                     if selected and selected != cfg.model:
-                        cfg.model = selected
-                        _announce_model(cfg.model, tui)
+                        # Through the setting, not straight onto the config:
+                        # picking a model from the list is the same act as
+                        # typing /model <name>, and should be remembered the
+                        # same way.
+                        _setting_command(cfg, tui, SETTINGS_BY_NAME["model"], selected)
                     continue
-                if task.startswith("/model "):
-                    cfg.model = task[len("/model "):].strip()
-                    _announce_model(cfg.model, tui)
+                verb, _, rest = task.partition(" ")
+                if verb == "/config":
+                    _config_command(cfg, tui, rest.strip())
                     continue
-                if task == "/theme-color" or task.startswith("/theme-color "):
-                    _theme_color_command(cfg, tui, task[len("/theme-color"):].strip())
+                # Every saved preference is dispatched off the registry, which
+                # is also what forgives the underscored spellings: the names
+                # are read off the AgentConfig fields they set, which are
+                # underscored. They land here rather than falling through to
+                # the MCP-prompt lookup below, which would call them unknown.
+                setting = find_setting(verb)
+                if setting is not None:
+                    _setting_command(cfg, tui, setting, rest.strip())
                     continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
@@ -1153,60 +1204,270 @@ def _echo(text: str, err: bool = False):
     typer.echo(text, err=err)
 
 
-def _theme_color_command(cfg, tui, argument: str):
-    """/theme-color — read, set or clear the saved accent colour.
+def _discover_model(host: str, api_key: str, timeout_s: float = 8.0) -> str:
+    """The first model the LLM server lists, or "" if it can't say.
 
-    Saving is the point: --theme-color already recolours one session, and the
-    thing it can't do is remember. So this writes to the settings file and
-    applies the colour to the session in hand, which means telling the
-    full-screen app (it holds a copy of the style map built at startup) as
-    well as ui itself.
+    Which model that is comes down to the order the server reports, and the
+    only alternative — guessing from the names — would be worse: the caller
+    says where the name came from, and /model overrides it permanently in one
+    line. The timeout is short and separate from --llm-timeout, which is
+    sized for generating tokens rather than for a GET that should answer
+    immediately: a slow server must not turn startup into a wait."""
+    try:
+        models = asyncio.run(list_models(host or None, api_key or None, timeout=timeout_s))
+    except (LLMError, OSError, RuntimeError):
+        return ""
+    return models[0] if models else ""
 
-    Already-printed transcript blocks keep the colour they were rendered in.
-    They're rendered text by then, and re-rendering the session's whole
-    history to recolour it would also lose whatever is in scrollback above
-    it — so the change reads as "from here on", which is what a colour
-    changed mid-session honestly is."""
-    from . import ui
+
+def _resolve_preferences(chosen: dict) -> dict:
+    """{field: value} for every setting in the registry.
+
+    `chosen` carries what the flags said, with None for "not passed" — which
+    is why the flags that back a preference all default to None rather than to
+    the value they used to hardcode. A flag that was passed is validated the
+    same way the slash command validates what is typed at it, so
+    --max-steps 0 is refused at the door instead of producing a run that
+    ends before its first step.
+
+    Below the flag: what /<name> saved, then the setting's environment
+    variable if it has one, then the built-in default."""
+    resolved = {}
+    for setting in SETTINGS:
+        given = chosen.get(setting.field)
+        if given is not None:
+            value = setting.parse(given)
+            if value is None:
+                typer.echo(f"Error: --{setting.name} {given!r} is not usable — expected "
+                           f"{setting.hint}.", err=True)
+                raise typer.Exit(code=1)
+        else:
+            value = saved_setting(setting)
+            if value is None:
+                value = env_setting(setting)
+            if value is None:
+                value = getattr(AgentConfig, setting.field)
+        resolved[setting.field] = value
+    return resolved
+
+
+def _setting_command(cfg, tui, setting, argument: str):
+    """One saved preference: read it, set it, or put it back to the default.
+
+    Every setting in the registry is driven through here rather than through a
+    handler of its own, so they all agree on what "reset" means, on where the
+    value is written, and on what happens when the settings file can't be
+    written — the value still applies to the session in hand, because a
+    preference that didn't stick is worth saying rather than refusing.
+
+    Saving is the whole point: the flags already set any of these for one run,
+    and the thing they can't do is remember."""
+    current = getattr(cfg, setting.field)
+    default = getattr(AgentConfig, setting.field)
 
     if not argument:
-        active = cfg.theme_color or ui.DEFAULT_ACCENT
-        saved = saved_theme_color()
-        where = "saved" if saved == active else ("this session only" if cfg.theme_color else "built-in")
-        _echo(f"Accent colour: {active} ({where}).  "
-               f"Set one with /theme-color #00b4d8, or /theme-color reset.")
+        where = _setting_origin(setting, current)
+        if where:
+            where = f"  [{where}]"
+        body = f"\n{_preview(current)}\n" if setting.from_file and current else " "
+        _echo(f"{setting.name}: {_setting_display(setting, current)}{where} — "
+              f"{setting.summary}.{body}"
+              f"Set one with /{setting.name} <value> ({setting.hint}), "
+              f"or /{setting.name} reset.")
         return
 
     if argument.lower() in ("reset", "default", "clear"):
         try:
-            path = save_setting(THEME_COLOR_KEY, None)
+            path = save_setting(setting.key, None)
         except OSError as e:
             _echo(f"Error: could not write the settings file: {e}", err=True)
             return
-        cfg.theme_color = ""
-        _apply_theme_color(ui.DEFAULT_ACCENT, tui)
-        _echo(f"Accent colour reset to the built-in {ui.DEFAULT_ACCENT} (cleared from {path}).")
+        _apply_setting(cfg, tui, setting, default)
+        _echo(f"{setting.name} reset to its default "
+              f"({_setting_display(setting, default)}), cleared from {path}."
+              f"{_setting_scope_note(setting)}")
         return
 
-    colour = normalize_hex_color(argument)
-    if colour is None:
-        _echo(f"Error: {argument!r} isn't a 6-digit hex colour — try /theme-color #00b4d8.",
-               err=True)
+    verb, _, rest = argument.partition(" ")
+    if setting.from_file and verb.lower() == "file":
+        source = rest.strip()
+        if not source:
+            _echo(f"Error: /{setting.name} file needs a path.", err=True)
+            return
+        try:
+            argument = open(os.path.expanduser(source), encoding="utf-8").read()
+        except OSError as e:
+            _echo(f"Error: could not read {source!r}: {e}", err=True)
+            return
+        if not argument.strip():
+            # Saving it would clear the setting rather than replace it, which
+            # is not what "set it from this file" asked for.
+            _echo(f"Error: {source!r} is empty — use /{setting.name} reset to go back to "
+                   "the default.", err=True)
+            return
+
+    value = setting.parse(argument)
+    if value is None:
+        _echo(f"Error: {argument!r} isn't usable for /{setting.name} — expected "
+              f"{setting.hint}.", err=True)
         return
 
+    shown = _setting_display(setting, value)
     try:
-        path = save_setting(THEME_COLOR_KEY, colour)
+        path = save_setting(setting.key, value)
     except OSError as e:
-        # Still worth applying: the colour works for this session even if the
-        # preference couldn't be written, and saying so beats refusing.
-        cfg.theme_color = colour
-        _apply_theme_color(colour, tui)
-        _echo(f"Accent colour set to {colour} for this session — could not save it: {e}",
-               err=True)
+        _apply_setting(cfg, tui, setting, value)
+        _echo(f"{setting.name} set to {shown} for this session — could not save it: {e}",
+              err=True)
         return
-    cfg.theme_color = colour
-    _apply_theme_color(colour, tui)
-    _echo(f"Accent colour → {colour}, saved to {path}.")
+    _apply_setting(cfg, tui, setting, value)
+    _echo(f"{setting.name} → {shown}, saved to {path}.{_setting_scope_note(setting)}")
+
+
+def _setting_origin(setting, value) -> str:
+    """Where a setting's current value came from, or "" for the built-in
+    default.
+
+    Worth saying: a value set for this session only looks identical to a
+    saved one until the next run, which is when the difference bites — and a
+    value that arrived from the environment is one nothing in the settings
+    file explains."""
+    if value == getattr(AgentConfig, setting.field):
+        return ""
+    if saved_setting(setting) == value:
+        return "saved"
+    if env_setting(setting) == value:
+        return f"${setting.env}"
+    return "this session only"
+
+
+def _apply_setting(cfg, tui, setting, value):
+    """Put a setting's new value on the live config, and anywhere else that
+    holds a copy of it. Only the accent colour has such a copy: every Rich
+    renderer builds its styles from ACCENT at call time, but the full-screen
+    app was handed the style map when it was constructed."""
+    setattr(cfg, setting.field, value)
+    if setting.field == "theme_color":
+        colour = value or _default_accent()
+        if colour:
+            _apply_theme_color(colour, tui)
+    elif setting.field == "model":
+        _announce_model(value, tui)
+
+
+def _setting_display(setting, value) -> str:
+    """One setting's value, on one line.
+
+    The system prompt is the reason this isn't just str(): replaying a whole
+    prompt into the transcript to confirm it was saved is worse than saying
+    how long it is — the top of it is shown separately, by the one command
+    that has room for it."""
+    if not value and not isinstance(value, bool):
+        empty = setting.empty
+        if setting.field == "theme_color":
+            accent = _default_accent()
+            return f"{empty} {accent}".strip()
+        if setting.field == "system_prompt":
+            return f"{empty} ({len(SYSTEM_PROMPT)} chars)"
+        return empty
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if setting.from_file:
+        return f"{len(value):,} chars"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+def _setting_scope_note(setting) -> str:
+    """Why a setting that was just saved hasn't changed anything yet.
+
+    Without this the two that aren't live look broken: the system prompt is
+    stored as a session's first message when the session is created, and the
+    tool-side knobs are handed to the MCP server process as environment when
+    it connects."""
+    if setting.scope == "session":
+        return " Takes effect in the next new session."
+    if setting.scope == "run":
+        return " Takes effect the next time omni starts."
+    return ""
+
+
+def _preview(text: str, lines: int = 6, width: int = 100) -> str:
+    """The first few lines of `text`, for echoing a setting back without
+    replaying a whole system prompt into the transcript."""
+    body = text.strip().splitlines()
+    shown = [line if len(line) <= width else line[:width - 1] + "…" for line in body[:lines]]
+    if len(body) > lines:
+        shown.append("…")
+    return "\n".join(shown)
+
+
+def _default_accent() -> str:
+    """The built-in accent, or "" on a bare install where there is no UI to
+    have one. /config lists every setting, theme-color included, so it must
+    not be the one command that needs rich installed to print a line."""
+    try:
+        from . import ui
+        return ui.DEFAULT_ACCENT
+    except ImportError:
+        return ""
+
+
+def _config_command(cfg, tui, argument: str):
+    """/config — every saved preference at once, and the one way to clear
+    them all. A settings file is easy to accumulate and hard to remember, so
+    the listing marks which values came from it."""
+    if argument.lower() in ("reset", "default", "clear"):
+        cleared = []
+        for setting in SETTINGS:
+            if saved_setting(setting) is None:
+                continue
+            try:
+                path = save_setting(setting.key, None)
+            except OSError as e:
+                _echo(f"Error: could not write the settings file: {e}", err=True)
+                return
+            _apply_setting(cfg, tui, setting, getattr(AgentConfig, setting.field))
+            cleared.append(setting.name)
+        if not cleared:
+            _echo("Nothing saved to reset — every setting is already at its default.")
+            return
+        _echo(f"Reset to defaults: {', '.join(cleared)} (cleared from {path}). "
+              "Registered MCP servers are untouched.")
+        return
+    if argument:
+        setting = find_setting(argument)
+        if setting is None:
+            _echo(f"Error: {argument!r} isn't a setting. /config lists them.", err=True)
+            return
+        _setting_command(cfg, tui, setting, "")
+        return
+
+    lines = []
+    for setting in SETTINGS:
+        value = getattr(cfg, setting.field)
+        mark = _setting_origin(setting, value)
+        shown = _setting_display(setting, value)
+        lines.append(f"  /{setting.name:<22} {shown}" + (f"  [{mark}]" if mark else ""))
+    _echo("Settings (/<name> <value> sets and saves one, /<name> reset restores its "
+          "default, /config reset restores all):\n" + "\n".join(lines))
+
+
+# Named wrappers for the settings that had a command before the registry
+# existed. They are what the REPL and the tests call; the behaviour is the
+# generic one.
+
+def _theme_color_command(cfg, tui, argument: str):
+    return _setting_command(cfg, tui, SETTINGS_BY_NAME["theme-color"], argument)
+
+
+def _system_prompt_command(cfg, argument: str, tui=None):
+    return _setting_command(cfg, tui, SETTINGS_BY_NAME["system-prompt"], argument)
+
+
+def _context_char_budget_command(cfg, argument: str, tui=None):
+    return _setting_command(cfg, tui, SETTINGS_BY_NAME["context-char-budget"], argument)
 
 
 def _apply_theme_color(colour: str, tui=None):

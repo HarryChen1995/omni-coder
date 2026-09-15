@@ -14,8 +14,16 @@ from dataclasses import dataclass, field
 # survives into every later run.
 
 THEME_COLOR_KEY = "themeColor"
+SYSTEM_PROMPT_KEY = "systemPrompt"
+CONTEXT_CHAR_BUDGET_KEY = "contextCharBudget"
 
 _HEX_COLOR_RE = re.compile(r"#?[0-9a-fA-F]{6}")
+
+# Below this a budget is self-defeating: the system prompt alone is ~900
+# characters, so anything smaller compacts on every single step and spends a
+# summarization call per turn to save nothing. It is a floor on the setting,
+# not on the model's context.
+MIN_CONTEXT_CHAR_BUDGET = 2_000
 
 
 def normalize_hex_color(value: str) -> str:
@@ -75,16 +83,252 @@ def save_setting(key: str, value, path: str = None) -> str:
     return path
 
 
-def saved_theme_color(path: str = None) -> str:
-    """The accent colour saved by /theme-color, or "" if none is set (or what
-    is set isn't a usable hex — a hand-edited settings file shouldn't be able
-    to paint the UI an unparseable colour)."""
-    return normalize_hex_color(load_settings(path).get(THEME_COLOR_KEY)) or ""
+# ---- the settings registry -------------------------------------------------
+#
+# One row per preference that can be set from the REPL and remembered across
+# runs. Everything downstream is driven off this table rather than written
+# per setting: the slash commands and their completion entries, the "set it,
+# save it, reset it" handler, the /config listing, and the startup rule that a
+# flag beats the saved value beats the built-in default. Adding a preference
+# is adding a row.
+#
+# What is deliberately NOT here: --auto-approve (a saved "never ask me again"
+# is a footgun that outlives the run that wanted it), --llm-api-key (a secret
+# does not belong in a plaintext settings file — use $LLM_API_KEY), and the
+# per-invocation paths (--project-root, --db-path, the log files), which
+# describe one run rather than a preference.
+
+
+def _text(value):
+    """Any non-blank string. Blank is None so "/model   " reads as a
+    question rather than as clearing the model to nothing."""
+    text = str(value if value is not None else "").strip()
+    return text or None
+
+
+def _prose(value):
+    """Text kept exactly as it was given, unless it is blank.
+
+    Unlike _text this does not strip: a system prompt read from a file is
+    the user's formatting, trailing newline included, and the REPL has
+    already stripped what was typed at the prompt by the time it lands
+    here."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def _whole(minimum: int):
+    """A whole number at or above `minimum`, or None.
+
+    Digit-group separators are accepted ("200_000", "200,000"): the context
+    budget is six digits long and the code that sets its default spells it
+    200_000, and a number mistyped by a factor of ten is not obvious on
+    screen. Anything under the minimum is refused rather than clamped —
+    silently using a different number than the one typed is how a session
+    ends up compacting every turn with no explanation."""
+    def parse(value):
+        if isinstance(value, bool):   # bool is an int; "true" is not a number
+            return None
+        if isinstance(value, int):
+            number = value
+        else:
+            text = str(value if value is not None else "").strip().replace("_", "").replace(",", "")
+            if not text.isdigit():
+                return None
+            number = int(text)
+        return number if number >= minimum else None
+    return parse
+
+
+def _seconds(minimum: float):
+    """A number of seconds at or above `minimum`. Floats are accepted because
+    the timeouts are floats; the step caps use _whole instead."""
+    def parse(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number if number >= minimum else None
+    return parse
+
+
+_TRUE = ("true", "yes", "on", "1")
+_FALSE = ("false", "no", "off", "0")
+
+
+def _flag(value):
+    """A boolean, spelled however it was typed. None for anything else —
+    an unrecognized word must not quietly read as False."""
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    return True if text in _TRUE else False if text in _FALSE else None
+
+
+def _embedding_backend(value):
+    """A model name, or "" for the keyword-matching fallback. The off
+    switch needs a spelling here because the empty string can be passed to
+    the flag but not typed at a slash command."""
+    text = str(value if value is not None else "").strip()
+    if text.lower() in ("off", "none", "disabled", "keyword"):
+        return ""
+    return text
+
+
+@dataclass(frozen=True)
+class Setting:
+    """One saveable preference. `name` is both the slash command (hyphenated,
+    no slash) and how it is listed; `field` is the AgentConfig field it sets;
+    `key` is its top-level key in the settings file."""
+
+    name: str
+    field: str
+    key: str
+    parse: callable
+    summary: str          # one line, for /config and the completion menu
+    hint: str             # what a usable value looks like, for the error
+    # When a change takes hold. "now" is the running loop; "session" is the
+    # next new session (the system prompt is stored as a session's first
+    # message when the session is created); "run" is the next start of omni
+    # (the tool-side knobs are handed to the MCP server process as env when
+    # it connects, and the connect timeout has already been spent by then).
+    scope: str = "now"
+    from_file: bool = False   # also settable as "<name> file <path>"
+    # An environment variable that supplies the value when neither the flag
+    # nor the settings file does. It sits below the saved preference on
+    # purpose: a variable named DEFAULT_* is what to use when nothing else
+    # says, not an override of what you deliberately saved.
+    env: str = ""
+    # What an empty value means, for the listing. Every one of these fields
+    # falls back to something rather than to nothing, and "unset" on its own
+    # invites setting it to a value it already behaves as.
+    empty: str = "unset"
+
+
+SETTINGS = (
+    Setting("model", "model", "model", _text,
+            "the model driving the agent", "a model name the LLM server lists",
+            env="DEFAULT_LLM_MODEL",
+            empty="unset (the first model the server lists)"),
+    Setting("llm-host", "llm_host", "llmHost", _text,
+            "the OpenAI-compatible server the models are called on",
+            "a URL, e.g. http://localhost:11434",
+            empty="unset ($LLM_HOST, or http://localhost:11434)"),
+    Setting("llm-timeout", "llm_timeout_s", "llmTimeoutS", _seconds(1),
+            "per-request timeout for calls to the LLM server, in seconds",
+            "a number of seconds, at least 1"),
+    Setting("max-steps", "max_steps", "maxSteps", _whole(1),
+            "hard cap on agent loop iterations", "a whole number, at least 1"),
+    Setting("subagent-model", "subagent_model", "subagentModel", _text,
+            "the model subagents run on (unset = the same one)",
+            "a model name, or reset to use the main one",
+            empty="unset (the main model)"),
+    Setting("subagent-max-steps", "subagent_max_steps", "subagentMaxSteps", _whole(1),
+            "step cap for one subagent, separate from max-steps",
+            "a whole number, at least 1"),
+    Setting("parse-intent", "parse_intent", "parseIntent", _flag,
+            "parse the task into structured intent before acting",
+            "on or off"),
+    Setting("intent-model", "intent_model", "intentModel", _text,
+            "the model intent parsing runs on (unset = the same one)",
+            "a model name, or reset to use the main one",
+            empty="unset (the main model)"),
+    Setting("compact-model", "compact_model", "compactModel", _text,
+            "the model history compaction runs on (unset = the same one)",
+            "a model name, or reset to use the main one",
+            empty="unset (the main model)"),
+    Setting("compact-keep-last", "compact_keep_last", "compactKeepLast", _whole(2),
+            "how many recent messages survive compaction verbatim",
+            "a whole number, at least 2"),
+    Setting("context-char-budget", "context_char_budget", CONTEXT_CHAR_BUDGET_KEY,
+            _whole(MIN_CONTEXT_CHAR_BUDGET),
+            "characters of history allowed before it is compacted",
+            f"a whole number, at least {MIN_CONTEXT_CHAR_BUDGET:,}, or the history "
+            "compacts on every step"),
+    Setting("embedding-model", "embedding_model", "embeddingModel", _embedding_backend,
+            "embedding backend ranking search_tools against deferred MCP tools",
+            'a model name, or "off" for plain keyword matching',
+            empty="off (plain keyword matching)"),
+    Setting("max-output-chars", "max_output_chars", "maxOutputChars", _whole(500),
+            "where one tool's output is truncated before the model sees it",
+            "a whole number, at least 500", scope="run"),
+    Setting("shell-timeout", "shell_timeout_s", "shellTimeoutS", _whole(1),
+            "how long one run_shell command may take, in seconds",
+            "a whole number of seconds, at least 1", scope="run"),
+    Setting("mcp-connect-timeout", "mcp_connect_timeout_s", "mcpConnectTimeoutS", _seconds(1),
+            "how long one MCP server gets to finish its handshake, in seconds",
+            "a number of seconds, at least 1", scope="run"),
+    Setting("system-prompt", "system_prompt", SYSTEM_PROMPT_KEY, _prose,
+            "the system prompt, replacing the built-in one",
+            "some text, or: file <path>", scope="session", from_file=True,
+            empty="the built-in prompt"),
+    Setting("theme-color", "theme_color", THEME_COLOR_KEY, normalize_hex_color,
+            "the UI accent colour", "a 6-digit hex colour, e.g. #00b4d8",
+            empty="the built-in accent"),
+)
+
+SETTINGS_BY_NAME = {s.name: s for s in SETTINGS}
+
+
+def find_setting(name: str) -> Setting:
+    """The setting `name` refers to, or None.
+
+    Underscored spellings resolve to the hyphenated ones: every name here is
+    read off the AgentConfig field it sets, which is underscored, so that is
+    at least as likely to be typed. "chart" for "char" is the typo the
+    budget's name invites, and costs one line to forgive."""
+    key = (name or "").strip().lower().lstrip("/").replace("_", "-")
+    return SETTINGS_BY_NAME.get(key.replace("chart", "char"))
+
+
+def env_setting(setting: Setting):
+    """A setting's value from its environment variable, or None.
+
+    Read when it's needed rather than at import, so exporting the variable
+    and running the agent in the same shell does what it looks like it
+    does — and so a test can set it."""
+    if not setting.env:
+        return None
+    return setting.parse(os.environ.get(setting.env, ""))
+
+
+def saved_setting(setting: Setting, path: str = None):
+    """The saved value of one setting, or None if nothing usable is saved.
+
+    Junk reads as nothing rather than propagating: a hand-edited settings
+    file must not be able to put the loop into permanent compaction, paint
+    the UI an unparseable colour, or cap the agent at zero steps."""
+    data = load_settings(path)
+    if setting.key not in data:
+        return None
+    return setting.parse(data[setting.key])
+
+
+def saved_settings(path: str = None) -> dict:
+    """Every usable saved preference, as {field: value} — ready to be merged
+    into an AgentConfig."""
+    values = {}
+    for setting in SETTINGS:
+        value = saved_setting(setting, path)
+        if value is not None:
+            values[setting.field] = value
+    return values
 
 
 @dataclass
 class AgentConfig:
-    model: str = "qwen3.6:35b"
+    # Empty on purpose: there is no model name compiled in here, because any
+    # name picked as a default is the wrong one on every install that doesn't
+    # happen to run it. The CLI fills this in from --model, from what /model
+    # saved, or by asking the server what it has; if none of those produce a
+    # name it refuses to start, which is a better answer than a first call
+    # that fails somewhere in the server with "model not found".
+    model: str = ""
     llm_host: str = ""   # empty = use LLM_HOST env var or http://localhost:11434
     llm_api_key: str = ""  # empty = use LLM_API_KEY env var; never hardcode this
 

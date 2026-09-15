@@ -85,6 +85,19 @@ Run `omni --help` for the full option list.
   ↓ 115)`, and live beside the spinner), from the server's own
   `prompt_tokens` / `completion_tokens`. Intent parsing and history
   compaction are counted too, and each agent counts only its own.
+- **No default model to get wrong** — nothing is compiled in: with no
+  `--model` and nothing saved, the agent asks the server which models it has
+  and uses the first one, or names `$DEFAULT_LLM_MODEL` if you exported one.
+  If nothing can name a model it says so and stops, instead of failing inside
+  the server on its first call.
+- **Settings that stick** — `/config` lists every preference (model, host,
+  timeouts, step caps, the system prompt, the context budget, the accent
+  colour) with its value and where it came from; `/<name> <value>` sets one
+  and saves it for every later run, `/<name> reset` restores its default, and
+  `/config reset` restores all of them. The matching flag sets any of them for
+  one run without replacing what's saved, so trying something out can't
+  quietly become permanent. The file is per user, so a saved setting holds
+  across every later run and every project.
 - **Themeable** — `/theme-color '#00b4d8'` recolours the accent across the
   whole UI and saves it for every later run (`/theme-color reset` goes back to
   the built-in one). `--theme-color` does the same for one session only,

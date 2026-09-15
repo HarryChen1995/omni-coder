@@ -350,6 +350,36 @@ def test_model_name_command_switches_without_redrawing_the_header(repl, mocker, 
     assert header.call_count == 1          # the one at startup
 
 
+# ---------------- settings ----------------
+
+def test_a_setting_typed_at_the_repl_is_saved(repl, cfg, settings_path):
+    repl(["/max-steps 7", "/context_chart_budget 50000"])
+    assert cfg.max_steps == 7 and cfg.context_char_budget == 50_000
+    saved = json.loads(settings_path.read_text())
+    assert saved == {"maxSteps": 7, "contextCharBudget": 50_000}
+
+
+def test_a_setting_is_reset_from_the_repl(repl, cfg, settings_path):
+    settings_path.write_text(json.dumps({"maxSteps": 7}))
+    cfg.max_steps = 7
+    repl(["/max-steps reset"])
+    assert cfg.max_steps == cli_mod.AgentConfig.max_steps
+    assert json.loads(settings_path.read_text()) == {}
+
+
+def test_config_lists_the_settings_at_the_repl(repl, capsys):
+    repl(["/config"])
+    out = capsys.readouterr().out
+    assert "/max-steps" in out and "/system-prompt" in out
+
+
+def test_a_slash_that_is_not_a_setting_still_falls_through(repl):
+    """The settings dispatch must not swallow everything starting with a
+    slash: anything that isn't a command is still run as a task."""
+    agent_run = repl(["/not-a-setting"])
+    assert agent_run.await_args.args[0] == "/not-a-setting"
+
+
 def test_header_is_not_redrawn_when_the_session_gets_its_id(repl, mocker):
     header = mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod.CodingAgent, "session_id", "abc12345", create=True)

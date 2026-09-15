@@ -7,9 +7,25 @@
 
 ## ⚙️ Setup
 ```bash
-ollama pull qwen3-coder:30b   # example: pulling the default model via Ollama
+ollama pull qwen3-coder:30b   # example: pulling a model via Ollama
 pip install -e .
 ```
+**There is no default model name.** Nothing is compiled in, because any name
+picked as a default is the wrong one on every install that doesn't happen to
+run it. With no `--model` and nothing saved by `/model`, the agent asks the
+server what it has (`GET /v1/models`) and uses the first model it lists,
+saying which. Full order, first one that answers wins:
+
+| | where it comes from | scope |
+|---|---|---|
+| 1 | `--model <name>` | this run only, never written back |
+| 2 | `/model <name>` in the REPL, or its picker | saved — every later run |
+| 3 | `$DEFAULT_LLM_MODEL` | that shell |
+| 4 | the first model the LLM server lists | that run |
+
+If none of those produce a name — usually because the server isn't running —
+the agent says so and stops, rather than starting a run that fails inside the
+server on its first call.
 No vendor SDK required — the agent talks to an OpenAI-compatible
 chat-completions endpoint (`/api/v1/chat/completions`) directly over HTTP via
 `httpx`. Reasoning models served with their output split in two (the answer in
@@ -30,7 +46,8 @@ Equivalent alternative: `python -m omni "..." --project-root ./myrepo`.
 
 Add `--auto-approve` to skip confirmation prompts (only in an already-isolated
 environment, e.g. a container you're fine getting wiped). Add `--max-steps N`
-to change the default cap of 100 agent-loop iterations. Run `omni --help`
+to change the cap of 100 agent-loop iterations (or `/max-steps N` once, to
+change it for good). Run `omni --help`
 for the full option list — it's a Typer app, so `--help` is auto-generated and
 kept in sync with the code.
 
@@ -415,15 +432,59 @@ MCP prompt exposed by a connected server. Special inputs:
   `tools.py`
 - `/model` — opens an interactive picker (↑/↓ to move, Enter to select, Esc to
   cancel) of models available on the LLM server, defaulting to the current one
-- `/model <name>` — switch the active model directly, without the picker
-- `/theme-color <#rrggbb>` — recolour the UI accent and **save** it, so every
-  later run starts that colour. Takes effect immediately — the frame, the
-  agent tree, the prompt and the shimmer all change under you, though blocks
-  already in the transcript keep the colour they were drawn in. `/theme-color`
-  on its own reports the current colour and where it came from;
-  `/theme-color reset` clears the saved one and goes back to the built-in
-  rust. Saved to `~/.omni-coder/omni-coder-settings.json` alongside any MCP
-  servers you've registered, which are left untouched
+- `/model <name>` — switch the active model directly, without the picker.
+  Either way the choice is saved, like any other setting below
+- `/config` — every saved setting at once, with its current value and a
+  `[saved]` mark on the ones that came from the settings file (`[this session
+  only]` on the ones a flag overrode for this run). `/config <name>` reports
+  one; `/config reset` puts every setting back to its default and clears them
+  all from the file, leaving registered MCP servers untouched
+- `/<setting> <value>` — set one setting and **save** it, so every later run
+  starts that way; `/<setting>` on its own reports it, and `/<setting> reset`
+  restores the default. The settings are the ones `/config` lists: `/model`,
+  `/llm-host`, `/llm-timeout`, `/max-steps`, `/subagent-model`,
+  `/subagent-max-steps`, `/parse-intent`, `/intent-model`, `/compact-model`,
+  `/compact-keep-last`, `/context-char-budget`, `/embedding-model`,
+  `/max-output-chars`, `/shell-timeout`, `/mcp-connect-timeout`,
+  `/system-prompt` and `/theme-color`. Each is the REPL half of the flag of
+  the same name: **the flag sets it for one run and is never written back**,
+  so trying a model or a colour out can't quietly become every run's setting,
+  while the slash command is the one that remembers. Underscores work too
+  (`/max_steps`, `/system_prompt`). Everything is written to
+  `~/.omni-coder/omni-coder-settings.json`, alongside any MCP servers you've
+  registered, which are left untouched. Deliberately *not* saveable:
+  `--auto-approve` (a remembered "never ask me again" outlives the run that
+  wanted it), `--llm-api-key` (a secret doesn't belong in a plaintext file —
+  use `$LLM_API_KEY`), and the per-invocation paths.
+
+  **Saved means everywhere.** The settings file is per *user*, not per project
+  or per session, so anything saved applies to every later run, in every repo,
+  and to subagents spawned inside them. In the session you're typing at, a
+  change lands immediately — except `/system-prompt`, which a session fixes as
+  its first message when it's created (so the next *new* session gets it, and
+  `--resume` keeps the prompt its session started with), and the three that
+  need a restart because the value is handed to the MCP server process when it
+  connects (`/max-output-chars`, `/shell-timeout`, `/mcp-connect-timeout`).
+  Each command says which of those it is when you set it. Another session
+  already running elsewhere read the file at *its* startup, so it keeps what
+  it loaded until you restart it
+- `/theme-color <#rrggbb>` — recolour the UI accent and save it. Takes effect
+  immediately — the frame, the agent tree, the prompt and the shimmer all
+  change under you, though blocks already in the transcript keep the colour
+  they were drawn in
+- `/system-prompt <text>` or `/system-prompt file <path>` — replace the
+  built-in system prompt, the one that tells the model the tool discipline the
+  loop relies on (prefer `edit_file` over `write_file`, finish with plain text,
+  `save_memory` for durable facts), so a replacement should cover the same
+  ground. `file <path>` is how a real one gets set, since the prompt reads one
+  line. A session stores its prompt as its first message when it's created, so
+  a change here reaches the *next* new session rather than the one in hand —
+  `--resume` keeps the prompt its session started with
+- `/context-char-budget <n>` — how many characters of history are allowed
+  before it's compacted (see `/compact` below). Live: the loop re-reads it at
+  the top of every step, so lowering it can compact the very next one. Refused
+  below 2,000, where the system prompt alone would trigger a summarization
+  call every step to save nothing
 - `/resources` — list resources published by connected MCP servers (the MCP
   "Resources" capability — readable context addressed by URI);
   `/resources <uri>` prints one. See
@@ -514,7 +575,9 @@ entry rather than the exact value.
 
 The flag is for one session: it overrides the saved colour without replacing
 it, so trying a colour out can't quietly become the colour of every run after
-it. `/theme-color <#rrggbb>` in the REPL is the one that saves.
+it. `/theme-color <#rrggbb>` in the REPL is the one that saves. That split is
+the same for every setting with both a flag and a slash command — see
+[`/config`](#-session-management).
 
 While a turn is unfinished, a highlight travels along the label that says why
 — "Running read_file…", an approval waiting on a y/n, a question the model
@@ -1015,7 +1078,17 @@ All modules live under `omni/`:
 - `__main__.py` — enables `python -m omni`
 
 Point at a non-default host with `--llm-host http://some-host:11434`
-or the `LLM_HOST` env var (checked in that order).
+or the `LLM_HOST` env var (checked in that order), or save one with
+`/llm-host` in the REPL.
+
+`DEFAULT_LLM_MODEL` names the model to use when neither `--model` nor a saved
+`/model` does — a per-shell default, below the saved preference precisely
+because it's called *default*:
+```bash
+export DEFAULT_LLM_MODEL="qwen3-coder:30b"
+```
+`/config` marks a value that arrived this way `[$DEFAULT_LLM_MODEL]`, so it's
+never a mystery why the model isn't the one in the settings file.
 
 If your LLM endpoint sits behind an authenticated proxy, set the key via
 environment variable rather than the CLI flag — it avoids the token landing

@@ -13,6 +13,24 @@ import pytest
 from omni.config import AgentConfig
 
 
+@pytest.fixture(autouse=True)
+def no_model_discovery(mocker):
+    """No test asks a real LLM server what models it has.
+
+    With no --model and nothing saved, the CLI now discovers one from the
+    server, so a developer who happens to have Ollama running on the default
+    port would otherwise get a different model than a CI box does — and the
+    tests that assert on the configured model would pass or fail by accident.
+    It stands in for a reachable server, since there is no model name
+    compiled in any more and the CLI refuses to start without one. Tests
+    that want a different answer — or none — patch it again themselves."""
+    from omni import cli
+    real = cli._discover_model
+    stub = mocker.patch("omni.cli._discover_model", return_value="discovered-model")
+    stub.real = real      # for the one test that exercises the lookup itself
+    return stub
+
+
 @pytest.fixture
 def project_root(tmp_path):
     """An isolated directory to act as --project-root."""
@@ -30,6 +48,7 @@ def project_root(tmp_path):
 def cfg(tmp_path, project_root):
     """AgentConfig with every on-disk path redirected into tmp_path."""
     return AgentConfig(
+        model="test-model",
         project_root=str(project_root),
         log_path=str(tmp_path / "agent_run.log"),
         db_path=str(tmp_path / "sessions.db"),
