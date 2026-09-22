@@ -59,7 +59,11 @@ def _file_paths() -> list:
     if sys.platform == "darwin":
         argv = ["osascript", "-e", "POSIX path of (the clipboard as «class furl»)"]
     elif sys.platform == "win32":
-        argv = ["powershell", "-NoProfile", "-Command",
+        # -Sta: clipboard OLE calls require a single-threaded apartment;
+        # powershell.exe (Windows PowerShell 5.1) is STA by default but not in
+        # every launch context, and reading the clipboard silently returns
+        # nothing under MTA. Forcing it makes the read reliable.
+        argv = ["powershell", "-NoProfile", "-Sta", "-Command",
                 "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"]
     else:
         argv = ["wl-paste", "--no-newline", "--type", "text/uri-list"]
@@ -129,7 +133,7 @@ def _from_linux() -> tuple:
 
 
 _WINDOWS_SCRIPT = """
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $image = [System.Windows.Forms.Clipboard]::GetImage()
 if ($image -eq $null) { exit 1 }
 $image.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
@@ -139,7 +143,9 @@ $image.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
 def _from_windows() -> tuple:
     path = os.path.join(tempfile.mkdtemp(prefix="omni-clip-"), "clip.png")
     try:
-        result = _run(["powershell", "-NoProfile", "-Command",
+        # -Sta: [Clipboard]::GetImage() returns $null under MTA rather than
+        # raising, so without this the paste silently finds "no image".
+        result = _run(["powershell", "-NoProfile", "-Sta", "-Command",
                         _WINDOWS_SCRIPT.replace("{path}", path.replace("\\", "\\\\"))])
     except (OSError, subprocess.SubprocessError):
         return None
@@ -173,7 +179,7 @@ def clipboard_text() -> str:
     """Whatever text the clipboard holds, or "" — used to spot a pasted path."""
     commands = {
         "darwin": ["pbpaste"],
-        "win32": ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+        "win32": ["powershell", "-NoProfile", "-Sta", "-Command", "Get-Clipboard"],
     }
     argv = commands.get(sys.platform, ["wl-paste", "--no-newline"])
     try:
