@@ -905,6 +905,15 @@ class TuiApp:
             # you are writing, and count how many you have pasted.
             self._buffer.insert_text(f"[Image #{len(pane.attachments)}]")
 
+        # Windows Terminal binds Ctrl+V to its own paste and swallows the
+        # keystroke, so the c-v binding above never fires there — image paste
+        # looked broken with no way in. Ctrl+B is passed through, so it's
+        # offered as an alternate trigger for the same paste. Windows only:
+        # elsewhere Ctrl+V reaches the app and Ctrl+B stays free for whatever
+        # the user's muscle memory expects.
+        if sys.platform == "win32":
+            keys.add("c-b", filter=Condition(self._accepts_typing))(_paste)
+
         @keys.add("enter", filter=Condition(lambda: self._asking()))
         def _answer_question(event):
             """What you typed if you typed anything, otherwise the highlighted

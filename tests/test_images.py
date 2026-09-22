@@ -262,6 +262,29 @@ async def test_a_pasted_newline_does_not_submit_the_line(app, mocker):
     assert app._buffer.text == "one two"
 
 
+def _active_binding(application, key):
+    for b in application._app.key_bindings.bindings:
+        if b.keys == (key,) and b.filter():
+            return b.handler
+    return None
+
+
+async def test_ctrl_b_is_an_alternate_paste_on_windows_only(app, mocker):
+    """Windows Terminal binds Ctrl+V to its own paste and swallows it, so the
+    c-v binding never fires there — Ctrl+B is offered as an alternate trigger
+    for the same paste, and only on Windows (elsewhere Ctrl+V works and Ctrl+B
+    stays free)."""
+    handler = _active_binding(app, Keys.ControlB)
+    if sys.platform == "win32":
+        assert handler is not None, "Ctrl+B should be an alternate paste on Windows"
+        mocker.patch("omni.clipboard.grab_image", return_value=("image/png", PNG))
+        handler(mocker.Mock())
+        assert app._buffer.text == "[Image #1]"
+        assert app.main.attachments == [{"mime": "image/png", "data": PNG}]
+    else:
+        assert handler is None, "Ctrl+B should not be bound off Windows"
+
+
 async def test_an_empty_clipboard_types_nothing(app, mocker):
     mocker.patch("omni.clipboard.grab_image", return_value=None)
     mocker.patch("omni.clipboard.clipboard_text", return_value="")

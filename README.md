@@ -240,6 +240,14 @@ itself, which needs a keystroke the terminal passes through. `osascript` does
 it on macOS, `wl-paste`/`xclip` on Linux, PowerShell on Windows; none is a
 hard dependency.
 
+**On Windows, use Ctrl+B if Ctrl+V does nothing.** Windows Terminal binds
+Ctrl+V to its *own* paste and swallows the keystroke, so it never reaches the
+app and the image never attaches. **Ctrl+B** is bound as an alternate on
+Windows for exactly this — it triggers the same paste. (You can instead free
+up Ctrl+V in Windows Terminal → Settings → Actions.) The Windows clipboard
+read is also run in an STA PowerShell process, which the image APIs require —
+without it `GetImage()` silently returns nothing.
+
 **A copied file works too** — Cmd+C or right-click → Copy on an image in
 Finder (or a file manager, or a path you copied as text). That case is asked
 about *first*, because Finder puts a reference to the file on the clipboard

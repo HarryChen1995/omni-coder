@@ -77,7 +77,9 @@ Run `omni --help` for the full option list.
   left exactly as they were. Ctrl+V rather than Cmd+V because Cmd+V is the
   *terminal's* own paste and no terminal can hand an application image data,
   so the clipboard is read directly (`osascript` / `wl-paste` / `xclip` /
-  PowerShell, none a hard dependency). A file copied in Finder works too, and
+  PowerShell, none a hard dependency). On Windows, use **Ctrl+B** if Ctrl+V
+  does nothing — Windows Terminal binds Ctrl+V to its own paste and swallows
+  it, so Ctrl+B is bound as an alternate trigger there. A file copied in Finder works too, and
   is preferred over the icon rendering the clipboard offers beside it; with no
   image on the clipboard at all the key pastes text as usual. Images are stored with the message, so a resumed
   session still sends what the model saw.
