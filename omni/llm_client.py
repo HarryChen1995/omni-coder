@@ -33,18 +33,29 @@ def _normalize_tool_call(call: dict) -> dict:
 
 def _normalize_messages(messages: list) -> list:
     normalized = []
+    seen_non_system = False
     for msg in messages:
         if not isinstance(msg, dict):
             normalized.append(msg)
+            seen_non_system = True
             continue
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            normalized.append({
-                **msg,
-                "tool_calls": [_normalize_tool_call(call) for call in tool_calls],
-            })
+        out = dict(msg)
+        if out.get("role") == "system":
+            # Only the leading block of system messages is valid; a system
+            # message that lands after any other role — e.g. a compacted-
+            # history summary injected mid-conversation, or one left in a
+            # session saved by an older build — makes strict servers reject
+            # the whole request ("System message must be at the beginning").
+            # Demoting it to user reads the same to the model and is accepted
+            # everywhere.
+            if seen_non_system:
+                out["role"] = "user"
         else:
-            normalized.append(msg)
+            seen_non_system = True
+        tool_calls = out.get("tool_calls")
+        if isinstance(tool_calls, list):
+            out["tool_calls"] = [_normalize_tool_call(call) for call in tool_calls]
+        normalized.append(out)
     return normalized
 
 

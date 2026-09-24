@@ -345,7 +345,7 @@ async def test_intent_parsing_is_skipped_when_resuming_with_no_new_task(agent, c
 # ---------------- budget / compaction / limits ----------------
 
 async def test_history_is_compacted_when_over_budget(agent, client, mocker):
-    agent.cfg.context_char_budget = 10
+    agent.cfg.context_window_budget = 10
     compact = mocker.patch.object(agent_mod, "_compact_messages",
                                   mocker.AsyncMock(side_effect=lambda m, *a, **kw: m))
     replies(mocker, text_reply("fin"))
@@ -354,11 +354,24 @@ async def test_history_is_compacted_when_over_budget(agent, client, mocker):
 
 
 async def test_history_is_not_compacted_under_budget(agent, client, mocker):
-    agent.cfg.context_char_budget = 10_000_000
+    agent.cfg.context_window_budget = 10_000_000
     compact = mocker.patch.object(agent_mod, "_compact_messages", mocker.AsyncMock())
     replies(mocker, text_reply("fin"))
     await agent.run("t", client=client)
     compact.assert_not_awaited()
+
+
+async def test_compaction_triggers_on_reported_tokens_not_char_count(agent, client, mocker):
+    """The budget is tokens: once the server reports a prompt larger than it,
+    compaction fires even though the char count of a tiny task is nowhere
+    near — it's the server's prompt_tokens that's watched, not characters."""
+    agent.cfg.context_window_budget = 100
+    agent._last_prompt_tokens = 5_000           # the server says the context is large
+    compact = mocker.patch.object(agent_mod, "_compact_messages",
+                                  mocker.AsyncMock(side_effect=lambda m, *a, **kw: m))
+    replies(mocker, text_reply("fin"))
+    await agent.run("hi", client=client)         # only a few characters
+    compact.assert_awaited()
 
 
 async def test_max_steps_terminates_the_loop(agent, client, mocker):
@@ -541,7 +554,7 @@ async def test_intent_block_is_inserted_before_the_new_instruction(agent, client
 async def test_automatic_compaction_is_written_back_to_the_store(agent, client, mocker):
     """Otherwise the DB keeps the full pre-compaction history and resuming
     reloads everything that was just summarized away."""
-    agent.cfg.context_char_budget = 10
+    agent.cfg.context_window_budget = 10
     mocker.patch.object(agent_mod, "_compact_messages", mocker.AsyncMock(
         side_effect=lambda msgs, *a, **kw: [msgs[0], {"role": "system", "content": "BRIEFING"}]))
     replies(mocker, text_reply("fin"))
@@ -553,7 +566,7 @@ async def test_automatic_compaction_is_written_back_to_the_store(agent, client, 
 
 
 async def test_a_no_op_compaction_leaves_the_store_alone(agent, client, mocker):
-    agent.cfg.context_char_budget = 10
+    agent.cfg.context_window_budget = 10
     mocker.patch.object(agent_mod, "_compact_messages",
                         mocker.AsyncMock(side_effect=lambda msgs, *a, **kw: msgs))
     replace = mocker.spy(agent.store, "replace_messages")
@@ -710,7 +723,7 @@ async def test_intent_parsing_is_counted(agent, client, mocker):
 
 
 async def test_compaction_is_counted(agent, client, mocker):
-    agent.cfg.context_char_budget = 10
+    agent.cfg.context_window_budget = 10
 
     async def fake_compact(messages, model, cfg, logger, usage=None):
         if usage is not None:

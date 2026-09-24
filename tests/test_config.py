@@ -30,7 +30,7 @@ def test_timeouts_and_budgets():
     assert cfg.llm_timeout_s == 300.0
     assert cfg.shell_timeout_s == 30
     assert cfg.max_output_chars == 8000
-    assert cfg.context_char_budget == 200_000
+    assert cfg.context_window_budget == 50_000
     assert cfg.compact_keep_last == 20
     assert cfg.max_retries == 3
 
@@ -231,15 +231,15 @@ def test_a_hand_edited_junk_colour_does_not_reach_the_ui(settings):
     ("200,000", 200_000),
     ("  50000 ", 50_000),
 ])
-def test_a_char_budget_is_normalized(given, expected):
-    assert config.SETTINGS_BY_NAME["context-char-budget"].parse(given) == expected
+def test_a_token_budget_is_normalized(given, expected):
+    assert config.SETTINGS_BY_NAME["context-window-budget"].parse(given) == expected
 
 
-@pytest.mark.parametrize("bad", ["", None, "lots", "-5", "1e5", "20.5", True, "1999"])
+@pytest.mark.parametrize("bad", ["", None, "lots", "-5", "1e5", "20.5", True, "499"])
 def test_anything_that_is_not_a_usable_budget_is_refused(bad):
-    """Including 1999: under the floor the history compacts on every step and
+    """Including 499: under the floor the history compacts on every step and
     spends a summarization call per turn to save nothing."""
-    assert config.SETTINGS_BY_NAME["context-char-budget"].parse(bad) is None
+    assert config.SETTINGS_BY_NAME["context-window-budget"].parse(bad) is None
 
 
 def test_a_system_prompt_round_trips(settings):
@@ -257,18 +257,18 @@ def test_a_blank_saved_system_prompt_reads_as_none(settings):
 
 
 def test_a_char_budget_round_trips_and_clears(settings):
-    config.save_setting(config.CONTEXT_CHAR_BUDGET_KEY, 50_000, path=settings)
-    assert _saved("context-char-budget", settings) == 50_000
-    config.save_setting(config.CONTEXT_CHAR_BUDGET_KEY, None, path=settings)
-    assert _saved("context-char-budget", settings) is None
+    config.save_setting(config.CONTEXT_WINDOW_BUDGET_KEY, 50_000, path=settings)
+    assert _saved("context-window-budget", settings) == 50_000
+    config.save_setting(config.CONTEXT_WINDOW_BUDGET_KEY, None, path=settings)
+    assert _saved("context-window-budget", settings) is None
 
 
 def test_a_hand_edited_junk_budget_does_not_reach_the_loop(settings):
     """Nothing usable saved is the same as nothing saved — a hand-edited file
     shouldn't be able to put the loop into permanent compaction."""
     with open(settings, "w") as f:
-        json.dump({config.CONTEXT_CHAR_BUDGET_KEY: 12}, f)
-    assert _saved("context-char-budget", settings) is None
+        json.dump({config.CONTEXT_WINDOW_BUDGET_KEY: 12}, f)
+    assert _saved("context-window-budget", settings) is None
 
 
 # ---------------- the settings registry ----------------
@@ -306,8 +306,8 @@ def test_secrets_and_footguns_are_not_saveable():
     ("/max-steps", "max-steps"),
     ("max_steps", "max-steps"),
     ("/SYSTEM_PROMPT", "system-prompt"),
-    ("/context_chart_budget", "context-char-budget"),   # the typo the name invites
-    ("context-chart-budget", "context-char-budget"),
+    ("/context_window_budget", "context-window-budget"),   # underscores instead of hyphens
+    ("CONTEXT-WINDOW-BUDGET", "context-window-budget"),  # case is ignored
 ])
 def test_a_setting_is_found_however_its_name_is_spelled(typed, expected):
     assert config.find_setting(typed).name == expected

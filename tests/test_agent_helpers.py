@@ -250,8 +250,8 @@ async def test_compact_replaces_the_middle_with_a_summary(cfg, mocker):
     out = await _compact_messages(history, "model", cfg, mocker.Mock())
 
     assert out[0] == history[0] and out[1] == history[1]     # system + task kept verbatim
-    assert out[2]["role"] == "system" and "THE SUMMARY" in out[2]["content"]
-    assert "Compacted history" in out[2]["content"]
+    assert out[2]["role"] == "user" and "THE SUMMARY" in out[2]["content"]
+    assert "Summary of earlier conversation" in out[2]["content"]
     assert out[-5:] == history[-5:]                          # recent tail kept verbatim
     assert len(out) == 2 + 1 + 5
 
@@ -276,7 +276,7 @@ async def test_compact_uses_the_configured_timeout_and_host(cfg, mocker):
 
 async def test_compact_falls_back_to_trim_when_the_call_fails(cfg, mocker):
     cfg.compact_keep_last = 5
-    cfg.context_char_budget = 50
+    cfg.context_window_budget = 50
     mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(side_effect=LLMError("down")))
     logger = mocker.Mock()
     history = long_history(40)
@@ -288,7 +288,7 @@ async def test_compact_falls_back_to_trim_when_the_call_fails(cfg, mocker):
 
 
 async def test_compact_falls_back_when_summary_is_empty(cfg, mocker):
-    cfg.compact_keep_last, cfg.context_char_budget = 5, 50
+    cfg.compact_keep_last, cfg.context_window_budget = 5, 50
     mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(return_value={"content": "   "}))
     out = await _compact_messages(long_history(40), "model", cfg, mocker.Mock())
     assert not any("Compacted history" in str(m.get("content")) for m in out)

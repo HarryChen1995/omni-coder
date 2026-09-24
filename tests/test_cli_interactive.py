@@ -353,10 +353,10 @@ def test_model_name_command_switches_without_redrawing_the_header(repl, mocker, 
 # ---------------- settings ----------------
 
 def test_a_setting_typed_at_the_repl_is_saved(repl, cfg, settings_path):
-    repl(["/max-steps 7", "/context_chart_budget 50000"])
-    assert cfg.max_steps == 7 and cfg.context_char_budget == 50_000
+    repl(["/max-steps 7", "/context-window-budget 80000"])
+    assert cfg.max_steps == 7 and cfg.context_window_budget == 80_000
     saved = json.loads(settings_path.read_text())
-    assert saved == {"maxSteps": 7, "contextCharBudget": 50_000}
+    assert saved == {"maxSteps": 7, "contextWindowBudget": 80_000}
 
 
 def test_a_setting_is_reset_from_the_repl(repl, cfg, settings_path):

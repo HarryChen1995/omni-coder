@@ -63,7 +63,7 @@ one-shot run — see [Session management](#session-management) below.
 | Shell safety | Ran anything, unbounded | Denylist for destructive patterns (`rm -rf /`, `sudo`, fork bombs, etc.), timeout, output truncation — a footgun guard, not a sandbox (see [below](#-still-recommended-before-real-production-use)) |
 | Human oversight | None | Write/edit/shell calls pause for approval unless the tool is in `safe_tools` or `auto_approve=True` |
 | Model reliability | Assumed clean tool-call JSON | Retries with backoff on API errors; malformed tool-call args are caught and reported back to the model instead of crashing |
-| Context window | Unbounded growth | Once the conversation exceeds `--context-char-budget` (default 200k chars), it's compacted via an LLM-written summary instead of growing forever |
+| Context window | Unbounded growth | Once the conversation exceeds `--context-window-budget` (default 50k tokens, off the server's reported `prompt_tokens`), it's compacted via an LLM-written summary instead of growing forever |
 | Observability | `print()` only | Structured log file (`agent_run.log`) recording every model call, tool call, args, and result — plus a separate `mcp_servers.log` for MCP server stderr, and a `/mcp` command showing live connection status |
 | Config | Hardcoded constants | `AgentConfig` dataclass — one place to tune model, project root, limits, policy |
 | Sessions | Each run started from a blank conversation | Every message is persisted to SQLite (`session_store.py`); resume by id or name, or run interactively |
@@ -85,8 +85,9 @@ one-shot run — see [Session management](#session-management) below.
    and commit before each run, so any agent change is a reviewable diff you
    can revert.
 3. **Rate/step limits per user** if this is exposed to a team, not just you.
-4. **Swap the char-based context trimming for a real tokenizer** if you hit
-   context issues in practice — it's a rough approximation.
+4. **Compaction triggers on the server's reported `prompt_tokens`**, with a
+   chars/4 estimate only for the first step before any call — good enough in
+   practice, but swap in a real tokenizer if you need the estimate exact.
 5. **Wire the test suite into CI** — it ships with the repo (see
    [Tests](#-tests)); `tests/test_tools.py` pins the path-scope check, which
    is the one thing you really don't want to regress silently.
@@ -281,7 +282,7 @@ what it saw the first time, and `/sessions` still shows something readable
 (`what is this? [1 image]`). Images stay in the conversation and therefore in
 every later request of that session, which is why anything over 10 MB is
 refused outright. Everything that measures or summarizes the conversation —
-the `--context-char-budget` check, compaction, the resumed-history panel —
+the `--context-window-budget` check, compaction, the resumed-history panel —
 reads a message by its *words*, so an attached image is worth
 `what is this? [1 image]` there rather than a megabyte of base64.
 
@@ -452,7 +453,7 @@ MCP prompt exposed by a connected server. Special inputs:
   restores the default. The settings are the ones `/config` lists: `/model`,
   `/llm-host`, `/llm-timeout`, `/max-steps`, `/subagent-model`,
   `/subagent-max-steps`, `/parse-intent`, `/intent-model`, `/compact-model`,
-  `/compact-keep-last`, `/context-char-budget`, `/embedding-model`,
+  `/compact-keep-last`, `/context-window-budget`, `/embedding-model`,
   `/max-output-chars`, `/shell-timeout`, `/mcp-connect-timeout`,
   `/system-prompt` and `/theme-color`. Each is the REPL half of the flag of
   the same name: **the flag sets it for one run and is never written back**,
@@ -488,11 +489,12 @@ MCP prompt exposed by a connected server. Special inputs:
   line. A session stores its prompt as its first message when it's created, so
   a change here reaches the *next* new session rather than the one in hand —
   `--resume` keeps the prompt its session started with
-- `/context-char-budget <n>` — how many characters of history are allowed
-  before it's compacted (see `/compact` below). Live: the loop re-reads it at
-  the top of every step, so lowering it can compact the very next one. Refused
-  below 2,000, where the system prompt alone would trigger a summarization
-  call every step to save nothing
+- `/context-window-budget <n>` — how many tokens of history are allowed
+  before it's compacted (see `/compact` below), measured by the `prompt_tokens`
+  the server reports for each call. Live: the loop re-reads it at the top of
+  every step, so lowering it can compact the very next one. Refused below 500,
+  where the system prompt alone would trigger a summarization call every step
+  to save nothing
 - `/resources` — list resources published by connected MCP servers (the MCP
   "Resources" capability — readable context addressed by URI);
   `/resources <uri>` prints one. See
@@ -511,9 +513,10 @@ MCP prompt exposed by a connected server. Special inputs:
   default 20), replacing everything older with an LLM-written briefing.
   Persists immediately, so the shrunk history is what future turns (and
   `--resume`) load. History is also compacted automatically mid-run
-  whenever it exceeds `--context-char-budget` (default 200,000 characters,
-  not tokens — a rough proxy); that automatic pass is persisted too, so
-  resuming doesn't reload everything it just summarized away. Use `--compact-model`
+  whenever it exceeds `--context-window-budget` (default 50,000 tokens,
+  measured by the server's reported `prompt_tokens`); that automatic pass is
+  persisted too, so resuming doesn't reload everything it just summarized
+  away. Use `--compact-model`
   to run the summarization call itself through a smaller/faster model
   than `--model` (same idea as `--intent-model`).
 - `/expand <n>` — reprint one tool call with nothing abbreviated: every

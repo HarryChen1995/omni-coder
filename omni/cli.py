@@ -179,18 +179,19 @@ def main(
     intent_model: Optional[str] = typer.Option(
         None, "--intent-model", help="Smaller/faster model to use just for intent parsing (defaults to --model)",
     ),
-    context_char_budget: Optional[int] = typer.Option(
-        None, "--context-char-budget",
-        help="Rough character budget (not tokens) for the running conversation. Once exceeded, "
-             "history is compacted — an LLM call summarizes everything except the system+task "
-             "messages and the most recent --compact-keep-last messages. This session only — it "
-             "overrides the budget saved by /context-char-budget without replacing it. Omit to "
-             f"use the saved budget, or {AgentConfig.context_char_budget} if none is saved.",
+    context_window_budget: Optional[int] = typer.Option(
+        None, "--context-window-budget",
+        help="Token budget for the running conversation, measured by the prompt_tokens the "
+             "server reports for each call. Once the context grows past it, history is compacted "
+             "— an LLM call summarizes everything except the system+task messages and the most "
+             "recent --compact-keep-last messages. This session only — it overrides the budget "
+             "saved by /context-window-budget without replacing it. Omit to use the saved budget, "
+             f"or {AgentConfig.context_window_budget} if none is saved.",
     ),
     compact_keep_last: Optional[int] = typer.Option(
         None, "--compact-keep-last",
         help="How many of the most recent messages to keep verbatim (not summarized) when "
-             "history is compacted, either automatically (--context-char-budget) or via /compact.",
+             "history is compacted, either automatically (--context-window-budget) or via /compact.",
     ),
     compact_model: Optional[str] = typer.Option(
         None, "--compact-model",
@@ -354,7 +355,7 @@ def main(
         "intent_model": intent_model,
         "compact_model": compact_model,
         "compact_keep_last": compact_keep_last,
-        "context_char_budget": context_char_budget,
+        "context_window_budget": context_window_budget,
         "embedding_model": embedding_model,
         "mcp_connect_timeout_s": mcp_connect_timeout,
         "system_prompt": system_prompt,
@@ -654,7 +655,18 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     if session_id is None:
                         _echo("No active session yet — run a task first.")
                     else:
-                        _echo(await agent.compact_history(session_id))
+                        # Compaction is an LLM call that can take several
+                        # seconds; without a busy state the pane sits idle and
+                        # looks hung. Drive the same shimmering spinner a turn
+                        # uses so it's visibly working, then report the result.
+                        if tui is not None:
+                            tui.set_busy("Compacting history…", pane=pane)
+                        try:
+                            result = await agent.compact_history(session_id)
+                        finally:
+                            if tui is not None:
+                                tui.set_idle(pane=pane)
+                        _echo(result)
                     continue
                 if task == "/expand" or task.startswith("/expand "):
                     _expand_call(agent, task[len("/expand"):].strip())
@@ -1466,8 +1478,8 @@ def _system_prompt_command(cfg, argument: str, tui=None):
     return _setting_command(cfg, tui, SETTINGS_BY_NAME["system-prompt"], argument)
 
 
-def _context_char_budget_command(cfg, argument: str, tui=None):
-    return _setting_command(cfg, tui, SETTINGS_BY_NAME["context-char-budget"], argument)
+def _context_window_budget_command(cfg, argument: str, tui=None):
+    return _setting_command(cfg, tui, SETTINGS_BY_NAME["context-window-budget"], argument)
 
 
 def _apply_theme_color(colour: str, tui=None):

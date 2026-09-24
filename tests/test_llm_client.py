@@ -81,6 +81,35 @@ def test_normalize_messages_only_touches_tool_calls():
     assert out[1]["tool_calls"][0]["function"]["arguments"] == '{"k": "v"}'
 
 
+def test_normalize_messages_keeps_a_leading_system_block():
+    """The real system prompt (and an intent system message right after it)
+    are at the start, so they stay system."""
+    msgs = [
+        {"role": "system", "content": "prompt"},
+        {"role": "system", "content": "intent"},
+        {"role": "user", "content": "task"},
+    ]
+    out = _normalize_messages(msgs)
+    assert [m["role"] for m in out] == ["system", "system", "user"]
+
+
+def test_normalize_messages_demotes_a_midstream_system_message():
+    """A system message after any other role — a compacted-history summary,
+    or one left by an older build — becomes a user message, so servers that
+    demand the system message be first don't reject the whole request."""
+    msgs = [
+        {"role": "system", "content": "prompt"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "system", "content": "# Summary of earlier conversation\n…"},
+        {"role": "user", "content": "continue"},
+    ]
+    out = _normalize_messages(msgs)
+    assert [m["role"] for m in out] == ["system", "user", "assistant", "user", "user"]
+    # content is otherwise untouched
+    assert out[3]["content"] == "# Summary of earlier conversation\n…"
+
+
 # ---------------- chat ----------------
 
 async def test_chat_returns_message(mocker):

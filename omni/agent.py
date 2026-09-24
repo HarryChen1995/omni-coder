@@ -350,15 +350,20 @@ async def _compact_messages(messages: list, model: str, cfg: AgentConfig, logger
         summary = (reply.get("content") or "").strip()
     except Exception as e:
         logger.info(f"compaction failed, falling back to drop-oldest trim: {e}")
-        return _trim_history(messages, cfg.context_char_budget)
+        return _trim_history(messages, cfg.context_window_budget * 4)
 
     if not summary:
-        return _trim_history(messages, cfg.context_char_budget)
+        return _trim_history(messages, cfg.context_window_budget * 4)
 
     elapsed = time.monotonic() - start
+    # A user message, not a system one: the summary is inserted after the
+    # protected head (the real system prompt + task), so a second system
+    # message would sit mid-conversation — which some servers reject outright
+    # ("System message must be at the beginning"). A user-role recap is
+    # accepted everywhere and the model reads it just the same.
     summary_msg = {
-        "role": "system",
-        "content": f"# Compacted history ({len(middle)} earlier messages)\n{summary}",
+        "role": "user",
+        "content": f"# Summary of earlier conversation ({len(middle)} messages, compacted)\n{summary}",
     }
     logger.info(f"compacted {len(middle)} messages into a {len(summary)}-char summary ({elapsed:.1f}s)")
     if _HAS_UI:
@@ -383,6 +388,10 @@ class CodingAgent:
         # Tokens this agent has used, from the server's own usage blocks
         # (prompt_tokens / completion_tokens). Shown beside the spinner.
         self.tokens = {"prompt": 0, "completion": 0}
+        # prompt_tokens the server reported for the most recent turn call —
+        # the real size of the context we keep sending, which is what the
+        # compaction trigger watches. 0 until the first call of a run.
+        self._last_prompt_tokens = 0
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
 
@@ -412,6 +421,8 @@ class CodingAgent:
                                          timeout=self.cfg.llm_timeout_s, usage=usage)
                     prompt_tokens = int(usage.get("prompt_tokens") or 0)
                     completion_tokens = int(usage.get("completion_tokens") or 0)
+                    if prompt_tokens:
+                        self._last_prompt_tokens = prompt_tokens
                     self._count(usage)
                     elapsed = time.monotonic() - start
                     if _HAS_UI:
@@ -579,8 +590,14 @@ class CodingAgent:
             persisted += 1
 
         for step in range(1, self.cfg.max_steps + 1):
-            total_chars = sum(len(message_text(m)) for m in messages)
-            if total_chars > self.cfg.context_char_budget:
+            # Trigger on the real context size: the prompt_tokens the server
+            # reported for the last call is exactly how large what we keep
+            # sending has grown. Before the first call of a run there's no
+            # count yet, so a rough chars/4 estimate stands in for that one
+            # step (a token is ~4 characters of English/code).
+            context_tokens = self._last_prompt_tokens or (
+                sum(len(message_text(m)) for m in messages) // 4)
+            if context_tokens > self.cfg.context_window_budget:
                 compaction_usage = {}
                 compacted = await _compact_messages(
                     messages, self.cfg.compact_model or self.cfg.model, self.cfg, self.logger,

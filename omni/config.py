@@ -15,15 +15,15 @@ from dataclasses import dataclass, field
 
 THEME_COLOR_KEY = "themeColor"
 SYSTEM_PROMPT_KEY = "systemPrompt"
-CONTEXT_CHAR_BUDGET_KEY = "contextCharBudget"
+CONTEXT_WINDOW_BUDGET_KEY = "contextWindowBudget"
 
 _HEX_COLOR_RE = re.compile(r"#?[0-9a-fA-F]{6}")
 
-# Below this a budget is self-defeating: the system prompt alone is ~900
-# characters, so anything smaller compacts on every single step and spends a
-# summarization call per turn to save nothing. It is a floor on the setting,
-# not on the model's context.
-MIN_CONTEXT_CHAR_BUDGET = 2_000
+# Below this a budget is self-defeating: the system prompt alone is a few
+# hundred tokens, so anything smaller compacts on every single step and spends
+# a summarization call per turn to save nothing. It is a floor on the setting,
+# not on the model's context window.
+MIN_CONTEXT_WINDOW_BUDGET = 500
 
 
 def normalize_hex_color(value: str) -> str:
@@ -245,11 +245,11 @@ SETTINGS = (
     Setting("compact-keep-last", "compact_keep_last", "compactKeepLast", _whole(2),
             "how many recent messages survive compaction verbatim",
             "a whole number, at least 2"),
-    Setting("context-char-budget", "context_char_budget", CONTEXT_CHAR_BUDGET_KEY,
-            _whole(MIN_CONTEXT_CHAR_BUDGET),
-            "characters of history allowed before it is compacted",
-            f"a whole number, at least {MIN_CONTEXT_CHAR_BUDGET:,}, or the history "
-            "compacts on every step"),
+    Setting("context-window-budget", "context_window_budget", CONTEXT_WINDOW_BUDGET_KEY,
+            _whole(MIN_CONTEXT_WINDOW_BUDGET),
+            "tokens of history allowed before it is compacted",
+            f"a whole number of tokens, at least {MIN_CONTEXT_WINDOW_BUDGET:,}, or the "
+            "history compacts on every step"),
     Setting("embedding-model", "embedding_model", "embeddingModel", _embedding_backend,
             "embedding backend ranking search_tools against deferred MCP tools",
             'a model name, or "off" for plain keyword matching',
@@ -280,10 +280,9 @@ def find_setting(name: str) -> Setting:
 
     Underscored spellings resolve to the hyphenated ones: every name here is
     read off the AgentConfig field it sets, which is underscored, so that is
-    at least as likely to be typed. "chart" for "char" is the typo the
-    budget's name invites, and costs one line to forgive."""
+    at least as likely to be typed."""
     key = (name or "").strip().lower().lstrip("/").replace("_", "-")
-    return SETTINGS_BY_NAME.get(key.replace("chart", "char"))
+    return SETTINGS_BY_NAME.get(key)
 
 
 def env_setting(setting: Setting):
@@ -384,10 +383,12 @@ class AgentConfig:
     llm_timeout_s: float = 300.0      # per-request timeout for chat/intent/compaction calls to the LLM server
     shell_timeout_s: int = 30
     max_output_chars: int = 8000      # truncate tool output before feeding back to model
-    context_char_budget: int = 200_000  # rough trim threshold (chars, not tokens)
+    context_window_budget: int = 50_000  # tokens of context before compaction kicks in
 
-    # When context_char_budget is exceeded, the history is compacted: an LLM
-    # call summarizes everything except the system+task messages and the most
+    # When the context grows past context_window_budget tokens — measured by
+    # the prompt_tokens the server reports for the last call, so it's the real
+    # size of what we keep sending — the history is compacted: an LLM call
+    # summarizes everything except the system+task messages and the most
     # recent `compact_keep_last` messages, which are kept verbatim. Falls back
     # to the old drop-oldest trim if the summarization call itself fails.
     compact_keep_last: int = 20

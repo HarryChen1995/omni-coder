@@ -113,9 +113,10 @@ Run `omni --help` for the full option list.
   arrow or click to select, Enter to submit, and anything you type instead
   wins, because the useful answer is often none of the options.
 - **Automatic context compaction** — once the running conversation exceeds
-  `--context-char-budget` (default 200k chars), older messages are replaced
-  with an LLM-written summary instead of growing forever or being silently
-  dropped. Trigger it manually anytime with `/compact`.
+  `--context-window-budget` (default 50k tokens, measured by the server's
+  reported `prompt_tokens`), older messages are replaced with an LLM-written
+  summary instead of growing forever or being silently dropped. Trigger it
+  manually anytime with `/compact`.
 - **Human-in-the-loop approval** — every write, edit, or shell command
   shows a diff or command preview before you confirm (diffs render with
   line numbers and red/green highlighting), unless explicitly marked safe

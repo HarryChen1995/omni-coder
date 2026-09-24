@@ -62,7 +62,7 @@ def test_flags_are_threaded_into_agentconfig(mocker, tmp_path):
            "--llm-host", "http://h:1", "--llm-api-key", "sk-k", "--llm-timeout", "42",
            "--max-steps", "7", "--auto-approve", "--skip-intent-parsing",
            "--intent-model", "small", "--compact-model", "tiny",
-           "--compact-keep-last", "9", "--context-char-budget", "12340",
+           "--compact-keep-last", "9", "--context-window-budget", "12340",
            "--embedding-model", "", "--db-path", str(tmp_path / "d.db"),
            "--log-path", str(tmp_path / "l.log"))
     cfg = captured["cfg"]
@@ -71,7 +71,7 @@ def test_flags_are_threaded_into_agentconfig(mocker, tmp_path):
     assert cfg.max_steps == 7 and cfg.auto_approve is True
     assert cfg.parse_intent is False and cfg.intent_model == "small"
     assert cfg.compact_model == "tiny" and cfg.compact_keep_last == 9
-    assert cfg.context_char_budget == 12340 and cfg.embedding_model == ""
+    assert cfg.context_window_budget == 12340 and cfg.embedding_model == ""
 
 
 def test_embedding_model_defaults_when_flag_omitted(mocker, tmp_path):
@@ -456,82 +456,82 @@ def test_the_flag_overrides_the_saved_system_prompt_without_replacing_it(mocker,
     assert json.loads(settings_path.read_text())["systemPrompt"] == "Be terse."
 
 
-# ---------------- /context-char-budget ----------------
+# ---------------- /context-window-budget ----------------
 
-def test_context_char_budget_command_saves_and_applies(settings_path):
+def test_context_window_budget_command_saves_and_applies(settings_path):
     cfg = AgentConfig()
-    cli_mod._context_char_budget_command(cfg, "50_000")
-    assert cfg.context_char_budget == 50_000
-    assert json.loads(settings_path.read_text())["contextCharBudget"] == 50_000
+    cli_mod._context_window_budget_command(cfg, "50_000")
+    assert cfg.context_window_budget == 50_000
+    assert json.loads(settings_path.read_text())["contextWindowBudget"] == 50_000
 
 
-def test_context_char_budget_command_refuses_junk_and_saves_nothing(mocker, settings_path):
+def test_context_window_budget_command_refuses_junk_and_saves_nothing(mocker, settings_path):
     echoed = mocker.patch.object(cli_mod, "_echo")
     cfg = AgentConfig()
-    cli_mod._context_char_budget_command(cfg, "lots")
-    assert cfg.context_char_budget == AgentConfig.context_char_budget
+    cli_mod._context_window_budget_command(cfg, "lots")
+    assert cfg.context_window_budget == AgentConfig.context_window_budget
     assert not settings_path.exists()
     assert echoed.call_args.kwargs.get("err") is True
 
 
-def test_context_char_budget_command_refuses_a_budget_under_the_floor(mocker, settings_path):
+def test_context_window_budget_command_refuses_a_budget_under_the_floor(mocker, settings_path):
     """Under the floor the loop compacts on every step — a summarization call
     per turn that saves nothing."""
     echoed = mocker.patch.object(cli_mod, "_echo")
     cfg = AgentConfig()
-    cli_mod._context_char_budget_command(cfg, "12")
-    assert cfg.context_char_budget == AgentConfig.context_char_budget
+    cli_mod._context_window_budget_command(cfg, "12")
+    assert cfg.context_window_budget == AgentConfig.context_window_budget
     assert not settings_path.exists()
     assert echoed.call_args.kwargs.get("err") is True
 
 
-def test_context_char_budget_command_resets_to_the_default(settings_path):
-    settings_path.write_text(json.dumps({"contextCharBudget": 50_000, "mcpServers": {"d": {}}}))
-    cfg = AgentConfig(context_char_budget=50_000)
-    cli_mod._context_char_budget_command(cfg, "reset")
-    assert cfg.context_char_budget == AgentConfig.context_char_budget
+def test_context_window_budget_command_resets_to_the_default(settings_path):
+    settings_path.write_text(json.dumps({"contextWindowBudget": 50_000, "mcpServers": {"d": {}}}))
+    cfg = AgentConfig(context_window_budget=50_000)
+    cli_mod._context_window_budget_command(cfg, "reset")
+    assert cfg.context_window_budget == AgentConfig.context_window_budget
     data = json.loads(settings_path.read_text())
-    assert "contextCharBudget" not in data and data["mcpServers"] == {"d": {}}
+    assert "contextWindowBudget" not in data and data["mcpServers"] == {"d": {}}
 
 
-def test_context_char_budget_command_with_no_argument_reports(mocker, settings_path):
+def test_context_window_budget_command_with_no_argument_reports(mocker, settings_path):
     echoed = mocker.patch.object(cli_mod, "_echo")
-    cli_mod._context_char_budget_command(AgentConfig(), "")
+    cli_mod._context_window_budget_command(AgentConfig(), "")
     said = echoed.call_args.args[0]
-    assert f"{AgentConfig.context_char_budget:,}" in said and "[saved]" not in said
-    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
-    cli_mod._context_char_budget_command(AgentConfig(context_char_budget=50_000), "")
+    assert f"{AgentConfig.context_window_budget:,}" in said and "[saved]" not in said
+    settings_path.write_text(json.dumps({"contextWindowBudget": 80_000}))
+    cli_mod._context_window_budget_command(AgentConfig(context_window_budget=80_000), "")
     assert "[saved]" in echoed.call_args.args[0]
 
 
-def test_context_char_budget_applies_even_when_the_settings_file_cannot_be_written(mocker):
+def test_context_window_budget_applies_even_when_the_settings_file_cannot_be_written(mocker):
     mocker.patch.object(cli_mod, "save_setting", side_effect=OSError("read-only"))
     echoed = mocker.patch.object(cli_mod, "_echo")
     cfg = AgentConfig()
-    cli_mod._context_char_budget_command(cfg, "50000")
-    assert cfg.context_char_budget == 50_000
+    cli_mod._context_window_budget_command(cfg, "50000")
+    assert cfg.context_window_budget == 50_000
     assert "could not save" in echoed.call_args.args[0]
 
 
-def test_a_saved_context_char_budget_is_used_when_the_flag_is_absent(mocker, tmp_path,
+def test_a_saved_context_window_budget_is_used_when_the_flag_is_absent(mocker, tmp_path,
                                                                     settings_path):
-    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
+    settings_path.write_text(json.dumps({"contextWindowBudget": 50_000}))
     captured = captured_cfg(mocker)
     invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
-    assert captured["cfg"].context_char_budget == 50_000
+    assert captured["cfg"].context_window_budget == 50_000
 
 
 def test_the_flag_overrides_the_saved_budget_without_replacing_it(mocker, tmp_path, settings_path):
-    settings_path.write_text(json.dumps({"contextCharBudget": 50_000}))
+    settings_path.write_text(json.dumps({"contextWindowBudget": 50_000}))
     captured = captured_cfg(mocker)
-    invoke("t", "--context-char-budget", "90000", "--db-path", str(tmp_path / "d.db"),
+    invoke("t", "--context-window-budget", "90000", "--db-path", str(tmp_path / "d.db"),
            "--log-path", str(tmp_path / "l.log"))
-    assert captured["cfg"].context_char_budget == 90_000
-    assert json.loads(settings_path.read_text())["contextCharBudget"] == 50_000
+    assert captured["cfg"].context_window_budget == 90_000
+    assert json.loads(settings_path.read_text())["contextWindowBudget"] == 50_000
 
 
 def test_a_budget_flag_under_the_floor_exits_nonzero(tmp_path):
-    r = invoke("t", "--context-char-budget", "12", "--db-path", str(tmp_path / "d.db"),
+    r = invoke("t", "--context-window-budget", "12", "--db-path", str(tmp_path / "d.db"),
                "--log-path", str(tmp_path / "l.log"))
     assert r.exit_code == 1 and "compacts on every step" in r.output
 
