@@ -1572,36 +1572,110 @@ def final_result(text: str):
     console.print()   # air between the answer and the input box below it
 
 
-def history_panel(messages: list):
-    """Show the prior conversation being resumed, rendered the same way it
-    looked the first time around — assistant replies as bare Markdown, same
-    as final_result() — so it's visibly clear context carried over instead of
-    silently feeding the model in the background.
+def _user_parts(message: dict) -> tuple:
+    """(text, image count) for a stored user message, split the way the live
+    echo takes them — the count is shown, the base64 is not."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return (content or "").strip(), 0
+    texts = [p.get("text", "") for p in content
+             if isinstance(p, dict) and p.get("type") == "text"]
+    images = sum(1 for p in content
+                  if isinstance(p, dict) and p.get("type") == "image_url")
+    return " ".join(t for t in texts if t).strip(), images
 
-    Bare, because a resumed transcript is mostly read in order to take
-    something back out of it, and a panel puts a "│" on both ends of every
-    single line: the border comes along with any selection, and there is no
-    way to strip it afterwards that doesn't also eat indentation."""
-    visible = [m for m in messages if m.get("role") != "system"]
-    console.print(Rule(f"[bold {ACCENT}]Resumed history — {len(visible)} messages[/bold {ACCENT}]"))
 
-    for m in visible:
-        role = m.get("role")
-        content = message_text(m).strip()
+def _replayed_calls(message: dict, results: list, first_index: int) -> list:
+    """Rebuild step_display's call records from one stored assistant message
+    and the tool messages that answered it.
+
+    `results` is the (message, meta) pairs in the order the calls were made —
+    which is the order they were persisted in, so they line up positionally
+    when a tool result carries no id to match on."""
+    by_id = {m.get("tool_call_id"): (m, meta) for m, meta in results if m.get("tool_call_id")}
+    calls = []
+    for offset, call in enumerate(message.get("tool_calls") or []):
+        args = call.get("function", {}).get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = None
+        answer, meta = by_id.get(call.get("id")) or (
+            results[offset] if offset < len(results) else ({}, {}))
+        result = answer.get("content") or ""
+        calls.append({
+            "index": first_index + offset,
+            "name": call.get("function", {}).get("name", "?"),
+            "args": args,
+            "raw": call.get("function", {}).get("arguments"),
+            "result": result,
+            # Stored from the live run; re-derived for sessions recorded
+            # before that was kept, the same way the agent decides it.
+            "ok": meta.get("ok") if "ok" in meta else (
+                args is not None and not str(result).startswith("ERROR")),
+            "duration": meta.get("duration"),
+        })
+    return calls
+
+
+def replay_history(records: list, first_index: int = 1) -> list:
+    """Redraw a resumed session's earlier turns through the same renderers a
+    live turn uses, so resuming looks like scrolling back through the session
+    you left rather than reading a summary of it.
+
+    `records` is SessionStore.load_records()'s (message, meta) pairs. Returns
+    the rebuilt tool-call records, which the caller seeds into the agent's
+    call log so `/expand <n>` — and the ▸ on a replayed call — still reach the
+    calls that ran before the resume."""
+    call_log = []
+    index = first_index
+    position = 0
+    while position < len(records):
+        message, meta = records[position]
+        position += 1
+        role = message.get("role")
+
+        if role == "system":
+            # The system prompt and the intent context blocks were never on
+            # screen in the original session either.
+            continue
+
         if role == "user":
-            console.print(f"\n[bold {ACCENT}]❯[/bold {ACCENT}] {content}")
-        elif role == "assistant" and m.get("tool_calls"):
-            calls = ", ".join(f"{c['function']['name']}(…)" for c in m["tool_calls"])
-            console.print(f"[dim]  → called {calls}[/dim]")
-        elif role == "assistant":
-            if content:
-                console.print()
-                console.print(Markdown(content))
-        elif role == "tool":
-            summary = content.splitlines()[0] if content else ""
-            console.print(f"  [dim]✓ {summary[:150]}[/dim]")
+            text, images = _user_parts(message)
+            if text or images:
+                instruction(text, images=images)
+            continue
 
-    console.print(Rule(style="dim"))
+        if role != "assistant":
+            # A tool result is drawn with the call it answers, below.
+            continue
+
+        if meta.get("elapsed") is not None:
+            elapsed_note("Responded", meta["elapsed"],
+                          tokens=(meta.get("prompt_tokens", 0), meta.get("completion_tokens", 0)))
+
+        text = message_text(message).strip()
+        if not message.get("tool_calls"):
+            final_result(text)
+            continue
+
+        if text:
+            assistant_message(text)
+        answers = []
+        while position < len(records) and records[position][0].get("role") == "tool":
+            answers.append(records[position])
+            position += 1
+        calls = _replayed_calls(message, answers, index)
+        index += len(calls)
+        step_display(calls)
+        call_log.extend({
+            "index": c["index"], "name": c["name"], "args": c["args"],
+            "raw_args": c.get("raw"), "result": c["result"],
+            "ok": c.get("ok"), "duration": c.get("duration"),
+        } for c in calls)
+
+    return call_log
 
 
 def sessions_table(sessions: list):
@@ -1860,7 +1934,7 @@ def error(text: str):
 for _name in (
     "banner", "header", "elapsed_note", "intent_panel", "high_risk_warning",
     "reasoning_full", "call_detail", "assistant_message", "final_result",
-    "history_panel", "sessions_table", "resources_table", "resource_content",
+    "sessions_table", "resources_table", "resource_content",
     "server_tools_table", "mcp_status", "model_switched", "interrupted",
     "compacted", "btw_answer", "instruction", "note", "warning", "error",
     "subagent_summary",

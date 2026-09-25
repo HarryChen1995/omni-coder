@@ -7,6 +7,7 @@ subprocess or reaches a model; HOME is redirected so the real
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -847,21 +848,36 @@ def test_print_mcp_status_delegates_to_ui(mocker):
     status.assert_called_once()
 
 
-def test_show_resumed_history_renders_when_session_exists(mocker, tmp_path):
+def _resume_agent(tmp_path):
     from omni.session_store import SessionStore
-    store = SessionStore(str(tmp_path / "s.db"))
-    sid = store.create_session("/p", "m", "t")
-    store.append_message(sid, 0, {"role": "user", "content": "earlier"})
-    panel = mocker.patch("omni.ui.history_panel")
-    cli_mod._show_resumed_history(str(tmp_path / "s.db"), sid)
-    assert panel.call_args.args[0][0]["content"] == "earlier"
+    return SimpleNamespace(store=SessionStore(str(tmp_path / "s.db")), call_log=[])
+
+
+def test_show_resumed_history_replays_when_session_exists(mocker, tmp_path):
+    agent = _resume_agent(tmp_path)
+    sid = agent.store.create_session("/p", "m", "t")
+    agent.store.append_message(sid, 0, {"role": "user", "content": "earlier"})
+    replay = mocker.patch("omni.ui.replay_history", return_value=[])
+    cli_mod._show_resumed_history(agent, sid)
+    assert replay.call_args.args[0][0][0]["content"] == "earlier"
+
+
+def test_show_resumed_history_seeds_the_call_log(mocker, tmp_path):
+    """Replayed calls keep their numbers, so /expand <n> still reaches them
+    and the next live call doesn't reuse a number already on screen."""
+    agent = _resume_agent(tmp_path)
+    sid = agent.store.create_session("/p", "m", "t")
+    agent.store.append_message(sid, 0, {"role": "user", "content": "earlier"})
+    mocker.patch("omni.ui.replay_history", return_value=[{"index": 1, "name": "read_file"}])
+    cli_mod._show_resumed_history(agent, sid)
+    assert [r["index"] for r in agent.call_log] == [1]
 
 
 def test_show_resumed_history_silent_for_unknown_session(mocker, tmp_path):
     """Stays quiet so agent.run() can raise the proper error instead."""
-    panel = mocker.patch("omni.ui.history_panel")
-    cli_mod._show_resumed_history(str(tmp_path / "s.db"), "ghost")
-    panel.assert_not_called()
+    replay = mocker.patch("omni.ui.replay_history")
+    cli_mod._show_resumed_history(_resume_agent(tmp_path), "ghost")
+    replay.assert_not_called()
 
 
 async def test_restart_mcp_server_wraps_the_client_call(mocker):

@@ -773,12 +773,12 @@ def test_compaction_can_summarize_a_turn_with_an_image():
     assert _render_for_summary(message) == "user: what is wrong here? [1 image]"
 
 
-def test_the_resumed_history_panel_renders_an_image_turn(capsys):
-    """Resuming shows the prior conversation; an image turn has to draw as
+def test_the_replayed_history_renders_an_image_turn(capsys):
+    """Resuming redraws the prior conversation; an image turn has to draw as
     its words plus a count, not crash on a list."""
     message = build_user_message("what is this?", [{"mime": "image/png", "data": PNG}])
-    ui.history_panel([{"role": "system", "content": "s"}, message,
-                       {"role": "assistant", "content": "a red square"}])
+    ui.replay_history([({"role": "system", "content": "s"}, {}), (message, {}),
+                        ({"role": "assistant", "content": "a red square"}, {})])
     out = capsys.readouterr().out
-    assert "what is this? [1 image]" in out
+    assert "what is this?" in out and "1 image attached" in out
     assert "base64" not in out

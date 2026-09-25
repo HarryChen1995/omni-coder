@@ -92,6 +92,14 @@ class SessionStore:
                 # resumed session sends role="tool" messages a strict
                 # OpenAI-compatible server rejects.
                 conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT")
+            if "meta" not in message_cols:
+                # Everything the transcript showed beside a message that isn't
+                # part of the message itself: how long the reply took and what
+                # it cost, how long a tool call ran, whether it succeeded. The
+                # model never sees this — load_messages drops it — but a resume
+                # replays the old turns through the live renderers, and without
+                # it those turns come back missing their timings.
+                conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
             conn.commit()
 
     def create_session(self, project_root: str, model: str, task: str, name: str = None) -> str:
@@ -124,13 +132,23 @@ class SessionStore:
         return row["id"] if row else None
 
     def load_messages(self, session_id: str) -> list:
+        """The conversation exactly as the model saw it — nothing else, since
+        this is what gets sent straight back to the server on a resume."""
+        return [message for message, _ in self.load_records(session_id)]
+
+    def load_records(self, session_id: str) -> list:
+        """(message, meta) for every stored message, in order.
+
+        `meta` is whatever the transcript showed alongside the message — reply
+        time and token counts, a tool call's duration and outcome — and is
+        `{}` for messages stored before that was recorded."""
         with _connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT role, content, tool_calls, tool_call_id, content_parts FROM messages "
+                "SELECT role, content, tool_calls, tool_call_id, content_parts, meta FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
-        messages = []
+        records = []
         for row in rows:
             msg = {"role": row["role"], "content": row["content"]}
             if row["content_parts"]:
@@ -139,21 +157,22 @@ class SessionStore:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
-            messages.append(msg)
-        return messages
+            records.append((msg, json.loads(row["meta"]) if row["meta"] else {}))
+        return records
 
-    def append_message(self, session_id: str, seq: int, message: dict) -> None:
+    def append_message(self, session_id: str, seq: int, message: dict, meta: dict = None) -> None:
         tool_calls = message.get("tool_calls")
         content, content_parts = _split_content(message.get("content"))
         now = _now()
         with _connect(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, "
-                "content_parts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_parts, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id, seq, message.get("role", ""), content,
                     json.dumps(tool_calls) if tool_calls else None,
-                    message.get("tool_call_id"), content_parts, now,
+                    message.get("tool_call_id"), content_parts,
+                    json.dumps(meta) if meta else None, now,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))

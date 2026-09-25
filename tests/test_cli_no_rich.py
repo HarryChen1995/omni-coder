@@ -6,6 +6,7 @@ install. These force that branch by making the `omni.ui` import fail.
 """
 
 import builtins
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,9 +85,9 @@ def test_resumed_history_falls_back_to_plain_lines(no_ui, mocker, tmp_path, caps
     store.append_message(sid, 0, {"role": "system", "content": "the system prompt"})
     store.append_message(sid, 1, {"role": "user", "content": "my question"})
 
-    cli_mod._show_resumed_history(str(tmp_path / "s.db"), sid)
+    cli_mod._show_resumed_history(SimpleNamespace(store=store, call_log=[]), sid)
     out = capsys.readouterr().out
-    assert "Resumed history" in out and "my question" in out
+    assert "my question" in out
     assert "the system prompt" not in out       # system messages stay hidden
 
 

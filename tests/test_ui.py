@@ -410,26 +410,70 @@ def test_final_result_renders_markdown(cap):
     assert "Heading" in out and "Body text" in out
 
 
-def test_history_panel_shows_each_role(cap):
-    ui.history_panel([
-        {"role": "system", "content": "hidden"},
-        {"role": "user", "content": "my question"},
-        {"role": "assistant", "content": "my answer"},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"function": {"name": "read_file", "arguments": "{}"}}]},
-        {"role": "tool", "content": "tool result"},
+def test_replay_history_shows_each_role(cap):
+    ui.replay_history([
+        ({"role": "system", "content": "hidden"}, {}),
+        ({"role": "user", "content": "my question"}, {}),
+        ({"role": "assistant", "content": "my answer"}, {}),
+        ({"role": "assistant", "content": None, "tool_calls": [
+            {"function": {"name": "run_shell", "arguments": "{}"}}]}, {}),
+        ({"role": "tool", "content": "tool result"}, {}),
     ])
     out = flat(cap)
-    assert "my question" in out and "my answer" in out and "read_file" in out
+    assert "my question" in out and "my answer" in out and "run_shell" in out
+    assert "tool result" in out
     assert "hidden" not in out          # system messages aren't replayed
 
 
-def test_history_panel_draws_no_box_around_a_reply(cap):
+def test_replay_history_carries_no_resumed_banner(cap):
+    """A resume is meant to look like the session never stopped, so nothing
+    labels the replayed turns as history."""
+    ui.replay_history([({"role": "user", "content": "q"},  {}),
+                        ({"role": "assistant", "content": "a"}, {})])
+    out = flat(cap)
+    assert "Resumed" not in out and "history" not in out
+
+
+def test_replay_history_renders_timings_and_tokens(cap):
+    ui.replay_history([
+        ({"role": "user", "content": "q"}, {}),
+        ({"role": "assistant", "content": "a"},
+         {"elapsed": 2.5, "prompt_tokens": 1200, "completion_tokens": 40}),
+    ])
+    out = flat(cap)
+    assert "2.5s" in out and "1.2k" in out
+
+
+def test_replay_history_returns_call_records_for_expand(cap):
+    log = ui.replay_history([
+        ({"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "read_file",
+                                       "arguments": '{"path": "a.py"}'}}]}, {}),
+        ({"role": "tool", "content": "file body", "tool_call_id": "c1"},
+         {"duration": 0.25, "ok": True}),
+    ], first_index=4)
+    assert [r["index"] for r in log] == [4]
+    assert log[0]["name"] == "read_file" and log[0]["args"] == {"path": "a.py"}
+    assert log[0]["ok"] is True and log[0]["duration"] == 0.25
+
+
+def test_replay_history_marks_a_failed_call_without_stored_meta(cap):
+    """Sessions recorded before outcomes were stored still show ✗ on a call
+    that errored, by re-deriving it the way the agent does."""
+    log = ui.replay_history([
+        ({"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]}, {}),
+        ({"role": "tool", "content": "ERROR: no such file", "tool_call_id": "c1"}, {}),
+    ])
+    assert log[0]["ok"] is False
+
+
+def test_replay_history_draws_no_box_around_a_reply(cap):
     """A resumed transcript is read in order to copy out of it, so the reply
     carries no border: a panel's "│" lands on both ends of every line and
     comes along with the selection."""
-    ui.history_panel([{"role": "user", "content": "q"},
-                      {"role": "assistant", "content": "the answer\n\nsecond paragraph"}])
+    ui.replay_history([({"role": "user", "content": "q"}, {}),
+                        ({"role": "assistant", "content": "the answer\n\nsecond paragraph"}, {})])
     out = cap.getvalue()
     assert "the answer" in out and "second paragraph" in out
     assert not set("│╭╮╰╯┌┐└┘┃┏┓┗┛") & set(out)

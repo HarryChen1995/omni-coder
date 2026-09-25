@@ -432,10 +432,10 @@ def main(
         asyncio.run(_interactive(cfg, resume, session_name))
         return
 
-    if resume:
-        _show_resumed_history(db_path, resume)
-
     agent = CodingAgent(cfg)
+    if resume:
+        _show_resumed_history(agent, resume)
+
     try:
         result = asyncio.run(agent.run(task, resume_session_id=resume, session_name=session_name))
     except (ValueError, RuntimeError, LLMError) as e:
@@ -500,7 +500,7 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                    "/exit to quit. Ctrl+C interrupts the current turn without leaving the session.")
 
     if resume:
-        _show_resumed_history(cfg.db_path, resume)
+        _show_resumed_history(agent, resume)
         # Resolve --resume (which may be a --session-name, not a raw id) to
         # the real DB id now rather than waiting for the first turn to set
         # it — /compact and /delete use session_id directly, and a name
@@ -1519,25 +1519,27 @@ def _print_header(cfg: AgentConfig, session_label: str):
         _echo(f"[model: {cfg.model}] [session: {session_label}]")
 
 
-def _show_resumed_history(db_path: str, resume: str):
-    """Print the conversation being resumed so it's visible on screen that
-    context actually carried over — agent.run() feeds it to the model
-    either way, but nothing else displays it."""
-    store = SessionStore(db_path)
-    session_id = store.resolve_session_id(resume)
+def _show_resumed_history(agent, resume: str):
+    """Redraw the conversation being resumed, block for block, the way the
+    session looked when it was left — instructions, replies, tool calls and
+    their timings all rendered by the same code a live turn goes through, so
+    a resumed session is indistinguishable from one that never stopped.
+
+    The replayed tool calls are seeded back into the agent's call log, which
+    is what keeps `/expand <n>` and the click-to-open ▸ working on them and
+    stops the next live call from reusing a number already on screen."""
+    session_id = agent.store.resolve_session_id(resume)
     if session_id is None:
         return  # let agent.run() raise the proper "no session found" error
-    messages = store.load_messages(session_id)
+    records = agent.store.load_records(session_id)
     try:
         from . import ui
-        ui.history_panel(messages)
+        agent.call_log.extend(ui.replay_history(records, first_index=len(agent.call_log) + 1))
     except ImportError:
-        _echo(f"--- Resumed history ({len(messages)} messages) ---")
-        for m in messages:
-            if m.get("role") == "system":
+        for message, _ in records:
+            if message.get("role") == "system":
                 continue
-            _echo(f"{m.get('role')}: {str(m.get('content'))[:200]}")
-        _echo("--- end history ---\n")
+            _echo(f"{message.get('role')}: {str(message.get('content'))[:200]}")
 
 
 def _make_tui(commands: dict, session_label: str, model: str):

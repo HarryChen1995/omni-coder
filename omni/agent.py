@@ -392,6 +392,9 @@ class CodingAgent:
         # the real size of the context we keep sending, which is what the
         # compaction trigger watches. 0 until the first call of a run.
         self._last_prompt_tokens = 0
+        # What the last reply cost and how long it took, so it can be stored
+        # beside the message and replayed on resume.
+        self._last_call_meta = {}
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
 
@@ -425,6 +428,8 @@ class CodingAgent:
                         self._last_prompt_tokens = prompt_tokens
                     self._count(usage)
                     elapsed = time.monotonic() - start
+                    self._last_call_meta = {"elapsed": elapsed, "prompt_tokens": prompt_tokens,
+                                             "completion_tokens": completion_tokens}
                     if _HAS_UI:
                         ui.elapsed_note("Responded", elapsed,
                                          tokens=(prompt_tokens, completion_tokens))
@@ -632,7 +637,7 @@ class CodingAgent:
                 _ensure_tool_call_ids(tool_calls, step)
 
             messages.append(msg)
-            self.store.append_message(session_id, persisted, msg)
+            self.store.append_message(session_id, persisted, msg, self._last_call_meta)
             persisted += 1
 
             # Chain of thought, when the server sends it as its own field
@@ -804,7 +809,8 @@ class CodingAgent:
                 if c.get("id"):
                     tool_msg["tool_call_id"] = c["id"]
                 messages.append(tool_msg)
-                self.store.append_message(session_id, persisted, messages[-1])
+                self.store.append_message(session_id, persisted, messages[-1],
+                                           {"duration": c.get("duration"), "ok": c.get("ok")})
                 persisted += 1
 
         msg = "Max steps reached without completion. Check the log for progress."
