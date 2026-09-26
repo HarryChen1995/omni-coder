@@ -5,11 +5,31 @@ history, so a run can be resumed later (`--resume <id>`) or browsed
 
 import json
 import sqlite3
+import subprocess
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 
 from .llm_client import message_text
+
+
+def current_branch(project_root: str) -> str:
+    """The git branch `project_root` is on, or "" for a detached HEAD, a
+    directory that isn't a checkout, or no git at all.
+
+    Recorded per session so the picker can offer the sessions from the
+    branch you are on before the ones from every other branch — the work is
+    usually branch-shaped, and a feature branch's sessions are noise while
+    you are on main."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=project_root or ".",
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return "" if branch == "HEAD" else branch
 
 
 def _split_content(content):
@@ -77,6 +97,12 @@ class SessionStore:
             existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
             if "name" not in existing_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN name TEXT")
+            if "branch" not in existing_cols:
+                # The branch the session ran on, so the picker can scope to
+                # it. Empty for sessions recorded before this, and for work
+                # outside a checkout — both of which the picker treats as
+                # "belongs to no branch in particular" and always shows.
+                conn.execute("ALTER TABLE sessions ADD COLUMN branch TEXT")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name)")
             message_cols = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
             if "content_parts" not in message_cols:
@@ -102,15 +128,20 @@ class SessionStore:
                 conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
             conn.commit()
 
-    def create_session(self, project_root: str, model: str, task: str, name: str = None) -> str:
+    def create_session(self, project_root: str, model: str, task: str, name: str = None,
+                        branch: str = None) -> str:
         session_id = uuid.uuid4().hex[:8]
         now = _now()
+        # Asked once, here, rather than every time the picker draws: it is a
+        # subprocess, and the branch a session ran on is a fact about when it
+        # ran, not about when you go looking for it.
+        branch = current_branch(project_root) if branch is None else branch
         try:
             with _connect(self.db_path) as conn:
                 conn.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, project_root, model, task, status, name) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
-                    (session_id, now, now, project_root, model, task, name),
+                    "INSERT INTO sessions (id, created_at, updated_at, project_root, model, task, "
+                    "status, name, branch) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+                    (session_id, now, now, project_root, model, task, name, branch),
                 )
                 conn.commit()
         except sqlite3.IntegrityError:
@@ -223,10 +254,15 @@ class SessionStore:
         return True
 
     def list_sessions(self, limit: int = 20) -> list:
+        """Newest first. `messages` is how many turns each one holds — the
+        cheapest honest measure of how much conversation is in there, which
+        is what the picker shows to tell two same-day sessions apart."""
         with _connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT id, created_at, updated_at, project_root, model, task, status, summary, name "
-                "FROM sessions ORDER BY updated_at DESC LIMIT ?",
+                "SELECT s.id, s.created_at, s.updated_at, s.project_root, s.model, s.task, "
+                "s.status, s.summary, s.name, s.branch, "
+                "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messages "
+                "FROM sessions s ORDER BY s.updated_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]

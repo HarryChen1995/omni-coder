@@ -242,3 +242,51 @@ def test_writes_are_committed_not_just_left_open(tmp_path):
     assert fresh.list_sessions()[0]["status"] == "done"
     assert fresh.delete_session(sid) is True
     assert SessionStore(path).session_exists(sid) is False
+
+
+# ---- per-message timings, for the resume replay ----
+
+def test_meta_is_stored_and_kept_out_of_what_the_model_sees(store):
+    """The replay needs the reply's timings; the server must never be sent
+    them, so they ride in a separate column and a separate accessor."""
+    sid = store.create_session("/p", "m", "t")
+    store.append_message(sid, 0, {"role": "assistant", "content": "hi"},
+                          {"elapsed": 1.5, "prompt_tokens": 10, "completion_tokens": 2})
+    assert store.load_messages(sid) == [{"role": "assistant", "content": "hi"}]
+    message, meta = store.load_records(sid)[0]
+    assert message == {"role": "assistant", "content": "hi"}
+    assert meta == {"elapsed": 1.5, "prompt_tokens": 10, "completion_tokens": 2}
+
+
+def test_a_message_stored_without_meta_reads_back_as_empty(store):
+    sid = store.create_session("/p", "m", "t")
+    store.append_message(sid, 0, {"role": "user", "content": "q"})
+    assert store.load_records(sid)[0][1] == {}
+
+
+# ---- the branch a session ran on ----
+
+def test_the_branch_is_recorded_and_listed(store):
+    sid = store.create_session("/p", "m", "t", branch="feature/x")
+    assert sid
+    assert store.list_sessions()[0]["branch"] == "feature/x"
+
+
+def test_current_branch_is_empty_outside_a_checkout(tmp_path):
+    """A project that isn't a git repo (or a machine with no git) has no
+    branch to scope the picker by, and must not blow up saying so."""
+    from omni.session_store import current_branch
+    assert current_branch(str(tmp_path)) == ""
+
+
+def test_current_branch_is_empty_when_git_is_missing(tmp_path, mocker):
+    mocker.patch("omni.session_store.subprocess.run", side_effect=FileNotFoundError)
+    from omni.session_store import current_branch
+    assert current_branch(str(tmp_path)) == ""
+
+
+def test_list_sessions_counts_the_messages(store):
+    sid = store.create_session("/p", "m", "t")
+    for seq in range(3):
+        store.append_message(sid, seq, {"role": "user", "content": "x"})
+    assert store.list_sessions()[0]["messages"] == 3

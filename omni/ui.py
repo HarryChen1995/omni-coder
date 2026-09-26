@@ -731,6 +731,22 @@ def _build_prompt_style() -> Style:
         # yellow on the Rich side: it should not read as business as usual.
         "frame.label.attention": "bold #d29922",
         "prompt.arrow": f"bold {ACCENT}",
+        # The --resume session list. Same accent, same two greys as the
+        # frame, so picking a session looks like part of this app rather
+        # than a dialog borrowed from somewhere else.
+        "picker.title": f"bold {ACCENT}",
+        "picker.count": _FRAME_HINT,
+        "picker.border": _FRAME_RULE,
+        "picker.icon": _FRAME_HINT,
+        "picker.placeholder": _FRAME_HINT,
+        "picker.group": _FRAME_HINT,
+        "picker.marker": f"bold {ACCENT}",
+        "picker.scroll": _FRAME_HINT,
+        "picker.name": "#d0d0d0",
+        "picker.name.selected": f"bold {ACCENT}",
+        "picker.detail": _FRAME_HINT,
+        "picker.hint": _FRAME_HINT,
+        "picker.empty": _FRAME_HINT,
         # bg:default everywhere except the selected row: prompt_toolkit's stock
         # menu paints a solid block, and since the menu is a full-width member of
         # the box's stack (not a float) that block reads as the whole terminal

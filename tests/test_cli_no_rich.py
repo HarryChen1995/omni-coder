@@ -121,3 +121,38 @@ def test_server_tools_fall_back_to_plain_lines(no_ui, capsys):
 def test_empty_server_tools_fall_back_to_a_notice(no_ui, capsys):
     cli_mod._print_server_tools("docs", [])
     assert "no tools" in capsys.readouterr().out
+
+
+def test_the_cli_imports_without_prompt_toolkit(mocker):
+    """The picker lives in its own module for exactly this reason: importing
+    prompt_toolkit at cli.py's top level would break the bare install that
+    every other test in this file is about."""
+    import ast
+    from pathlib import Path
+    source = Path(cli_mod.__file__).read_text(encoding="utf-8")
+    top_level = [node for node in ast.parse(source).body
+                 if isinstance(node, (ast.Import, ast.ImportFrom))]
+    names = [alias.name for node in top_level if isinstance(node, ast.Import)
+             for alias in node.names]
+    names += [node.module or "" for node in top_level if isinstance(node, ast.ImportFrom)]
+    assert not [n for n in names if n.split(".")[0] in ("rich", "prompt_toolkit")]
+    assert not [n for n in names if n.endswith("session_picker")]
+
+
+def test_bare_resume_falls_back_to_typing_an_id(no_ui, mocker, cfg, capsys):
+    """Without prompt_toolkit there is no list to draw, so the sessions are
+    printed and the id is asked for the only way a plain terminal can."""
+    from omni.session_store import SessionStore
+    SessionStore(cfg.db_path).create_session(cfg.project_root, "m", "t", name="earlier")
+    mocker.patch("builtins.input", return_value="earlier")
+    mocker.patch.dict("sys.modules", {"omni.session_picker": None})
+    assert cli_mod._pick_session(cfg) == "earlier"
+    assert "earlier" in capsys.readouterr().out
+
+
+def test_a_blank_answer_cancels_the_fallback(no_ui, mocker, cfg):
+    from omni.session_store import SessionStore
+    SessionStore(cfg.db_path).create_session(cfg.project_root, "m", "t", name="earlier")
+    mocker.patch("builtins.input", return_value="  ")
+    mocker.patch.dict("sys.modules", {"omni.session_picker": None})
+    assert cli_mod._pick_session(cfg) is None

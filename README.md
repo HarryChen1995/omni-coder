@@ -66,7 +66,7 @@ one-shot run — see [Session management](#session-management) below.
 | Context window | Unbounded growth | Once the conversation exceeds `--context-window-budget` (default 50k tokens, off the server's reported `prompt_tokens`), it's compacted via an LLM-written summary instead of growing forever |
 | Observability | `print()` only | Structured log file (`agent_run.log`) recording every model call, tool call, args, and result — plus a separate `mcp_servers.log` for MCP server stderr, and a `/mcp` command showing live connection status |
 | Config | Hardcoded constants | `AgentConfig` dataclass — one place to tune model, project root, limits, policy |
-| Sessions | Each run started from a blank conversation | Every message is persisted to SQLite (`session_store.py`); resume by id or name, or run interactively |
+| Sessions | Each run started from a blank conversation | Every message is persisted to SQLite (`session_store.py`); resume by id or name, or pick from a searchable list with a bare `--resume`. Resuming redraws the earlier turns — tool calls, results, timings — through the live renderers, so it reads like a session that never stopped |
 | Codebase search | `grep` piped through a subprocess | Pure-Python `search_files` (regex + glob filter, skips `.git`/`node_modules`/etc.) and a `glob_files` tool for pattern-based file discovery |
 | Git integration | Only `git_diff` (read-only) | Full toolset — `git_status`, `git_log`, `git_show`, `git_branch`, `git_fetch` (read-only, auto-approved) plus `git_add`, `git_commit`, `git_pull`, `git_push` (approval-gated, same as any other write) |
 | Long-term memory | Every session starts blank | `save_memory` tool appends durable notes (conventions, gotchas, preferences) to a project-local `agent_memory.md`, auto-injected into the system prompt at the start of every new session |
@@ -352,10 +352,55 @@ omni --resume utils-typing "Also add docstrings"
 ```
 `--resume` accepts either the session id it printed at the end of a run, or
 the `--session-name` you gave it. `--session-name` is optional — without it
-you just get an 8-character id. When you resume, the prior conversation is
-printed before the run continues (assistant replies rendered the same
-Markdown-panel way they looked the first time), so it's visibly clear that
-context carried over rather than just trusting it happened in the background.
+you just get an 8-character id.
+
+When you resume, the earlier turns are redrawn before the run continues —
+your instructions, the replies, every tool call with its ⎿ result line, and
+the "Responded (2.4s · ↑ 3.1k ↓ 64)" timings that went with them, all through
+the same renderers a live turn uses. Nothing is greyed out or collapsed into
+a "resumed history" summary, and `/expand <n>` still reaches a call that ran
+before the resume, so a resumed session reads like one that never stopped.
+
+**Pick a session from a list** — pass `--resume` with nothing after it:
+```bash
+omni --resume
+```
+```
+  Resume session  (1 of 38)
+
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ⌕ Search…                                                                │
+╰──────────────────────────────────────────────────────────────────────────╯
+
+  omni-coder  ·  master
+
+❯ Add type hints to utils.py
+  5 days ago  ·  qwen3-coder  ·  18 messages  ·  a0f21c4d
+
+  Fix the importer retry loop
+  4 days ago  ·  qwen3-coder  ·  7 messages  ·  91be03aa
+
+↓ Session picker UI
+  3 days ago  ·  qwen3-coder  ·  14 messages  ·  55d1e7b2
+
+  ↑↓ to move  ·  Enter to resume  ·  Type to search  ·  Esc to cancel
+  Ctrl+A for all projects  ·  Ctrl+T for all branches
+```
+Type to filter (each word has to appear somewhere in the name, task, id or
+model, in any order), ↑/↓ to move, Enter to resume, Esc to cancel.
+
+The list opens on where you are actually standing — this project, this git
+branch — because that is nearly always where the session you want is.
+**Ctrl+A** widens it to every project and **Ctrl+T** to every branch; the
+heading above the rows says which scope you are in. If nothing matches where
+you are standing, it widens on its own rather than opening empty. Outside a
+git checkout the branch filter disappears entirely — no branch line in the
+heading, no Ctrl+T.
+
+Ctrl+A and Ctrl+T rather than anything nearer to hand because the rest is
+already taken: Ctrl+V and Ctrl+B both paste an image, Ctrl+S is selection
+mode, Ctrl+C interrupts, Ctrl+D leaves, and the Ctrl+arrows walk the agent
+tree.
 
 **Browse saved sessions:**
 ```bash

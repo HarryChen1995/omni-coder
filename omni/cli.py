@@ -42,6 +42,7 @@ from dataclasses import replace
 from typing import List, Optional
 
 import typer
+from typer.core import TyperCommand
 
 from .agent import CodingAgent, SYSTEM_PROMPT
 from .config import (
@@ -53,7 +54,44 @@ from .mcp_client import (
     MCPToolClient, default_mcp_config_path, load_mcp_config,
     parse_mcp_server_specs, save_mcp_config,
 )
-from .session_store import SessionStore
+from .session_store import SessionStore, current_branch
+
+# What a bare `--resume` is rewritten to before the parser sees it, so "open
+# the picker" can travel as an ordinary option value. Not a valid session id
+# or name — resolve_session_id would have to match it otherwise. Defined
+# here rather than in session_picker so this module still imports on an
+# install with no prompt_toolkit, where there is no picker to open.
+PICK_SESSION = "\x00pick-session\x00"
+
+
+def fill_bare_resume(args: list) -> list:
+    """Rewrite a `--resume` with nothing after it to `--resume <sentinel>`.
+
+    `--resume` has to work both ways: with an id, and on its own to open the
+    session list. Click expresses that directly (is_flag=False plus a
+    flag_value), but Typer builds its own options and has no way to ask for
+    it, so the rewrite happens here instead — before the parser runs, and in
+    `parse_args` rather than around `sys.argv` so it holds for the test
+    runner too.
+
+    "Nothing after it" means the same thing it means to click: end of the
+    line, another option, or the `--` that ends the options."""
+    out = []
+    for position, arg in enumerate(args):
+        out.append(arg)
+        if arg != "--resume":
+            continue
+        following = args[position + 1] if position + 1 < len(args) else None
+        if following is None or following == "--" or following.startswith("-"):
+            out.append(PICK_SESSION)
+    return out
+
+
+class _ResumeCommand(TyperCommand):
+    """The one command, taught that `--resume` may arrive without a value."""
+
+    def parse_args(self, ctx, args):
+        return super().parse_args(ctx, fill_bare_resume(args))
 
 _STATIC_COMMANDS = {
     "/exit": "leave the REPL",
@@ -90,7 +128,7 @@ _STATIC_COMMANDS.update({
 app = typer.Typer(add_completion=False, help="Coding agent (Qwen Coder or any OpenAI-compatible model)")
 
 
-@app.command()
+@app.command(cls=_ResumeCommand)
 def main(
     task: Optional[str] = typer.Argument(
         None, help="What you want the agent to do. Optional with --resume (continues "
@@ -208,7 +246,10 @@ def main(
         "agent_sessions.db", "--db-path", help="SQLite file storing session/message history",
     ),
     resume: Optional[str] = typer.Option(
-        None, "--resume", help="Resume a previous session by id or --session-name instead of starting a new one",
+        None, "--resume",
+        help="Resume a previous session instead of starting a new one. Give it an id or a "
+             "--session-name, or pass it bare to pick from a searchable list of this "
+             "project's sessions (Ctrl+T there widens it to every project).",
     ),
     session_name: Optional[str] = typer.Option(
         None, "--session-name", help="Give a new session a memorable name, so you can --resume it by name later",
@@ -427,6 +468,14 @@ def main(
         safe_tools=AgentConfig.safe_tools + tuple(safe_tool),
         **preferences,
     )
+
+    # A bare --resume: resolved to a real session here, while this is still
+    # ordinary synchronous startup, so everything downstream sees the id it
+    # would have seen had you typed it.
+    if resume == PICK_SESSION:
+        resume = _pick_session(cfg)
+        if resume is None:
+            raise typer.Exit()
 
     if task is None:
         asyncio.run(_interactive(cfg, resume, session_name))
@@ -1517,6 +1566,32 @@ def _print_header(cfg: AgentConfig, session_label: str):
         ui.header(session_label, cfg.project_root)
     except ImportError:
         _echo(f"[model: {cfg.model}] [session: {session_label}]")
+
+
+# How far back the picker looks. Generous, because the list is searchable
+# and scrolls — the 20 that /sessions prints is a table's limit, not a
+# reason to hide a session you actually want back.
+_PICKER_LIMIT = 500
+
+
+def _pick_session(cfg) -> Optional[str]:
+    """Bare `--resume`: choose a session from the list. Returns its id, or
+    None if the list was empty or dismissed (either way, nothing to resume).
+
+    Without prompt_toolkit there is no list to draw, so the sessions are
+    printed and the id is asked for the only way a plain terminal can."""
+    sessions = SessionStore(cfg.db_path).list_sessions(limit=_PICKER_LIMIT)
+    if not sessions:
+        _echo("No saved sessions yet — run without --resume to start one.", err=True)
+        return None
+    try:
+        from .session_picker import SessionPicker
+    except ImportError:
+        _print_sessions(sessions)
+        answer = input("Session id or name to resume (blank to cancel): ").strip()
+        return answer or None
+    branch = current_branch(cfg.project_root)
+    return asyncio.run(SessionPicker(sessions, cfg.project_root, branch).run())
 
 
 def _show_resumed_history(agent, resume: str):

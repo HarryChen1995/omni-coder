@@ -41,7 +41,15 @@ Run `omni --help` for the full option list.
 - **Session persistence** — every message is saved to SQLite as the run
   happens. Resume a previous run by id or a name you gave it
   (`--resume`), browse saved sessions (`--list-sessions`), or delete one
-  (`--delete-session`).
+  (`--delete-session`). Resuming redraws the earlier turns through the same
+  renderers a live turn uses — tool calls, results and reply timings and
+  all — so it reads like a session that never stopped, and `/expand <n>`
+  still reaches a call from before the resume.
+- **Pick a session to resume** — `--resume` with nothing after it opens a
+  searchable list instead of demanding an id: type to filter, ↑/↓ to move,
+  Enter to resume. It opens on this project and this git branch, since that
+  is nearly always where the session you want is; Ctrl+A widens it to every
+  project and Ctrl+T to every branch.
 - **Interactive mode** — a full-screen session that keeps the model
   connection and tool session alive across turns. Ctrl-C during a running
   turn cancels just that turn instead of killing the session; at the prompt

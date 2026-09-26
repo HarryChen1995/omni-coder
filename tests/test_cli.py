@@ -880,6 +880,67 @@ def test_show_resumed_history_silent_for_unknown_session(mocker, tmp_path):
     replay.assert_not_called()
 
 
+@pytest.mark.parametrize("args, expected", [
+    (["--resume"], ["--resume", cli_mod.PICK_SESSION]),
+    (["--resume", "abc"], ["--resume", "abc"]),
+    (["--resume=abc"], ["--resume=abc"]),
+    (["--resume", "-p", "/x"], ["--resume", cli_mod.PICK_SESSION, "-p", "/x"]),
+    (["--resume", "--"], ["--resume", cli_mod.PICK_SESSION, "--"]),
+    (["a task", "--resume"], ["a task", "--resume", cli_mod.PICK_SESSION]),
+    (["--model", "m"], ["--model", "m"]),
+])
+def test_fill_bare_resume(args, expected):
+    """--resume has to work both with an id and on its own; Typer can't
+    express a value-optional option, so the value is filled in first."""
+    assert cli_mod.fill_bare_resume(args) == expected
+
+
+def test_bare_resume_opens_the_picker_and_resumes_what_it_returns(mocker, tmp_path):
+    picked = mocker.patch.object(cli_mod, "_pick_session", return_value="chosen-id")
+    interactive = mocker.patch.object(cli_mod, "_interactive", new=mocker.AsyncMock())
+    result = CliRunner().invoke(app, ["--resume", "--model", "m", "-p", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    picked.assert_called_once()
+    assert interactive.await_args.args[1] == "chosen-id"
+
+
+def test_a_dismissed_picker_starts_nothing(mocker, tmp_path):
+    """Escaping the list means "never mind", not "start a fresh session"."""
+    mocker.patch.object(cli_mod, "_pick_session", return_value=None)
+    interactive = mocker.patch.object(cli_mod, "_interactive", new=mocker.AsyncMock())
+    result = CliRunner().invoke(app, ["--resume", "--model", "m", "-p", str(tmp_path)])
+    assert result.exit_code == 0
+    interactive.assert_not_awaited()
+
+
+def test_resume_with_an_id_never_opens_the_picker(mocker, tmp_path):
+    picked = mocker.patch.object(cli_mod, "_pick_session")
+    mocker.patch.object(cli_mod, "_interactive", new=mocker.AsyncMock())
+    CliRunner().invoke(app, ["--resume", "abc123", "--model", "m", "-p", str(tmp_path)])
+    picked.assert_not_called()
+
+
+def test_the_picker_is_handed_this_projects_sessions_and_branch(mocker, cfg):
+    from omni.session_store import SessionStore
+    store = SessionStore(cfg.db_path)
+    store.create_session(cfg.project_root, "m", "earlier task", name="earlier")
+    mocker.patch.object(cli_mod, "current_branch", return_value="feature/x")
+    picker = mocker.patch("omni.session_picker.SessionPicker")
+    picker.return_value.run = mocker.AsyncMock(return_value="picked")
+
+    assert cli_mod._pick_session(cfg) == "picked"
+    sessions, project_root, branch = picker.call_args.args
+    assert [s["name"] for s in sessions] == ["earlier"]
+    assert project_root == cfg.project_root and branch == "feature/x"
+
+
+def test_picking_with_no_saved_sessions_says_so(mocker, cfg, capsys):
+    picker = mocker.patch("omni.session_picker.SessionPicker")
+    assert cli_mod._pick_session(cfg) is None
+    picker.assert_not_called()
+    assert "No saved sessions" in capsys.readouterr().err
+
+
 async def test_restart_mcp_server_wraps_the_client_call(mocker):
     client = mocker.AsyncMock()
     client.restart_server.return_value = {"name": "docs", "connected": True, "tool_count": 3}
