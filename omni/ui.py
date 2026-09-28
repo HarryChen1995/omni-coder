@@ -1858,38 +1858,83 @@ def instruction(text: str, images: int = 0):
                             style="dim"))
 
 
+def _standalone_picker(options: list):
+    """The choice picker for a run with no full-screen frame, or None when it
+    can't be drawn: nothing to choose between, a frame already showing its
+    own picker, prompt_toolkit missing, input that isn't a terminal, or a
+    terminal prompt_toolkit turns out not to be able to drive.
+
+    A pipe is the case worth spelling out — `omni "…" < script.txt` has no
+    arrow keys to press, and a picker drawn into a redirected stream waits
+    for a keystroke that is never coming.
+
+    Settled here, before the question is printed, because the answer decides
+    how the question itself is drawn."""
+    if not options or _tui is not None:
+        return None
+    try:
+        from .option_picker import OptionPicker, available
+    except ImportError:
+        return None
+    if not available():
+        return None
+    picker = OptionPicker(options)
+    return picker if picker.prepare() else None
+
+
 async def ask_user(question: str, options: list = None) -> str:
     """Put a question to the person and wait for their answer (the ask_user
     tool). Returns the answer, or None if they dismissed it.
 
-    Options are offered as a numbered list: typing the number picks one,
-    typing anything else is taken verbatim. Both matter — a plan needs
-    accepting or rejecting, but the interesting answer is often neither of
-    the choices offered."""
+    Wherever they are answering it, the choices are a picker: one row marked,
+    arrows to move, Enter to take it — in the frame during an interactive
+    session (tui.ask_text), and on its own under the question during a
+    one-shot run (option_picker). Typing instead of arrowing always works and
+    always wins, because a plan needs accepting or rejecting but the
+    interesting answer is often neither of the choices offered. A number is
+    both: typing 2 and arrowing to the second row mean the same thing."""
     options = options or []
-    # In a full-screen session the choices are a live picker in the frame
-    # (arrow, click, or type past them), so the transcript block carries just
-    # the question. Elsewhere the numbered list *is* the interface.
-    _question_block(question, [] if _tui is not None else options)
+    picker = _standalone_picker(options)
+    # Whichever picker is drawing the choices is showing them already, so the
+    # transcript block carries just the question. Without one — piped input,
+    # or no prompt_toolkit — the numbered list *is* the interface.
+    _question_block(question, [] if (_tui is not None or picker is not None) else options)
     hint = ("type 1–%d to choose, or write your own answer" % len(options)) if options \
         else "type your answer"
 
     if _tui is not None:
         answer = await _tui.ask_text(hint, options)
-    else:
-        console.print(Text(f"  {hint}", style="dim"))
+    elif picker is not None:
         try:
-            answer = console.input("  [bold]❯[/bold] ")
+            answer = await picker.run()
         except (EOFError, KeyboardInterrupt):
-            console.print()
-            answer = None
+            answer = None       # dismissed at the picker, like a Ctrl+C in it
+        except Exception:
+            # The terminal took the picker and then lost it — a window closed
+            # mid-question, a session detached. Rare, and not worth the
+            # question dying over: ask the way a plain terminal does, listing
+            # the choices this time, since the picker was the only thing that
+            # had shown them.
+            picker = None
+            _choices_block(options)
+            answer = _typed_answer(hint)
+    else:
+        answer = _typed_answer(hint)
 
     if answer is None:
         return None
     answer = answer.strip()
     if options and answer.isdigit() and 1 <= int(answer) <= len(options):
-        return options[int(answer) - 1]
-    return answer or None
+        answer = options[int(answer) - 1]
+    answer = answer or None
+    if picker is not None and answer is not None:
+        # The picker erases itself on the way out, so without this the
+        # transcript would show a question with no sign of what was answered.
+        # Echoed after the number is resolved, so it records the choice rather
+        # than the keystroke. The frame does the same thing, for the same
+        # reason (tui._answer_question).
+        console.print(Text("  ❯ ", style=f"bold {ACCENT}").append(answer, style="bold"))
+    return answer
 
 
 def _question_block(question: str, options: list):
@@ -1898,15 +1943,49 @@ def _question_block(question: str, options: list):
         body = Text()
         body.append("? ", style=f"bold {ACCENT}")
         body.append(question, style="bold")
-        for i, option in enumerate(options, 1):
-            body.append(f"\n    {i}. ", style=ACCENT)
-            body.append(option)
+        _append_options(body, options)
         return body
 
     if _tui is not None:
         _tui.emit(lambda: _rendered(_print_question, build))
         return
     _print_question(build)
+
+
+def _choices_block(options: list):
+    """The numbered list on its own, for the one path that prints it after
+    the question rather than with it: a picker that was drawable when the
+    question went out and wasn't by the time it ran."""
+    def build():
+        body = Text()
+        _append_options(body, options, lead=False)
+        return body
+
+    if _tui is not None:
+        _tui.emit(lambda: _rendered(_print_question, build))
+        return
+    _print_question(build)
+
+
+def _append_options(body: Text, options: list, lead: bool = True):
+    """The choices as numbered lines. `lead` says whether the first one opens
+    a new line — it follows a question, or it starts the block."""
+    for i, option in enumerate(options, 1):
+        if lead or i > 1:
+            body.append("\n")
+        body.append(f"    {i}. ", style=ACCENT)
+        body.append(option)
+
+
+def _typed_answer(hint: str):
+    """A line read the only way a plain terminal can. None if it was
+    dismissed (Ctrl+C, or a closed stdin)."""
+    console.print(Text(f"  {hint}", style="dim"))
+    try:
+        return console.input("  [bold]❯[/bold] ")
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return None
 
 
 def _print_question(build):

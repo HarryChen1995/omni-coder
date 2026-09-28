@@ -705,6 +705,161 @@ async def test_an_empty_answer_counts_as_dismissed(cap, mocker):
     assert await ui.ask_user("q") is None
 
 
+# ---------------- ask_user's standalone choice picker ----------------
+#
+# A one-shot run has no frame to draw the choices in, so ask_user puts up a
+# picker of its own (option_picker). These cover *when* it is used and what
+# the transcript is left holding; the picker's own keys live in
+# tests/test_option_picker.py.
+
+
+@pytest.fixture
+def at_a_terminal(mocker):
+    """Pretend this run has a terminal prompt_toolkit can drive, which is what
+    decides whether the picker is used. Under pytest there is neither a tty
+    nor a console to attach to, so without this every ask_user test takes the
+    numbered-list path."""
+    mocker.patch("omni.option_picker.available", return_value=True)
+    return mocker.patch("omni.option_picker.OptionPicker.prepare", return_value=True)
+
+
+def test_no_choices_means_no_picker(at_a_terminal):
+    """A question with nothing to pick between is just a line to type."""
+    assert ui._standalone_picker([]) is None
+
+
+def test_a_running_frame_draws_its_own_picker(at_a_terminal, mocker):
+    """Two pickers for one question would be one too many — the frame's is
+    already in the input row."""
+    ui.use_tui(mocker.Mock())
+    try:
+        assert ui._standalone_picker(["a", "b"]) is None
+    finally:
+        ui.use_tui(None)
+
+
+def test_a_run_with_no_terminal_falls_back_to_the_numbered_list(mocker):
+    mocker.patch("omni.option_picker.available", return_value=False)
+    assert ui._standalone_picker(["a", "b"]) is None
+
+
+def test_a_terminal_prompt_toolkit_cannot_drive_falls_back_too(mocker):
+    """isatty() says yes on a Cygwin or mintty console that prompt_toolkit
+    then refuses to attach to. Asked before the question is printed, so the
+    choices are listed rather than promised to a picker that never appears."""
+    mocker.patch("omni.option_picker.available", return_value=True)
+    mocker.patch("omni.option_picker.OptionPicker.prepare", return_value=False)
+    assert ui._standalone_picker(["a", "b"]) is None
+
+
+def test_choices_at_a_terminal_get_a_picker(at_a_terminal):
+    picker = ui._standalone_picker(["a", "b"])
+    assert picker is not None and picker.options == ["a", "b"]
+
+
+async def test_the_picker_answers_the_question(cap, at_a_terminal, mocker):
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(return_value="Postgres"))
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) == "Postgres"
+
+
+async def test_the_picker_shows_the_choices_so_the_transcript_need_not(
+        cap, at_a_terminal, mocker):
+    """Printing the numbered list above a picker showing the same list would
+    put every option on screen twice."""
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(return_value="SQLite"))
+    await ui.ask_user("Which store?", ["SQLite", "Postgres"])
+    out = flat(cap)
+    assert "Which store?" in out
+    assert "1. SQLite" not in out and "2. Postgres" not in out
+
+
+async def test_what_was_chosen_is_echoed_because_the_picker_erased_itself(
+        cap, at_a_terminal, mocker):
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(return_value="Postgres"))
+    await ui.ask_user("Which store?", ["SQLite", "Postgres"])
+    assert "❯ Postgres" in flat(cap)
+
+
+async def test_a_number_typed_at_the_picker_echoes_the_option_it_names(
+        cap, at_a_terminal, mocker):
+    """The keystroke was "2"; what was answered was Postgres, and that is
+    what the transcript should be left holding."""
+    mocker.patch("omni.option_picker.OptionPicker.run", mocker.AsyncMock(return_value="2"))
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) == "Postgres"
+    assert "❯ Postgres" in flat(cap)
+
+
+async def test_free_text_at_the_picker_is_taken_verbatim(cap, at_a_terminal, mocker):
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(return_value="use DuckDB instead"))
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) == "use DuckDB instead"
+
+
+async def test_dismissing_the_picker_echoes_nothing(cap, at_a_terminal, mocker):
+    mocker.patch("omni.option_picker.OptionPicker.run", mocker.AsyncMock(return_value=None))
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) is None
+    assert "❯" not in flat(cap)
+
+
+@pytest.mark.parametrize("boom", [EOFError(), KeyboardInterrupt()])
+async def test_an_interrupted_picker_counts_as_dismissed(cap, at_a_terminal, mocker, boom):
+    mocker.patch("omni.option_picker.OptionPicker.run", mocker.AsyncMock(side_effect=boom))
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) is None
+
+
+async def test_a_picker_that_dies_mid_question_asks_the_plain_way_instead(
+        cap, at_a_terminal, mocker):
+    """A window closed or a session detached after the question went out. The
+    question is not worth losing over it — and the choices have to be printed
+    now, because the picker was the only thing that had shown them."""
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(side_effect=RuntimeError("terminal went away")))
+    mocker.patch.object(ui.console, "input", return_value="2")
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) == "Postgres"
+    out = flat(cap)
+    assert "1. SQLite" in out and "2. Postgres" in out
+    assert "type 1–2 to choose" in out
+
+
+async def test_the_question_is_asked_once_even_when_the_picker_dies(
+        cap, at_a_terminal, mocker):
+    """The fallback prints the choices, not the question again."""
+    mocker.patch("omni.option_picker.OptionPicker.run",
+                  mocker.AsyncMock(side_effect=RuntimeError("terminal went away")))
+    mocker.patch.object(ui.console, "input", return_value="SQLite")
+    await ui.ask_user("Which store?", ["SQLite", "Postgres"])
+    assert flat(cap).count("Which store?") == 1
+
+
+async def test_the_numbered_list_is_still_the_interface_without_a_picker(cap, mocker):
+    """Piped input, or no prompt_toolkit: the choices have to be readable and
+    the number has to work, because there is nothing else to press."""
+    mocker.patch("omni.option_picker.available", return_value=False)
+    mocker.patch.object(ui.console, "input", return_value="2")
+    assert await ui.ask_user("Which store?", ["SQLite", "Postgres"]) == "Postgres"
+    out = flat(cap)
+    assert "1. SQLite" in out and "2. Postgres" in out
+    assert "type 1–2 to choose" in out
+
+
+async def test_a_missing_prompt_toolkit_falls_back_rather_than_raising(cap, mocker):
+    """ui degrades to plain printing when its optional deps aren't there; the
+    picker has to degrade the same way instead of taking the question down."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_option_picker(name, *args, **kwargs):
+        if "option_picker" in name:
+            raise ImportError("no prompt_toolkit")
+        return real_import(name, *args, **kwargs)
+
+    mocker.patch.object(builtins, "__import__", no_option_picker)
+    assert ui._standalone_picker(["a", "b"]) is None
+
+
 # ---------------- the shimmer ----------------
 
 def _brightness(hex_colour: str) -> int:

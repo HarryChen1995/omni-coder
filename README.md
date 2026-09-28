@@ -214,6 +214,31 @@ anything you type is taken verbatim and sent back as-is. Ctrl+C dismisses the
 question, and the tool tells the model so rather than letting it ask again in
 a loop.
 
+A one-shot run (`omni "…"`) has no frame to put the choices in, so it draws
+the same picker on its own, under the question:
+
+```
+? Store sessions in SQLite or Postgres?
+
+  ❯ 1. Keep SQLite
+    2. Switch to Postgres
+    3. Accept my plan as written
+
+  ❯ or type your own answer…
+  ↑↓ to move  ·  Enter to choose  ·  or type your own answer  ·  Ctrl+C to dismiss
+```
+
+Same keys, same rule about typing, and a number still works either way —
+typing `2` and arrowing to the second row mean the same thing. The picker
+erases itself once answered and what you chose is echoed in its place, so the
+transcript keeps a record of the answer rather than of the keystroke.
+
+Where there is no terminal to draw on — piped input (`omni "…" < script.txt`),
+a console prompt_toolkit can't attach to, or an install without it — the
+choices fall back to a plain numbered list read with `input()`. That is
+decided before the question is printed, so the list is always either pickable
+or visible, never promised to a picker that doesn't appear.
+
 It's the one tool the client answers itself rather than passing to a server:
 the answer has to come from your terminal, and every MCP server — the
 built-in one included — is a subprocess with no access to it. It's in
@@ -1106,6 +1131,7 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 | `test_agent_loop.py` | The turn loop: dispatch, parallelism, cancellation, limits, tool_call_id pairing |
 | `test_ui.py` | Diff rendering, summaries, ask_user, every renderer |
 | `test_tui.py` | The clickable transcript: layout, scroll, click-to-toggle, the app's four input modes |
+| `test_option_picker.py` | `ask_user`'s standalone choice picker: the marker, wrapping, typing past it, the keys, and when it gives way to a plain list |
 | `test_images.py` | Image paste: the clipboard read, the placeholder, the content parts, the stored history |
 | `test_cli.py` / `test_cli_interactive.py` | Flags, MCP registry, and every REPL slash command |
 | `test_cli_no_rich.py` | The degraded path when rich/prompt_toolkit aren't installed |

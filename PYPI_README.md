@@ -119,7 +119,9 @@ Run `omni --help` for the full option list.
 - **The model can ask you a question** — `ask_user` puts a genuine ambiguity
   (or a plan to accept) to you mid-turn. Offered choices become a picker:
   arrow or click to select, Enter to submit, and anything you type instead
-  wins, because the useful answer is often none of the options.
+  wins, because the useful answer is often none of the options. A one-shot
+  run draws the same picker under the question, and piped input falls back
+  to a numbered list.
 - **Automatic context compaction** — once the running conversation exceeds
   `--context-window-budget` (default 50k tokens, measured by the server's
   reported `prompt_tokens`), older messages are replaced with an LLM-written
