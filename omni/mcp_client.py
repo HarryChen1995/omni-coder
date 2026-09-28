@@ -401,6 +401,16 @@ def _ask_user_schema() -> dict:
                         "description": ("Optional answers to choose from, in order. Each should be a "
                                          "short phrase. The person may still type their own answer."),
                     },
+                    "recommended": {
+                        "type": "integer",
+                        "description": ("Optional 1-based number of the option you would pick "
+                                         "yourself. The cursor starts there, so agreeing costs one "
+                                         "keystroke, and the row is labelled '(recommended)'. Give "
+                                         "it when you do have a view — a question where one answer "
+                                         "is clearly better is still worth asking, but don't make "
+                                         "them guess what you think. Leave it out when the options "
+                                         "are genuinely even."),
+                    },
                 },
                 "required": ["question"],
             },
@@ -1237,7 +1247,9 @@ class MCPToolClient:
                 options = [options]
             options = [str(o) for o in options if str(o).strip()]
             from . import ui
-            answer = await ui.ask_user(question, options)
+            # ui decides what a recommendation that names no real row means
+            # (nothing), so a mangled hint costs the question nothing.
+            answer = await ui.ask_user(question, options, args.get("recommended"))
             if answer is None:
                 return ("The user dismissed the question without answering. Don't ask again; "
                          "proceed with your best judgement or stop and explain what you need.")

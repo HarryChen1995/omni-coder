@@ -69,6 +69,67 @@ def test_moving_an_empty_list_is_harmless():
     assert picker.selected is None and picker.row_fragments() == []
 
 
+# ---- the option the model would pick itself ----
+
+def test_the_cursor_starts_on_the_recommendation():
+    """Said twice, and this is the half that costs nothing to act on: Enter
+    takes the recommendation without moving at all."""
+    picker = OptionPicker(OPTIONS, recommended=1)
+    assert picker.index == 1 and picker.answer() == "Switch to Postgres"
+
+
+def test_the_recommended_row_is_labelled():
+    """The other half: a cursor that merely starts somewhere doesn't say that
+    somewhere was chosen for a reason."""
+    assert "2. Switch to Postgres  (recommended)" in rows(OptionPicker(OPTIONS, recommended=1))
+
+
+def test_the_label_stays_behind_when_the_cursor_moves_off_it():
+    """The recommendation belongs to the option, not to the cursor — and you
+    have to be able to find your way back to it."""
+    picker = OptionPicker(OPTIONS, recommended=1)
+    picker.move(1)
+    shown = rows(picker)
+    assert "❯ 3. Neither" in shown
+    assert "2. Switch to Postgres  (recommended)" in shown
+
+
+def test_only_one_row_is_ever_recommended():
+    assert rows(OptionPicker(OPTIONS, recommended=0)).count("(recommended)") == 1
+
+
+def test_no_recommendation_means_no_label_and_the_first_row():
+    picker = OptionPicker(OPTIONS)
+    assert picker.recommended is None and picker.index == 0
+    assert "(recommended)" not in rows(picker)
+
+
+@pytest.mark.parametrize("junk", [-1, 3, 99])
+def test_a_recommendation_naming_no_row_is_dropped_rather_than_crashing(junk):
+    """ui normalises before this, but the picker is constructible on its own
+    and an index past the end would blow up the first render."""
+    picker = OptionPicker(OPTIONS, recommended=junk)
+    assert picker.recommended is None and picker.index == 0
+    assert "(recommended)" not in rows(picker)
+
+
+def test_typing_hides_the_cursor_but_not_the_recommendation():
+    """What the model suggested is still true while you write past it."""
+    picker = OptionPicker(OPTIONS, recommended=1)
+    picker.write("use DuckDB")
+    shown = rows(picker)
+    assert "❯" not in shown and "(recommended)" in shown
+
+
+def test_enter_on_an_untouched_recommended_picker_takes_it():
+    assert drive(OptionPicker(OPTIONS, recommended=2), ENTER) == "Neither"
+
+
+def test_the_recommendation_can_still_be_arrowed_away_from():
+    """A recommendation is a suggestion, not a default you are stuck with."""
+    assert drive(OptionPicker(OPTIONS, recommended=1), UP + ENTER) == "Keep SQLite"
+
+
 # ---- typing instead of choosing ----
 
 def test_typing_takes_the_marker_off_the_list_and_says_why():

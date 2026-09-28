@@ -206,7 +206,7 @@ def test_an_older_database_gains_the_column(tmp_path):
 # ---------------- the keypress ----------------
 
 @pytest.fixture
-def app(mocker):
+def app(mocker, headless_terminal):
     mocker.patch("omni.ui.instruction")
     application = TuiApp({"/exit": "leave"}, "s", "m")
     ui.use_tui(application)

@@ -179,7 +179,10 @@ from omni.tui import TuiApp
 
 
 @pytest.fixture
-def app(mocker):
+def app(mocker, headless_terminal):
+    """TuiApp builds its prompt_toolkit Application in __init__, which
+    resolves an output as it goes — see the headless_terminal fixture for why
+    a test runner has none to give it."""
     mocker.patch("omni.ui.instruction")           # would emit into a transcript block
     application = TuiApp({"/exit": "leave"}, "my-session", "my-model")
     ui.use_tui(application)
@@ -322,6 +325,59 @@ async def test_the_highlight_wraps_around(app, mocker):
     binding(app, "up")(mocker.Mock())                 # up from the first
     binding(app, "enter")(mocker.Mock())
     assert await pending == "b"
+
+
+async def test_the_highlight_starts_on_the_option_the_model_recommends(app, mocker):
+    """Said twice: the cursor starts there, so agreeing costs one keystroke,
+    and the row is labelled, so it reads as a suggestion rather than as where
+    the cursor happened to begin."""
+    pending = asyncio.ensure_future(
+        app.ask_text("choose", ["Keep SQLite", "Switch to Postgres"], recommended=1))
+    await asyncio.sleep(0)
+    rows = "".join(f[1] for f in app._options_lines())
+    assert "▸ 2. Switch to Postgres  (recommended)" in rows
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "Switch to Postgres"
+
+
+async def test_the_recommendation_label_stays_put_when_the_highlight_moves(app, mocker):
+    """It belongs to the option, not to the cursor."""
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b", "c"], recommended=1))
+    await asyncio.sleep(0)
+    binding(app, "down")(mocker.Mock())
+    rows = "".join(f[1] for f in app._options_lines())
+    assert "▸ 3. c" in rows and "2. b  (recommended)" in rows
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "c"
+
+
+async def test_no_recommendation_leaves_the_picker_exactly_as_it_was(app, mocker):
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b"]))
+    await asyncio.sleep(0)
+    rows = "".join(f[1] for f in app._options_lines())
+    assert "(recommended)" not in rows and rows.strip().startswith("▸ 1.")
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "a"
+
+
+async def test_a_recommendation_naming_no_row_is_dropped(app, mocker):
+    """ui normalises before this, but ask_text is callable on its own and an
+    index past the end would mark nothing while still moving the cursor."""
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b"], recommended=9))
+    await asyncio.sleep(0)
+    rows = "".join(f[1] for f in app._options_lines())
+    assert "(recommended)" not in rows and rows.strip().startswith("▸ 1.")
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "a"
+
+
+async def test_the_recommendation_is_cleared_with_the_question(app, mocker):
+    """The next question's picker must not inherit the last one's label."""
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b"], recommended=1))
+    await asyncio.sleep(0)
+    binding(app, "enter")(mocker.Mock())
+    await pending
+    assert app.pane.recommended is None
 
 
 async def test_typing_beats_the_highlight(app, mocker):

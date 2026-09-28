@@ -64,10 +64,15 @@ class OptionPicker:
     """The list of choices itself. Built without a terminal so the selection
     logic can be exercised directly; `run()` is the only part that needs one."""
 
-    def __init__(self, options: list, rows: int = VISIBLE_ROWS):
+    def __init__(self, options: list, rows: int = VISIBLE_ROWS, recommended=None):
         self.options = list(options or [])
         self.rows = rows
-        self.index = 0
+        # The recommendation is where the cursor starts, so agreeing with it
+        # costs one keystroke. The label on the row is what stops that from
+        # being invisible — see `row_fragments`.
+        self.recommended = recommended if (
+            recommended is not None and 0 <= recommended < len(self.options)) else None
+        self.index = self.recommended or 0
         self.typed = ""
         self._app = None
 
@@ -126,7 +131,13 @@ class OptionPicker:
             else:
                 marker = ("class:picker.scroll", "    ")
             style = "class:picker.name.selected" if chosen else "class:picker.name"
-            out += [marker, (style, f"{position + 1}. {self.options[position]}"), ("", "\n")]
+            out += [marker, (style, f"{position + 1}. {self.options[position]}")]
+            if position == self.recommended:
+                # Stays on the row when the cursor moves off it: the
+                # recommendation belongs to the option, not to the cursor,
+                # and you need to be able to find your way back to it.
+                out.append(("class:picker.recommended", "  (recommended)"))
+            out.append(("", "\n"))
         if self.typing:
             # The marker is gone at this point, so without a word here the
             # list just looks switched off.

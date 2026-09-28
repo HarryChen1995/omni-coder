@@ -705,6 +705,85 @@ async def test_an_empty_answer_counts_as_dismissed(cap, mocker):
     assert await ui.ask_user("q") is None
 
 
+# ---------------- the model's own pick ----------------
+
+OPTS = ["Keep SQLite", "Switch to Postgres", "Neither"]
+
+
+@pytest.mark.parametrize("sent, index", [(1, 0), (2, 1), (3, 2)])
+def test_a_recommendation_is_the_number_the_person_sees(sent, index):
+    """1-based, because that is what the model is asked for and what every
+    rendering of the list shows beside the option."""
+    assert ui.recommended_index(sent, OPTS) == index
+
+
+def test_a_recommendation_can_name_the_option_instead_of_counting_rows():
+    """A model that echoes the phrase is being unambiguous, not wrong."""
+    assert ui.recommended_index("Switch to Postgres", OPTS) == 1
+
+
+def test_a_recommendation_sent_as_a_numeric_string_still_counts():
+    assert ui.recommended_index("2", OPTS) == 1
+
+
+@pytest.mark.parametrize("junk", [0, -1, 4, 99, None, "", "  ", "Use DuckDB",
+                                   "two", 1.5, True, False, [2], {"n": 2}])
+def test_anything_naming_no_real_row_is_simply_no_recommendation(junk):
+    """A hint that arrived mangled is worth dropping — it is not worth
+    failing the person's question over."""
+    assert ui.recommended_index(junk, OPTS) is None
+
+
+def test_there_is_nothing_to_recommend_without_options():
+    assert ui.recommended_index(1, []) is None
+
+
+async def test_the_numbered_list_labels_the_recommendation(cap, mocker):
+    """With no picker over it the label is all the recommendation has: there
+    is no cursor here to start in the right place."""
+    mocker.patch("omni.option_picker.available", return_value=False)
+    mocker.patch.object(ui.console, "input", return_value="1")
+    await ui.ask_user("Which store?", OPTS, 2)
+    out = flat(cap)
+    assert "2. Switch to Postgres (recommended)" in out
+    assert out.count("(recommended)") == 1
+
+
+async def test_the_numbered_list_says_nothing_when_nothing_was_recommended(cap, mocker):
+    mocker.patch("omni.option_picker.available", return_value=False)
+    mocker.patch.object(ui.console, "input", return_value="1")
+    await ui.ask_user("Which store?", OPTS)
+    assert "(recommended)" not in flat(cap)
+
+
+async def test_a_recommendation_naming_no_row_labels_nothing(cap, mocker):
+    mocker.patch("omni.option_picker.available", return_value=False)
+    mocker.patch.object(ui.console, "input", return_value="1")
+    await ui.ask_user("Which store?", OPTS, 99)
+    assert "(recommended)" not in flat(cap)
+
+
+async def test_the_standalone_picker_is_built_on_the_recommended_row(at_a_terminal):
+    """The loud half of recommending something: the cursor starts there, so
+    agreeing with it costs one keystroke."""
+    picker = ui._standalone_picker(OPTS, ui.recommended_index(2, OPTS))
+    assert picker.recommended == 1
+    assert picker.index == 1 and picker.answer() == "Switch to Postgres"
+
+
+async def test_the_recommendation_reaches_the_frames_picker_too(cap, mocker):
+    """An interactive session draws the choices itself, so the index has to
+    be handed to it rather than rendered here."""
+    app = mocker.Mock()
+    app.ask_text = mocker.AsyncMock(return_value="Switch to Postgres")
+    ui.use_tui(app)
+    try:
+        await ui.ask_user("Which store?", OPTS, 2)
+    finally:
+        ui.use_tui(None)
+    assert app.ask_text.await_args.kwargs["recommended"] == 1
+
+
 # ---------------- ask_user's standalone choice picker ----------------
 #
 # A one-shot run has no frame to draw the choices in, so ask_user puts up a

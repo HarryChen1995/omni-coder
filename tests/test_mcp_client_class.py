@@ -68,8 +68,11 @@ async def test_ask_user_is_always_offered(client, mocker):
     assert "ask_user" in names
     schema = next(s for s in await client.list_llm_tools() if s["function"]["name"] == "ask_user")
     props = schema["function"]["parameters"]["properties"]
-    assert set(props) == {"question", "options"}
+    assert set(props) == {"question", "options", "recommended"}
     assert schema["function"]["parameters"]["required"] == ["question"]
+    # Only the question is required: a bare question, a question with choices,
+    # and a question with a choice the model would make itself are all valid.
+    assert props["recommended"]["type"] == "integer"
 
 
 async def test_custom_server_underscore_tools_are_not_filtered(client, mocker):
@@ -791,7 +794,27 @@ async def test_ask_user_puts_the_question_to_the_ui(client, mocker):
     ask = mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="Use SQLite"))
     out = await client.call_tool("ask_user", {"question": "Which store?",
                                                "options": ["Use SQLite", "Use Postgres"]})
-    ask.assert_awaited_once_with("Which store?", ["Use SQLite", "Use Postgres"])
+    ask.assert_awaited_once_with("Which store?", ["Use SQLite", "Use Postgres"], None)
+    assert out == "The user answered: Use SQLite"
+
+
+async def test_ask_user_carries_the_models_own_pick_through(client, mocker):
+    """The number the model sent, untouched — ui is what decides whether it
+    names a real row, so there is one place that rule lives."""
+    ask = mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="Use Postgres"))
+    await client.call_tool("ask_user", {"question": "Which store?",
+                                         "options": ["Use SQLite", "Use Postgres"],
+                                         "recommended": 2})
+    ask.assert_awaited_once_with("Which store?", ["Use SQLite", "Use Postgres"], 2)
+
+
+async def test_a_nonsense_recommendation_still_reaches_ui_to_be_dropped(client, mocker):
+    """The dispatch must not grow a second opinion about what is valid; a
+    question with a bad hint is still a question worth asking."""
+    ask = mocker.patch("omni.ui.ask_user", mocker.AsyncMock(return_value="Use SQLite"))
+    out = await client.call_tool("ask_user", {"question": "Which store?",
+                                               "options": ["Use SQLite"], "recommended": 99})
+    ask.assert_awaited_once_with("Which store?", ["Use SQLite"], 99)
     assert out == "The user answered: Use SQLite"
 
 

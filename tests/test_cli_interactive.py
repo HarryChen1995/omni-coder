@@ -670,7 +670,7 @@ def test_missing_v1_models_endpoint_is_tolerated(repl, client, mocker):
 # an error result the model then worked around.
 
 @pytest.fixture
-def tui_app(mocker, cfg):
+def tui_app(mocker, cfg, headless_terminal):
     from omni import ui
     from omni.tui import TuiApp
     app = TuiApp({}, "main", cfg.model)

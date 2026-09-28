@@ -91,3 +91,25 @@ def mcp_server_factory(tmp_path):
         return {"command": sys.executable, "args": [str(path)]}, path
 
     return make
+
+
+@pytest.fixture
+def headless_terminal():
+    """A terminal for prompt_toolkit that isn't one.
+
+    A full-screen app resolves an output as it is constructed, and a test
+    runner with its output piped has none to give — on Windows that is an
+    outright NoConsoleScreenBufferError before a single assertion runs, and
+    on a bare CI container it is whatever that box's TERM happens to be.
+    A pipe and a dummy output settle it the same way the --resume list's
+    tests do, so anything built inside this fixture has a layout and key
+    bindings without needing a real screen behind them.
+
+    Yields the pipe, for a test that wants to feed it keys."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            yield pipe

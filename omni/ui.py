@@ -717,6 +717,11 @@ def _build_prompt_style() -> Style:
         "frame.model": f"bold {ACCENT}",
         "choice": "",
         "choice.selected": f"bold {ACCENT}",
+        # The recommendation's label, in the same grey as the frame hints.
+        # It is an annotation on a row, not a second thing competing with the
+        # cursor for the accent — the cursor already starts on it, which is
+        # the loud half of saying so.
+        "choice.recommended": _FRAME_HINT,
         "agent": "#8a8a8a",
         "agent.active": f"bold {ACCENT}",
         "agent.picked": f"bold reverse {ACCENT}",
@@ -747,6 +752,7 @@ def _build_prompt_style() -> Style:
         "picker.detail": _FRAME_HINT,
         "picker.hint": _FRAME_HINT,
         "picker.empty": _FRAME_HINT,
+        "picker.recommended": _FRAME_HINT,
         # bg:default everywhere except the selected row: prompt_toolkit's stock
         # menu paints a solid block, and since the menu is a full-width member of
         # the box's stack (not a float) that block reads as the whole terminal
@@ -1858,7 +1864,36 @@ def instruction(text: str, images: int = 0):
                             style="dim"))
 
 
-def _standalone_picker(options: list):
+def recommended_index(recommended, options: list):
+    """The row a `recommended` answer points at, as a 0-based index, or None.
+
+    Takes the number the person sees beside the option rather than an index,
+    because 1-based is what the model is asked for and what every rendering
+    of the list shows. Naming the option by its own text works too — a model
+    that echoes the phrase rather than counting rows is being unambiguous,
+    not wrong.
+
+    Anything that names no real row — 0, past the end, a phrase that isn't
+    among the options, not a number at all — is no recommendation rather
+    than an error. A hint that arrived mangled is worth dropping; it is not
+    worth failing the person's question over."""
+    if recommended is None or not options:
+        return None
+    if isinstance(recommended, bool):       # bools are ints; a True here is noise
+        return None
+    if isinstance(recommended, str):
+        text = recommended.strip()
+        if text in options:
+            return options.index(text)
+        if not text.isdigit():
+            return None
+        recommended = int(text)
+    if not isinstance(recommended, int):
+        return None
+    return recommended - 1 if 1 <= recommended <= len(options) else None
+
+
+def _standalone_picker(options: list, recommended=None):
     """The choice picker for a run with no full-screen frame, or None when it
     can't be drawn: nothing to choose between, a frame already showing its
     own picker, prompt_toolkit missing, input that isn't a terminal, or a
@@ -1878,11 +1913,11 @@ def _standalone_picker(options: list):
         return None
     if not available():
         return None
-    picker = OptionPicker(options)
+    picker = OptionPicker(options, recommended=recommended)
     return picker if picker.prepare() else None
 
 
-async def ask_user(question: str, options: list = None) -> str:
+async def ask_user(question: str, options: list = None, recommended=None) -> str:
     """Put a question to the person and wait for their answer (the ask_user
     tool). Returns the answer, or None if they dismissed it.
 
@@ -1892,18 +1927,28 @@ async def ask_user(question: str, options: list = None) -> str:
     one-shot run (option_picker). Typing instead of arrowing always works and
     always wins, because a plan needs accepting or rejecting but the
     interesting answer is often neither of the choices offered. A number is
-    both: typing 2 and arrowing to the second row mean the same thing."""
+    both: typing 2 and arrowing to the second row mean the same thing.
+
+    `recommended` names the option the model would pick itself. It is said
+    twice, because the two halves do different jobs: the cursor *starts*
+    there, so the recommendation is what Enter takes and agreeing costs one
+    keystroke, and the row is labelled, so you can see it is a suggestion
+    rather than merely where the cursor happened to begin. Moving off it
+    leaves the label behind — the recommendation is a property of the
+    option, not of the cursor."""
     options = options or []
-    picker = _standalone_picker(options)
+    recommended = recommended_index(recommended, options)
+    picker = _standalone_picker(options, recommended)
     # Whichever picker is drawing the choices is showing them already, so the
     # transcript block carries just the question. Without one — piped input,
     # or no prompt_toolkit — the numbered list *is* the interface.
-    _question_block(question, [] if (_tui is not None or picker is not None) else options)
+    _question_block(question, [] if (_tui is not None or picker is not None) else options,
+                     recommended)
     hint = ("type 1–%d to choose, or write your own answer" % len(options)) if options \
         else "type your answer"
 
     if _tui is not None:
-        answer = await _tui.ask_text(hint, options)
+        answer = await _tui.ask_text(hint, options, recommended=recommended)
     elif picker is not None:
         try:
             answer = await picker.run()
@@ -1916,7 +1961,7 @@ async def ask_user(question: str, options: list = None) -> str:
             # the choices this time, since the picker was the only thing that
             # had shown them.
             picker = None
-            _choices_block(options)
+            _choices_block(options, recommended)
             answer = _typed_answer(hint)
     else:
         answer = _typed_answer(hint)
@@ -1937,13 +1982,13 @@ async def ask_user(question: str, options: list = None) -> str:
     return answer
 
 
-def _question_block(question: str, options: list):
+def _question_block(question: str, options: list, recommended=None):
     """The question itself, as a transcript block."""
     def build():
         body = Text()
         body.append("? ", style=f"bold {ACCENT}")
         body.append(question, style="bold")
-        _append_options(body, options)
+        _append_options(body, options, recommended)
         return body
 
     if _tui is not None:
@@ -1952,13 +1997,13 @@ def _question_block(question: str, options: list):
     _print_question(build)
 
 
-def _choices_block(options: list):
+def _choices_block(options: list, recommended=None):
     """The numbered list on its own, for the one path that prints it after
     the question rather than with it: a picker that was drawable when the
     question went out and wasn't by the time it ran."""
     def build():
         body = Text()
-        _append_options(body, options, lead=False)
+        _append_options(body, options, recommended, lead=False)
         return body
 
     if _tui is not None:
@@ -1967,14 +2012,20 @@ def _choices_block(options: list):
     _print_question(build)
 
 
-def _append_options(body: Text, options: list, lead: bool = True):
+def _append_options(body: Text, options: list, recommended=None, lead: bool = True):
     """The choices as numbered lines. `lead` says whether the first one opens
-    a new line — it follows a question, or it starts the block."""
+    a new line — it follows a question, or it starts the block.
+
+    This is the list with no picker over it, so the recommendation has only
+    its label to travel on: there is no cursor here to start in the right
+    place, and the number is the whole interface."""
     for i, option in enumerate(options, 1):
         if lead or i > 1:
             body.append("\n")
         body.append(f"    {i}. ", style=ACCENT)
         body.append(option)
+        if recommended == i - 1:
+            body.append("  (recommended)", style=_FRAME_HINT)
 
 
 def _typed_answer(hint: str):

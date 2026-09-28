@@ -199,8 +199,8 @@ before it acts:
 ```
 ? Store sessions in SQLite or Postgres?
 
- ▸ 1. Keep SQLite
-   2. Switch to Postgres
+   1. Keep SQLite
+ ▸ 2. Switch to Postgres  (recommended)
    3. Accept my plan as written
 ────────────────────────────────────────────────────────── my-session ──
 ❯
@@ -213,6 +213,16 @@ useful answer is often none of the options ("neither, use DuckDB"), so
 anything you type is taken verbatim and sent back as-is. Ctrl+C dismisses the
 question, and the tool tells the model so rather than letting it ask again in
 a loop.
+
+The model can also mark **one option as recommended** — the one it would pick
+itself. That is said twice, because the two halves do different jobs: the
+cursor *starts* on that row, so agreeing costs a single Enter, and the row is
+labelled, so you can see it was chosen for a reason rather than being where
+the cursor happened to begin. Move off it and the label stays behind — the
+recommendation belongs to the option, not to the cursor. It is only ever a
+suggestion: arrowing away, clicking elsewhere and typing over it all work
+exactly as before. A recommendation naming no real row is dropped rather than
+failing the question.
 
 A one-shot run (`omni "…"`) has no frame to put the choices in, so it draws
 the same picker on its own, under the question:

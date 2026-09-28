@@ -295,6 +295,9 @@ class Pane:
         self.ask = None               # (hint, Future)
         self.options: list = []
         self.choice = 0
+        # Which option the model would pick itself, if it said so. The
+        # cursor starts there; the row keeps its label when it moves off.
+        self.recommended = None
 
     # The frame shows exactly one of these for the focused pane.
     @property
@@ -656,6 +659,11 @@ class TuiApp:
                     self.invalidate()
 
             fragments.append((style, f" {marker}{i + 1}. {option}", handler))
+            if i == pane.recommended:
+                # Stays put when the cursor moves off it: the recommendation
+                # belongs to the option, not to the cursor, and you have to be
+                # able to find your way back to it.
+                fragments.append(("class:choice.recommended", "  (recommended)", handler))
             fragments.append(("", "\n"))
         if typing:
             fragments.append(("class:frame.hint", "   (using what you typed)"))
@@ -1136,7 +1144,8 @@ class TuiApp:
         if pane.approval and not pane.approval[1].done():
             pane.approval[1].set_result(verdict)
 
-    async def ask_text(self, hint: str, options: list = None, pane: Pane = None) -> str:
+    async def ask_text(self, hint: str, options: list = None, pane: Pane = None,
+                        recommended=None) -> str:
         """Answer a question the model asked (the ask_user tool), rather than
         start a new turn. Same input row — there is still only one place to
         type — but the line goes back to the tool, and when options were
@@ -1146,13 +1155,17 @@ class TuiApp:
         future = asyncio.get_running_loop().create_future()
         pane.ask = (hint, future)
         pane.options = list(options or [])
-        pane.choice = 0
+        pane.recommended = recommended if (
+            recommended is not None and 0 <= recommended < len(pane.options)) else None
+        # Start on the recommendation, so agreeing with it is one keystroke.
+        pane.choice = pane.recommended or 0
         self.invalidate()
         try:
             return await future
         finally:
             pane.ask = None
             pane.options = []
+            pane.recommended = None
             self.invalidate()
 
     def _resolve_ask(self, pane: Pane, text):
