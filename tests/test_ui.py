@@ -1351,3 +1351,134 @@ def test_frame_pause_outside_a_turn_is_a_no_op():
 
 
 # ---------------- prompt_task_async ----------------
+
+
+# ---------------- fitting a choice to the terminal ----------------
+#
+# A choice drawn as one long fragment is simply cut off at the edge, and an
+# answer you cannot read is one you cannot pick. wrap_choice is what both
+# pickers fold their options with.
+
+
+def test_a_short_choice_is_left_on_one_line():
+    lines, tag_alone = ui.wrap_choice("  1. ", "Keep SQLite", 60)
+    assert lines == ["  1. Keep SQLite"] and tag_alone is False
+
+
+def test_a_long_choice_is_folded_to_the_width():
+    lines, _ = ui.wrap_choice("  1. ", "x " * 60, 40)
+    assert len(lines) > 1
+    assert all(len(line) <= 40 for line in lines)
+
+
+def test_continuation_lines_hang_under_the_text_not_the_number():
+    """A wrapped choice still has to read as one item, with the numbers a
+    clean column down the left edge."""
+    lines, _ = ui.wrap_choice("  1. ", "alpha beta gamma delta epsilon zeta", 24)
+    assert lines[0].startswith("  1. ")
+    assert all(line.startswith("     ") and not line[5:6].isspace() for line in lines[1:])
+
+
+def test_whitespace_in_a_choice_is_collapsed():
+    """An option that arrived with a newline in it must not break the row."""
+    lines, _ = ui.wrap_choice("  1. ", "keep\n  sqlite\tplease", 60)
+    assert lines == ["  1. keep sqlite please"]
+
+
+def test_a_word_longer_than_the_line_is_broken_rather_than_overflowing():
+    lines, _ = ui.wrap_choice("  1. ", "x" * 200, 40)
+    assert all(len(line) <= 40 for line in lines)
+
+
+def test_an_absurdly_narrow_terminal_still_leaves_room_for_words():
+    """Otherwise the text column collapses to one character per line."""
+    lines, _ = ui.wrap_choice("  1. ", "alpha beta gamma", 4)
+    assert max(len(line) for line in lines) > 10
+
+
+def test_an_empty_choice_is_one_empty_row():
+    assert ui.wrap_choice("  1. ", "", 40) == (["  1. "], False)
+
+
+def test_a_tag_rides_on_the_last_line_when_it_fits():
+    _, tag_alone = ui.wrap_choice("  1. ", "Postgres", 60, "  (recommended)")
+    assert tag_alone is False
+
+
+def test_a_tag_drops_to_its_own_line_when_it_does_not_fit():
+    _, tag_alone = ui.wrap_choice("  1. ", "Switch to Postgres today", 30, "  (recommended)")
+    assert tag_alone is True
+
+
+def test_no_tag_never_asks_for_a_line():
+    assert ui.wrap_choice("  1. ", "anything", 60)[1] is False
+
+
+# ---------------- tool icons ----------------
+
+
+def test_the_read_only_git_tools_share_one_icon():
+    """They read as a family — 🐙, for the "octo" of Octocat, since GitHub's
+    own mark is an image and not a codepoint a terminal can draw."""
+    family = {ui._emoji_for(n) for n in ("git_status", "git_diff", "git_log", "git_show")}
+    assert family == {"🐙"}
+
+
+def test_a_git_tool_nobody_listed_still_joins_the_family():
+    assert ui._emoji_for("git_stash") == ui._emoji_for("git_status")
+
+
+def test_the_git_calls_that_change_something_keep_their_own_icon():
+    """"This touches history or the remote" is worth seeing before you read
+    the name."""
+    mutating = {ui._emoji_for(n) for n in ("git_add", "git_commit", "git_pull", "git_push")}
+    assert len(mutating) == 4 and "🐙" not in mutating
+
+
+def test_no_tool_icon_carries_a_variation_selector():
+    """Rich measures U+FE0F emoji as two cells but terminals advance the
+    cursor by one, so the glyph swallows the space and collides with the
+    tool name."""
+    names = list(ui._TOOL_EMOJI) + ["git_stash", "something__custom", "unknown_tool"]
+    for name in names:
+        assert "\ufe0f" not in ui._emoji_for(name), name
+
+
+# ---------------- /cost ----------------
+
+
+def test_the_cost_report_names_each_agent(cap):
+    """Per agent, because subagents are where spend goes unnoticed: they run
+    unwatched and report back only a final answer."""
+    ui.cost_report([("main", 128400, 9120), ("1 audit", 42100, 3300)], 0)
+    out = " ".join(cap.getvalue().split())
+    assert "main" in out and "1 audit" in out
+
+
+def test_the_cost_report_totals_every_agent(cap):
+    ui.cost_report([("main", 100, 20), ("1 audit", 300, 40)], 0)
+    out = " ".join(cap.getvalue().split())
+    assert "all agents" in out and "460" in out
+
+
+def test_a_lone_agent_needs_no_total_row(cap):
+    ui.cost_report([("main", 100, 20)], 0)
+    assert "all agents" not in " ".join(cap.getvalue().split())
+
+
+def test_big_numbers_are_grouped(cap):
+    """A token count mistyped by a factor of ten is not obvious on screen."""
+    ui.cost_report([("main", 1284000, 91200)], 0)
+    assert "1,284,000" in " ".join(cap.getvalue().split())
+
+
+def test_the_cap_is_shown_when_there_is_one(cap):
+    ui.cost_report([("main", 1, 1)], 200000)
+    assert "200,000 tokens per turn" in " ".join(cap.getvalue().split())
+
+
+def test_no_cap_says_how_to_set_one(cap):
+    """The default is uncapped, so this is the only place it is offered."""
+    ui.cost_report([("main", 1, 1)], 0)
+    assert "no per-turn cap" in " ".join(cap.getvalue().split())
+    assert "/max-turn-tokens" in " ".join(cap.getvalue().split())

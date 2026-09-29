@@ -404,6 +404,15 @@ class CodingAgent:
         # part-way through, so the two can't interleave. A lock here would
         # imply a second thread that does not exist.
         self._inbox: list = []
+        # What the turn in flight has spent, against cfg.max_turn_tokens.
+        # Reset at the start of every turn; self.tokens keeps the session's
+        # running total and is never reset.
+        self._turn_tokens = {"prompt": 0, "completion": 0}
+        # Set while read-only tool calls are in flight: calling it abandons
+        # them so a line typed now reaches the model at once. None whenever
+        # there is nothing safe to interrupt.
+        self._tool_cancel = None
+        self._superseded_tools = False
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
 
@@ -424,6 +433,16 @@ class CodingAgent:
         if not (text or "").strip():
             return False
         self._inbox.append((text, list(attachments or [])))
+        # If the turn is sitting on read-only tool calls, drop them: their
+        # answers are about to be irrelevant, and the point of typing was not
+        # to wait. Writes and shell commands are never interrupted this way —
+        # see where _tool_cancel is set.
+        if self._tool_cancel is not None:
+            self._superseded_tools = True
+            try:
+                self._tool_cancel()
+            except Exception:
+                pass
         return True
 
     @property
@@ -462,6 +481,21 @@ class CodingAgent:
                 ui.injected(text, images=len(attachments))
         return persisted
 
+    @property
+    def turn_tokens(self) -> int:
+        """Everything the turn in flight has spent so far, both directions.
+
+        One number because the budget is one number: a cap that had to be
+        split between prompt and completion would be two settings nobody
+        could reason about, and what is billed is the sum."""
+        return self._turn_tokens["prompt"] + self._turn_tokens["completion"]
+
+    @property
+    def total_tokens(self) -> int:
+        """Everything this agent has spent since it was made — what /cost
+        reports, and never reset by a turn beginning."""
+        return self.tokens["prompt"] + self.tokens["completion"]
+
     def _count(self, usage: dict):
         """Fold one usage block into this agent's running total.
 
@@ -469,8 +503,16 @@ class CodingAgent:
         here — the turn's own calls, intent parsing, and history compaction —
         so the number beside the spinner is the whole of what the session has
         cost, not just the visible replies."""
-        self.tokens["prompt"] += int((usage or {}).get("prompt_tokens") or 0)
-        self.tokens["completion"] += int((usage or {}).get("completion_tokens") or 0)
+        prompt = int((usage or {}).get("prompt_tokens") or 0)
+        completion = int((usage or {}).get("completion_tokens") or 0)
+        self.tokens["prompt"] += prompt
+        self.tokens["completion"] += completion
+        # The same spend, counted again per turn, which is what
+        # max_turn_tokens is measured against. Two counters rather than one
+        # because the session total is what /cost reports and must never be
+        # reset, while the budget has to start again at every turn.
+        self._turn_tokens["prompt"] += prompt
+        self._turn_tokens["completion"] += completion
 
     async def _call_model(self, messages: list, tool_schemas: list):
         """Call the LLM server with retries for transient errors (connection refused,
@@ -671,6 +713,11 @@ class CodingAgent:
         # Only a keystroke reaches the inbox (cli's _inject, off the input
         # row), so nothing the model does can extend its own leash.
         budget = self.cfg.max_steps
+        # Tokens are capped the same way and for the same reason — a cap on
+        # what runs unattended, not on how much work a turn may do — so a
+        # keystroke restarts this one too. 0 lifts it entirely.
+        token_budget = self.cfg.max_turn_tokens
+        self._turn_tokens = {"prompt": 0, "completion": 0}
         step = 0
         while step < budget:
             step += 1
@@ -682,6 +729,17 @@ class CodingAgent:
             if self._inbox:
                 persisted = self._absorb_inbox(session_id, messages, persisted)
                 budget = step + self.cfg.max_steps
+                if token_budget:
+                    token_budget = self.turn_tokens + self.cfg.max_turn_tokens
+
+            if token_budget and self.turn_tokens >= token_budget:
+                spent = self.turn_tokens
+                msg = (f"Token budget for this turn is spent ({spent:,} of "
+                        f"{token_budget:,}). Nothing is lost — say what to do next to "
+                        f"carry on, or raise it with /max-turn-tokens.")
+                self.logger.info(msg)
+                self.store.finish_session(session_id, "max_tokens", msg)
+                return msg
 
             # Trigger on the real context size: the prompt_tokens the server
             # reported for the last call is exactly how large what we keep
@@ -839,9 +897,19 @@ class CodingAgent:
                         previous_sigint = signal.signal(
                             signal.SIGINT, lambda *_: [t.cancel() for t in tasks if not t.done()]
                         )
+                        # And so does typing. Reads are the one thing worth
+                        # abandoning half-done: nothing has changed, the
+                        # answer is about to be irrelevant anyway, and waiting
+                        # for eight file reads to finish before the model
+                        # hears "wrong directory" is the delay this is for.
+                        # Only here — the branch below runs writes and shell
+                        # commands, and tearing one of those in half is how
+                        # you get a truncated file.
+                        self._tool_cancel = lambda: [t.cancel() for t in tasks if not t.done()]
                         try:
                             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
                         finally:
+                            self._tool_cancel = None
                             signal.signal(signal.SIGINT, previous_sigint)
                     else:
                         # Sequential (see the safe_tools check above for why):
@@ -872,8 +940,16 @@ class CodingAgent:
                         finally:
                             signal.signal(signal.SIGINT, previous_sigint)
 
+                # Why it stopped matters to the model: "the user typed
+                # something" is followed by that something, and reads as a
+                # change of direction. "Ctrl+C" reads as a refusal.
+                stopped = ("ERROR: superseded — the user said something mid-call; "
+                            "read their message below before continuing."
+                            if self._superseded_tools
+                            else "ERROR: cancelled by user (Ctrl+C).")
+                self._superseded_tools = False
                 results = [
-                    "ERROR: cancelled by user (Ctrl+C)." if isinstance(r, asyncio.CancelledError) else r
+                    stopped if isinstance(r, asyncio.CancelledError) else r
                     for r in raw_results
                 ]
                 for c, result in zip(runnable, results):

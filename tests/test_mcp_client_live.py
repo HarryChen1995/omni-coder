@@ -9,6 +9,7 @@ Marked `live` — deselect with `-m "not live"` if subprocess spawning is
 unavailable.
 """
 
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -62,7 +63,10 @@ def live_children(script_path, expected=None, timeout=3.0):
     """
     deadline = time.monotonic() + timeout
     while True:
-        out = subprocess.run(["pgrep", "-f", str(script_path)], capture_output=True, text=True).stdout
+        if shutil.which("pgrep") is None:
+            pytest.skip("pgrep is POSIX-only; no portable way to count these children")
+        out = subprocess.run(["pgrep", "-f", str(script_path)], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace").stdout
         count = len([l for l in out.splitlines() if l.strip()])
         if expected is None or count == expected or time.monotonic() > deadline:
             return count

@@ -227,11 +227,56 @@ during this turn instead of finishing the wrong work first. Concretely:
 - **Never dropped.** A line typed on a turn's very last step arrives after
   the final boundary, so that turn can't see it. It's moved to the front of
   that pane's queue and runs as a turn of its own — late, but never lost.
+- **Reads in flight are abandoned.** If the turn is sitting on read-only tool
+  calls when you type, they're dropped rather than waited for: nothing has
+  changed, their answers are about to be irrelevant, and waiting for eight
+  file reads to finish before the model hears "wrong directory" is the delay
+  this exists to remove. The model is told they were *superseded*, not
+  cancelled, so it reads as a change of direction rather than a refusal.
+  **Writes and shell commands are never interrupted this way** — tearing one
+  of those in half is how you get a truncated file.
 
 The fallback queue drains **strictly in order, one turn at a time**: it never
 runs alongside the turn in front of it, and a turn that fails still lets it
 move on. Images pasted with a line travel with that line, not with whichever
 turn happens to pick it up.
+
+## 💰 What a turn may spend
+
+`--max-steps` caps how many iterations a turn may run, but it stopped being a
+cost guard the moment typing into a turn restarted it — a turn you're steering
+is bounded only by you. Tokens are capped separately:
+
+```bash
+omni --max-turn-tokens 200000     # or /max-turn-tokens 200000, saved
+```
+
+It counts everything spent on the turn's behalf — its own calls, intent
+parsing, history compaction — and stops the turn when it's spent, saying so
+and how to carry on. **0 is the default and means no cap**, because the models
+this usually drives are local, where a limit nobody asked for is a turn that
+stops for no visible reason. Set it where tokens are billed, and for
+subagents especially: they run with nobody watching and report back only a
+final answer, so one that loops spends invisibly.
+
+Like the step cap, it counts what runs *unattended* — typing into the turn
+restarts it, because someone at the keyboard is the oversight the cap stands
+in for.
+
+**`/cost`** shows what the session has spent, per agent, which is where a
+looping subagent actually shows up:
+
+```
+ agent           sent   received     total
+ ─────────────────────────────────────────
+ main         128,400      9,120   137,520
+ 1 audit       42,100      3,300    45,400
+
+ all agents                        182,920
+```
+
+Tokens rather than currency: the counts come from the server's own usage
+blocks, and a price per token would be invented rather than reported.
 
 ## ❓ Asking you a question
 
@@ -256,6 +301,20 @@ useful answer is often none of the options ("neither, use DuckDB"), so
 anything you type is taken verbatim and sent back as-is. Ctrl+C dismisses the
 question, and the tool tells the model so rather than letting it ask again in
 a loop.
+
+Long answers are wrapped to your terminal rather than cut off at its edge,
+with continuation lines hanging under the option's text so the numbers stay a
+clean column and a folded choice still reads as one item — an answer you
+can't read is one you can't pick:
+
+```
+   1. Keep SQLite as the session store and leave the schema
+      exactly as it is today
+ ▸ 2. Switch to Postgres and migrate the existing rows in
+      the same deployment window  (recommended)
+   3. Neither
+```
+
 
 The model can also mark **one option as recommended** — the one it would pick
 itself. That is said twice, because the two halves do different jobs: the
@@ -1190,7 +1249,7 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 
 | File | Covers |
 |---|---|
-| `test_tools.py` | Path scoping (the security boundary), file IO, ripgrep search, shell policy |
+| `test_tools.py` | Path scoping (the security boundary), file IO, ripgrep search, shell policy, and the paths handed to the model |
 | `test_tools_git.py` | Every git tool's argv, exit codes, timeouts, missing binary |
 | `test_session_store.py` | SQLite persistence, resume/rename/delete, compaction rewrites |
 | `test_intent.py` | JSON coercion of malformed model output, retry + fallback |
@@ -1215,6 +1274,12 @@ exist because `_serve`/`_stop_server` are about anyio task-group lifetimes —
 cancel scopes are task-scoped, which is *why* each server gets its own task —
 and a mock can't exercise that. They also assert no subprocess is orphaned
 across restarts.
+
+A test that needs something the machine can't do — creating a symlink, which
+on Windows wants Developer Mode or an elevated shell, or `pgrep`, which is
+POSIX-only — **skips with a reason rather than failing**. A red suite should
+mean you broke something, not that you're on the wrong operating system; the
+whole suite is green on Windows, macOS and Linux.
 
 ## 📁 Files
 All modules live under `omni/`:

@@ -8,6 +8,8 @@ OSError — which a real repo can't reproduce on demand.
 
 import subprocess
 
+import os
+
 import pytest
 
 from omni.tools import PathScopeError, Tools
@@ -166,7 +168,9 @@ def test_missing_git_binary_is_reported_not_raised(tools, run_mock, call):
 def test_git_tools_run_in_resolved_scope(tools, run_mock):
     """cwd must be the resolved in-scope path, never the caller's cwd."""
     tools.git_diff("pkg")
-    assert run_mock.call_args.kwargs["cwd"].endswith("/pkg")
+    # An absolute cwd is the machine's own spelling — unlike the relative
+    # paths we hand the model, which are normalised to forward slashes.
+    assert run_mock.call_args.kwargs["cwd"].endswith(os.sep + "pkg")
 
 
 def test_read_only_git_output_is_truncated(cfg, run_mock):

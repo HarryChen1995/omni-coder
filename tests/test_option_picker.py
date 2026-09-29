@@ -426,3 +426,55 @@ def test_the_picker_erases_itself_on_the_way_out():
         with create_app_session(input=pipe, output=DummyOutput()):
             app = OptionPicker(OPTIONS)._build()
     assert app.erase_when_done and not app.full_screen
+
+
+# ---------------- fitting the choices to the terminal ----------------
+
+LONG = ("Switch to Postgres and migrate every existing row in the same "
+        "deployment window, then retire the SQLite file")
+
+
+def test_a_long_choice_is_wrapped_rather_than_cut_off():
+    """An answer you cannot read is one you cannot pick."""
+    rows = "".join(f[1] for f in OptionPicker([LONG]).row_fragments(width=50))
+    assert len(rows.rstrip("\n").split("\n")) > 1
+    assert all(len(line) <= 50 for line in rows.split("\n"))
+
+
+def test_every_word_of_a_wrapped_choice_survives():
+    """Wrapping must fold the text, never trim it."""
+    rows = "".join(f[1] for f in OptionPicker([LONG]).row_fragments(width=44))
+    assert " ".join(rows.split()) == "❯ 1. " + LONG
+
+
+def test_a_wrapped_choice_hangs_under_its_own_text():
+    """So it still reads as one item, with the numbers a clean column down
+    the left edge rather than continuation text running under them."""
+    rows = "".join(f[1] for f in OptionPicker([LONG]).row_fragments(width=44))
+    first, second = rows.split("\n")[:2]
+    lead = "  ❯ 1. "
+    assert first.startswith(lead)
+    assert second.startswith(" " * len(lead)) and second.strip()
+
+
+def test_the_marker_still_leads_a_wrapped_choice():
+    rows = "".join(f[1] for f in OptionPicker([LONG, "Neither"]).row_fragments(width=44))
+    assert rows.split("\n")[0].lstrip().startswith("\u276f 1.")
+
+
+def test_a_narrow_terminal_does_not_lose_the_recommendation_tag():
+    rows = "".join(f[1] for f in
+                    OptionPicker([LONG, "Neither"], recommended=0).row_fragments(width=44))
+    assert "(recommended)" in rows
+
+
+def test_the_window_asks_for_the_height_the_wrapped_rows_need():
+    """A fixed row-per-choice window would clip a wrapped choice itself —
+    the same bug the wrapping fixes, one level up."""
+    short = OptionPicker(["a", "b"])
+    tall = OptionPicker([LONG, LONG])
+    assert tall.rows_height() > short.rows_height()
+
+
+def test_a_short_list_needs_one_line_per_choice():
+    assert OptionPicker(["a", "b", "c"]).rows_height() == 4

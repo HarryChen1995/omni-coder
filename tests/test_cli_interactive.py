@@ -1357,3 +1357,50 @@ def test_images_travel_with_the_line_that_was_typed_with_them(tui_app):
     shot = [{"mime": "image/png", "data": b"x"}]
     cli_mod._inject(pane, "what is wrong here", shot)
     assert pane.agent.taken == [("what is wrong here", shot)]
+
+
+# ---------------- /cost ----------------
+
+
+def test_cost_reports_every_pane_that_has_an_agent(tui_app, mocker, cfg):
+    main, sub = tui_app.main, tui_app.add_pane("audit", depth=1)
+    main.agent = mocker.Mock(tokens={"prompt": 100, "completion": 20})
+    sub.agent = mocker.Mock(tokens={"prompt": 300, "completion": 40})
+    report = mocker.patch("omni.ui.cost_report")
+
+    cli_mod._report_cost(cfg, tui_app, main)
+    rows = report.call_args.args[0]
+    assert rows == [("main", 100, 20), ("1 audit", 300, 40)]
+
+
+def test_cost_passes_the_cap_through(tui_app, mocker, cfg):
+    cfg.max_turn_tokens = 12345
+    tui_app.main.agent = mocker.Mock(tokens={"prompt": 1, "completion": 1})
+    report = mocker.patch("omni.ui.cost_report")
+    cli_mod._report_cost(cfg, tui_app, tui_app.main)
+    assert report.call_args.args[1] == 12345
+
+
+def test_a_pane_with_no_agent_is_left_out(tui_app, mocker, cfg):
+    tui_app.main.agent = None
+    tui_app.add_pane("audit", agent=mocker.Mock(tokens={"prompt": 5, "completion": 5}), depth=1)
+    report = mocker.patch("omni.ui.cost_report")
+    cli_mod._report_cost(cfg, tui_app, tui_app.main)
+    assert [name for name, _, _ in report.call_args.args[0]] == ["1 audit"]
+
+
+def test_an_agent_whose_tokens_are_not_a_count_is_left_out(tui_app, mocker, cfg):
+    """A stub answers every attribute with a Mock; putting one in a table
+    would render it as an object."""
+    tui_app.main.agent = mocker.Mock()
+    report = mocker.patch("omni.ui.cost_report")
+    mocker.patch.object(cli_mod, "_echo")
+    cli_mod._report_cost(cfg, tui_app, tui_app.main)
+    report.assert_not_called()
+
+
+def test_cost_before_anything_has_run_says_so(tui_app, mocker, cfg):
+    tui_app.main.agent = None
+    echo = mocker.patch.object(cli_mod, "_echo")
+    cli_mod._report_cost(cfg, tui_app, tui_app.main)
+    assert "Nothing spent yet" in echo.call_args.args[0]

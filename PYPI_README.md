@@ -45,6 +45,11 @@ Run `omni --help` for the full option list.
   the wrong work first. An interjection even keeps a turn alive that was about
   to end. Per agent, persisted like any other message, and a line that arrives
   after the last boundary runs as its own turn rather than being lost.
+- **A budget for what a turn may spend** — `--max-turn-tokens` caps tokens the
+  way `--max-steps` caps iterations, counting everything spent on the turn's
+  behalf; `/cost` shows the session's spend per agent, which is where a
+  looping subagent shows up. Off by default, since the models this drives are
+  usually local.
 - **Session persistence** — every message is saved to SQLite as the run
   happens. Resume a previous run by id or by a name you gave it, quoted if
   it has spaces (`--resume "my refactor"` — case and surrounding space are

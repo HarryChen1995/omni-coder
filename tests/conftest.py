@@ -113,3 +113,28 @@ def headless_terminal():
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
             yield pipe
+
+
+def can_symlink(tmp_path) -> bool:
+    """Whether this process may create a symlink.
+
+    On Windows it needs Developer Mode or an elevated shell, so an ordinary
+    checkout cannot. That is a missing capability, not a defect: a test that
+    needs one should say it was skipped and why, rather than fail and leave a
+    developer unable to tell their own breakage from their machine's."""
+    probe = tmp_path / "__symlink_probe__"
+    target = tmp_path / "__symlink_target__"
+    target.mkdir(exist_ok=True)
+    try:
+        probe.symlink_to(target)
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+    probe.unlink()
+    return True
+
+
+@pytest.fixture
+def symlinks(tmp_path):
+    """Skip the test unless symlinks can actually be created here."""
+    if not can_symlink(tmp_path):
+        pytest.skip("symlinks unavailable (Windows needs Developer Mode or elevation)")

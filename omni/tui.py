@@ -679,14 +679,21 @@ class TuiApp:
     def _options_lines(self):
         """The choices, with the highlighted one marked. Each row carries its
         own mouse handler, so an option can be clicked as well as arrowed
-        to — the transcript is clickable, and so is this."""
+        to — the transcript is clickable, and so is this.
+
+        Wrapped to the frame's width: a choice drawn as one long fragment is
+        cut off at the terminal's edge, and an answer you cannot read is one
+        you cannot pick. Every line of a wrapped choice keeps that choice's
+        handler, so clicking its second line selects it too."""
         pane = self.pane
         typing = bool(self._buffer.text.strip())
+        width = self._width()
         fragments = []
         for i, option in enumerate(pane.options):
             selected = i == pane.choice and not typing
             marker = "▸ " if selected else "  "
             style = "class:choice.selected" if selected else "class:choice"
+            tag = "  (recommended)" if i == pane.recommended else ""
 
             def handler(event, index=i, target=pane):
                 if event.event_type == MouseEventType.MOUSE_UP:
@@ -694,16 +701,30 @@ class TuiApp:
                     self._buffer.reset()
                     self.invalidate()
 
-            fragments.append((style, f" {marker}{i + 1}. {option}", handler))
-            if i == pane.recommended:
+            lines, tag_alone = _ui.wrap_choice(f" {marker}{i + 1}. ", option, width, tag)
+            for line in lines:
+                fragments.append((style, line, handler))
+                if line is not lines[-1]:
+                    fragments.append(("", "\n", handler))
+            if tag:
                 # Stays put when the cursor moves off it: the recommendation
                 # belongs to the option, not to the cursor, and you have to be
                 # able to find your way back to it.
-                fragments.append(("class:choice.recommended", "  (recommended)", handler))
+                if tag_alone:
+                    fragments.append(("", "\n", handler))
+                    fragments.append(("class:choice.recommended",
+                                       " " * (len(marker) + 4) + tag.strip(), handler))
+                else:
+                    fragments.append(("class:choice.recommended", tag, handler))
             fragments.append(("", "\n"))
         if typing:
             fragments.append(("class:frame.hint", "   (using what you typed)"))
         return fragments
+
+    def _options_height(self) -> int:
+        """How many rows the picker needs, so a wrapped choice isn't clipped
+        by the window it is drawn in — the very thing the wrapping fixes."""
+        return sum(f[1].count("\n") for f in self._options_lines()) + 1
 
     # ---- modes, read off the focused pane ----
 
@@ -863,8 +884,13 @@ class TuiApp:
                 filter=Condition(self._busy),
             ),
             ConditionalContainer(
+                # Height follows the wrapped content rather than a fixed ten
+                # rows, or long choices would be clipped by the window instead
+                # of by the terminal — the same bug one level up. Still
+                # capped, so a question with many long answers takes a share
+                # of the screen and not all of it.
                 Window(FormattedTextControl(self._options_lines), always_hide_cursor=True,
-                        height=Dimension(min=1, max=10)),
+                        height=lambda: Dimension(min=1, max=min(self._options_height(), 16))),
                 filter=Condition(self._choosing),
             ),
             ConditionalContainer(

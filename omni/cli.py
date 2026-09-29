@@ -98,6 +98,7 @@ _STATIC_COMMANDS = {
     "/quit": "leave the REPL",
     "/sessions": "list saved sessions",
     "/delete ": "delete a saved session — /delete <id-or-name>",
+    "/cost": "tokens this session has spent, per agent",
     "/compact": "summarize this session's history down to a briefing",
     "/copy": "copy this agent's transcript to the system clipboard",
     "/reasoning": "show a reply's chain of thought in full — /reasoning [n]",
@@ -720,6 +721,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                         _echo("Couldn't reach a clipboard tool "
                                    "(pbcopy / wl-copy / xclip / xsel).", err=True)
                     continue
+                if task == "/cost":
+                    _report_cost(cfg, tui, pane)
+                    continue
                 if task == "/compact":
                     if session_id is None:
                         _echo("No active session yet — run a task first.")
@@ -1237,6 +1241,33 @@ def _inject(pane, text: str, attachments: list) -> bool:
         # A turn that has just torn down, or a stub. The line is not lost: the
         # caller parks it on the pane's queue instead.
         return False
+
+
+def _report_cost(cfg, tui, pane):
+    """/cost — what every agent in this session has spent.
+
+    Reads the live agents rather than the store, because the spinner's count
+    and this have to agree: both come from the usage blocks the server
+    reported, and a second source would drift from the first."""
+    panes = list(tui.panes) if tui is not None else [pane]
+    rows = []
+    for index, one in enumerate(panes):
+        agent = getattr(one, "agent", None)
+        tokens = getattr(agent, "tokens", None)
+        if not isinstance(tokens, dict):
+            continue
+        label = "main" if index == 0 else f"{index} {one.name}"
+        rows.append((label, int(tokens.get("prompt") or 0),
+                      int(tokens.get("completion") or 0)))
+    if not rows:
+        _echo("Nothing spent yet — run a task first.")
+        return
+    try:
+        from . import ui
+        ui.cost_report(rows, cfg.max_turn_tokens)
+    except ImportError:
+        for label, prompt, completion in rows:
+            _echo(f"{label}: {prompt + completion} tokens")
 
 
 def _take_inbox(pane) -> list:

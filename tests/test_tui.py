@@ -1093,3 +1093,65 @@ async def test_the_running_app_copies_its_transcript(mocker):
             as (application, pipe, stream):
         assert application.copy_transcript() == (True, 2)
         assert copy.call_args.args[0] == "first\nsecond"
+
+
+# ---------------- fitting the choices to the frame ----------------
+
+LONG_OPTION = ("Switch to Postgres and migrate every existing row in the same "
+               "deployment window, then retire the SQLite file")
+
+
+async def test_a_long_choice_is_wrapped_to_the_frame(app, mocker):
+    """Drawn as one fragment it was cut off at the terminal's edge, and an
+    answer you cannot read is one you cannot pick."""
+    mocker.patch.object(app, "_width", return_value=50)
+    pending = asyncio.ensure_future(app.ask_text("choose", [LONG_OPTION, "Neither"]))
+    await asyncio.sleep(0)
+    rows = "".join(f[1] for f in app._options_lines())
+    assert all(len(line) <= 50 for line in rows.split("\n"))
+    assert rows.split()[-1] == "Neither"
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == LONG_OPTION
+
+
+async def test_every_line_of_a_wrapped_choice_stays_clickable(app, mocker):
+    """The transcript is clickable and so is this — including the second
+    line of a choice that had to fold."""
+    from prompt_toolkit.mouse_events import MouseEventType
+    mocker.patch.object(app, "_width", return_value=44)
+    pending = asyncio.ensure_future(app.ask_text("choose", ["Keep SQLite", LONG_OPTION]))
+    await asyncio.sleep(0)
+    wrapped = [f for f in app._options_lines() if len(f) == 3 and f[1].strip()
+                and "deployment" in f[1]]
+    assert wrapped, "expected a continuation line to exist"
+    wrapped[0][2](mocker.Mock(event_type=MouseEventType.MOUSE_UP))
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == LONG_OPTION
+
+
+async def test_the_recommendation_tag_survives_a_narrow_frame(app, mocker):
+    mocker.patch.object(app, "_width", return_value=44)
+    pending = asyncio.ensure_future(
+        app.ask_text("choose", [LONG_OPTION, "Neither"], recommended=0))
+    await asyncio.sleep(0)
+    assert "(recommended)" in "".join(f[1] for f in app._options_lines())
+    binding(app, "enter")(mocker.Mock())
+    await pending
+
+
+async def test_the_picker_asks_for_the_height_its_wrapped_rows_need(app, mocker):
+    mocker.patch.object(app, "_width", return_value=44)
+    pending = asyncio.ensure_future(app.ask_text("choose", [LONG_OPTION]))
+    await asyncio.sleep(0)
+    assert app._options_height() > 2
+    binding(app, "enter")(mocker.Mock())
+    await pending
+
+
+async def test_a_short_choice_still_takes_one_line(app, mocker):
+    mocker.patch.object(app, "_width", return_value=80)
+    pending = asyncio.ensure_future(app.ask_text("choose", ["a", "b"]))
+    await asyncio.sleep(0)
+    assert app._options_height() == 3
+    binding(app, "enter")(mocker.Mock())
+    await pending

@@ -5,6 +5,7 @@ through the project-scope path check first.
 import difflib
 import glob as globmod
 import os
+import re
 import subprocess
 from datetime import datetime
 
@@ -18,6 +19,23 @@ _IGNORE_DIRS = {
     ".pytest_cache", ".tox", ".ruff_cache",
 }
 _IGNORE_GLOBS = [f"!**/{d}/**" for d in sorted(_IGNORE_DIRS)]
+
+# One ripgrep match line: "path:lineno:text". The path may open with a
+# Windows drive letter, whose colon would otherwise be taken for the
+# separator — splitting on the first colon turns C:\proj.py:3:hit into the
+# file "C", and the line number into the rest of the path.
+_MATCH_LINE = re.compile(r"^((?:[A-Za-z]:)?[^:]*):(\d+):(.*)$")
+
+
+def _posix(path: str) -> str:
+    """A relative path as the model should see it: forward slashes, whatever
+    this OS separates with.
+
+    Every path we hand over is one the model may hand back — in a later tool
+    call, in a patch, in a commit message — so one spelling has to win, and
+    backslashes are the one that breaks when quoted, escaped or fed to git.
+    Absolute paths are left alone: those are the machine's, not ours."""
+    return (path or "").replace(os.sep, "/")
 
 
 class PathScopeError(Exception):
@@ -112,11 +130,11 @@ class Tools:
                 if single_file and head.isdigit():
                     fpath, lineno, content = p, head, rest
                 else:
-                    parts = raw_line.split(":", 2)
-                    if len(parts) != 3:
+                    parsed = _MATCH_LINE.match(raw_line)
+                    if parsed is None:
                         continue  # not a "path:lineno:text" match line
-                    fpath, lineno, content = parts
-                rel = os.path.relpath(fpath, root_abs)
+                    fpath, lineno, content = parsed.groups()
+                rel = _posix(os.path.relpath(fpath, root_abs))
                 results.append(f"{rel}:{lineno}:{content}")
                 if len(results) >= max_matches:
                     break
@@ -145,7 +163,7 @@ class Tools:
             rel = os.path.relpath(m, root_abs)
             if any(part in _IGNORE_DIRS for part in rel.split(os.sep)):
                 continue
-            files.append((m, rel))
+            files.append((m, _posix(rel)))
 
         if not files:
             return "(no matches)"
@@ -162,7 +180,7 @@ class Tools:
         p = _resolve_in_scope(self.cfg.project_root, path)
         try:
             result = subprocess.run(
-                ["git", "diff"], cwd=p, capture_output=True, text=True, timeout=15,
+                ["git", "diff"], cwd=p, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             return _truncate(result.stdout or "(no changes)", self.cfg.max_output_chars)
         except Exception as e:
@@ -172,7 +190,7 @@ class Tools:
         p = _resolve_in_scope(self.cfg.project_root, path)
         try:
             result = subprocess.run(
-                ["git", "status", "--short", "--branch"], cwd=p, capture_output=True, text=True, timeout=15,
+                ["git", "status", "--short", "--branch"], cwd=p, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             return _truncate(result.stdout or "(clean)", self.cfg.max_output_chars)
         except Exception as e:
@@ -183,7 +201,7 @@ class Tools:
         try:
             result = subprocess.run(
                 ["git", "log", f"-{max_count}", "--pretty=format:%h %ad %an: %s", "--date=short"],
-                cwd=p, capture_output=True, text=True, timeout=15,
+                cwd=p, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             if result.returncode != 0:
                 return f"ERROR: {result.stderr.strip()}"
@@ -195,7 +213,7 @@ class Tools:
         p = _resolve_in_scope(self.cfg.project_root, path)
         try:
             result = subprocess.run(
-                ["git", "show", ref], cwd=p, capture_output=True, text=True, timeout=15,
+                ["git", "show", ref], cwd=p, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             if result.returncode != 0:
                 return f"ERROR: {result.stderr.strip()}"
@@ -207,7 +225,7 @@ class Tools:
         p = _resolve_in_scope(self.cfg.project_root, path)
         try:
             result = subprocess.run(
-                ["git", "branch", "-vv"], cwd=p, capture_output=True, text=True, timeout=15,
+                ["git", "branch", "-vv"], cwd=p, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             if result.returncode != 0:
                 return f"ERROR: {result.stderr.strip()}"
@@ -221,7 +239,7 @@ class Tools:
         try:
             result = subprocess.run(
                 ["git", "fetch", remote], cwd=self.cfg.project_root,
-                capture_output=True, text=True, timeout=self.cfg.shell_timeout_s,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.cfg.shell_timeout_s,
             )
             out = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             return _truncate(out, self.cfg.max_output_chars)
@@ -257,11 +275,14 @@ class Tools:
             resolved = []
             for part in paths.split():
                 p = _resolve_in_scope(self.cfg.project_root, part)
-                resolved.append(os.path.relpath(p, self.cfg.project_root))
+                # git takes forward slashes on every platform and is the
+                # loudest consumer of a path we built, so it gets the same
+                # spelling the model was given.
+                resolved.append(_posix(os.path.relpath(p, self.cfg.project_root)))
             args = ["git", "add"] + resolved
         try:
             result = subprocess.run(
-                args, cwd=self.cfg.project_root, capture_output=True, text=True, timeout=15,
+                args, cwd=self.cfg.project_root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             if result.returncode != 0:
                 return f"ERROR: {result.stderr.strip()}"
@@ -275,7 +296,7 @@ class Tools:
         try:
             result = subprocess.run(
                 ["git", "commit", "-m", message], cwd=self.cfg.project_root,
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             out = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             return _truncate(out, self.cfg.max_output_chars)
@@ -291,7 +312,7 @@ class Tools:
             args.append(branch)
         try:
             result = subprocess.run(
-                args, cwd=self.cfg.project_root, capture_output=True, text=True,
+                args, cwd=self.cfg.project_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=self.cfg.shell_timeout_s,
             )
             out = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -309,7 +330,7 @@ class Tools:
             args.append(branch)
         try:
             result = subprocess.run(
-                args, cwd=self.cfg.project_root, capture_output=True, text=True,
+                args, cwd=self.cfg.project_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=self.cfg.shell_timeout_s,
             )
             out = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -421,7 +442,7 @@ class Tools:
         try:
             result = subprocess.run(
                 command, shell=True, cwd=self.cfg.project_root,
-                capture_output=True, text=True, timeout=self.cfg.shell_timeout_s,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.cfg.shell_timeout_s,
             )
             out = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             return _truncate(out, self.cfg.max_output_chars)

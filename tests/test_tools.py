@@ -5,6 +5,7 @@ import os
 import pytest
 
 from omni.config import AgentConfig
+from omni import tools as tools_mod
 from omni.tools import PathScopeError, Tools, _resolve_in_scope, _truncate
 
 
@@ -31,7 +32,7 @@ def test_resolve_in_scope_rejects_escapes(tmp_path, escape):
         _resolve_in_scope(str(root), escape)
 
 
-def test_resolve_in_scope_rejects_symlink_out(tmp_path):
+def test_resolve_in_scope_rejects_symlink_out(tmp_path, symlinks):
     """A symlink inside the root pointing outside must not be a way through —
     realpath() resolves it before the prefix check."""
     root = tmp_path / "proj"
@@ -160,7 +161,7 @@ def test_search_files_single_file_no_match(tools):
     assert tools.search_files("zzz-not-here-zzz", path="hello.py") == "(no matches)"
 
 
-def test_search_and_glob_stay_relative_through_a_symlinked_root(tmp_path):
+def test_search_and_glob_stay_relative_through_a_symlinked_root(tmp_path, symlinks):
     """A project root reached through a symlink (/tmp on macOS, a symlinked
     checkout) used to yield paths like ../../../private/tmp/... because the
     match was made relative to the raw root while ripgrep reported the
@@ -326,3 +327,59 @@ def test_run_shell_timeout(cfg):
 def test_run_shell_truncates_output(cfg):
     cfg.max_output_chars = 50
     assert "truncated" in Tools(cfg).run_shell("seq 1 500")
+
+
+# ---------------- paths as the model sees them ----------------
+
+
+def test_a_relative_path_is_handed_over_with_forward_slashes():
+    """Every path we hand the model is one it may hand back — in a later
+    call, a patch, a commit message — so one spelling has to win, and
+    backslashes are the one that breaks when quoted or fed to git."""
+    assert tools_mod._posix(os.path.join("pkg", "sub", "mod.py")) == "pkg/sub/mod.py"
+
+
+@pytest.mark.parametrize("empty", ["", None])
+def test_posix_of_nothing_is_nothing(empty):
+    assert tools_mod._posix(empty) == ""
+
+
+def test_a_ripgrep_line_is_split_into_path_line_and_text():
+    path, lineno, text = tools_mod._MATCH_LINE.match("pkg/mod.py:12:import os").groups()
+    assert (path, lineno, text) == ("pkg/mod.py", "12", "import os")
+
+
+def test_a_windows_drive_letter_is_not_mistaken_for_the_separator():
+    """Splitting on the first colon turns C:\\proj\\a.py:3:hit into the file
+    "C" and a line number made of the rest of the path — which is how search
+    results came back as ..\\..\\..\\Desktop\\omni-coder\\C:\\Users\\..."""
+    match = tools_mod._MATCH_LINE.match(r"C:\proj\a.py:3:hit")
+    assert match.groups() == (r"C:\proj\a.py", "3", "hit")
+
+
+def test_text_containing_colons_survives_the_split():
+    path, lineno, text = tools_mod._MATCH_LINE.match("a.py:7:d = {1: 2}").groups()
+    assert (path, lineno, text) == ("a.py", "7", "d = {1: 2}")
+
+
+def test_a_line_that_is_not_a_match_is_rejected():
+    assert tools_mod._MATCH_LINE.match("just some text") is None
+
+
+def test_search_results_are_relative_and_posix(tmp_path):
+    """The two bugs together: a result should read pkg/mod.py:1:..., not an
+    absolute path and not with backslashes."""
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "mod.py").write_text("import os\n")
+    out = Tools(AgentConfig(model="m", project_root=str(root))).search_files("import os")
+    assert out.startswith("pkg/mod.py:1:")
+    assert "\\" not in out
+
+
+def test_glob_results_are_posix_too(tmp_path):
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "mod.py").write_text("x\n")
+    out = Tools(AgentConfig(model="m", project_root=str(root))).glob_files("**/*.py")
+    assert "pkg/mod.py" in out and "\\" not in out

@@ -111,13 +111,18 @@ class OptionPicker:
 
     # ---- rendering ----
 
-    def row_fragments(self) -> list:
+    def row_fragments(self, width: int = None) -> list:
         """The choices, with the highlighted one marked. ❯ rather than a
         background block: the row sits directly under a question drawn by
-        Rich, and a painted bar there reads as a different application."""
+        Rich, and a painted bar there reads as a different application.
+
+        Wrapped to the terminal: a choice drawn as one long fragment is cut
+        off at the edge, and an answer you cannot read is one you cannot
+        pick."""
         total = len(self.options)
         if not total:
             return []
+        width = self._width() if width is None else width
         first, last = scroll_window(self.index, total, self.rows)
         out = []
         for position in range(first, last):
@@ -131,18 +136,47 @@ class OptionPicker:
             else:
                 marker = ("class:picker.scroll", "    ")
             style = "class:picker.name.selected" if chosen else "class:picker.name"
-            out += [marker, (style, f"{position + 1}. {self.options[position]}")]
-            if position == self.recommended:
+            tag = "  (recommended)" if position == self.recommended else ""
+            # The marker is its own fragment so it keeps its own colour, so
+            # the lead handed to the wrapper is its width, not its text.
+            lead = " " * len(marker[1]) + f"{position + 1}. "
+            from . import ui as _ui
+            lines, tag_alone = _ui.wrap_choice(lead, self.options[position], width, tag)
+            out.append(marker)
+            out.append((style, lines[0][len(marker[1]):]))
+            for line in lines[1:]:
+                out += [("", "\n"), (style, line)]
+            if tag:
                 # Stays on the row when the cursor moves off it: the
                 # recommendation belongs to the option, not to the cursor,
                 # and you need to be able to find your way back to it.
-                out.append(("class:picker.recommended", "  (recommended)"))
+                if tag_alone:
+                    out += [("", "\n"),
+                            ("class:picker.recommended", " " * len(lead) + tag.strip())]
+                else:
+                    out.append(("class:picker.recommended", tag))
             out.append(("", "\n"))
         if self.typing:
             # The marker is gone at this point, so without a word here the
             # list just looks switched off.
             out.append(("class:picker.hint", "    (using what you typed)"))
         return out
+
+    def _width(self) -> int:
+        """The terminal's width, however this picker can find it out. Falls
+        back to Rich's idea of it, which is what drew the question above."""
+        from . import ui
+        try:
+            from prompt_toolkit.application.current import get_app
+            return get_app().output.get_size().columns
+        except Exception:
+            return ui.console.width
+
+    def rows_height(self) -> int:
+        """How many lines the wrapped choices need, so the window they are
+        drawn in doesn't clip them — the same bug the wrapping fixes, one
+        level up."""
+        return sum(f[1].count("\n") for f in self.row_fragments()) + 1
 
     def hint_fragments(self) -> list:
         return [("class:picker.hint",
@@ -166,8 +200,11 @@ class OptionPicker:
         ], height=one)
 
         layout = Layout(HSplit([
+            # Height follows the wrapped content: a fixed row-per-choice
+            # window would clip a wrapped choice itself, which is the very
+            # thing the wrapping fixes.
             Window(FormattedTextControl(self.row_fragments), always_hide_cursor=True,
-                    height=Dimension(min=1, max=self.rows + 1)),
+                    height=lambda: Dimension(min=1, max=min(self.rows_height(), 16))),
             Window(height=one),
             entry,
             Window(FormattedTextControl(self.hint_fragments), wrap_lines=True,

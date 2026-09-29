@@ -1100,3 +1100,193 @@ async def test_the_transcript_marks_where_the_line_reached_the_model(agent, clie
 
     await agent.run("go", client=client)
     marked.assert_called_once_with("and the tests", images=0)
+
+
+# ---------------- what a turn may spend ----------------
+#
+# max_turn_tokens caps tokens the way max_steps caps iterations, and for the
+# same reason: a backstop on what runs *unattended*. Steps stopped being a
+# cost guard once a keystroke restarted them, and a subagent that loops spends
+# invisibly — nobody is watching it and it reports back only a final answer.
+
+
+def usage_of(prompt, completion):
+    """A chat() stand-in that reports the same usage on every call."""
+    async def fake(*args, **kwargs):
+        if kwargs.get("usage") is not None:
+            kwargs["usage"].update({"prompt_tokens": prompt, "completion_tokens": completion})
+        return {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "x"}'}}]}
+    return fake
+
+
+def test_turn_tokens_counts_both_directions(agent):
+    agent._count({"prompt_tokens": 100, "completion_tokens": 20})
+    assert agent.turn_tokens == 120 and agent.total_tokens == 120
+
+
+def test_the_session_total_survives_a_turn_starting(agent):
+    """/cost reports the session; only the budget restarts."""
+    agent._count({"prompt_tokens": 100, "completion_tokens": 20})
+    agent._turn_tokens = {"prompt": 0, "completion": 0}
+    assert agent.turn_tokens == 0 and agent.total_tokens == 120
+
+
+async def test_a_turn_stops_once_its_token_budget_is_spent(agent, client, mocker):
+    agent.cfg.max_turn_tokens = 500
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_of(300, 50))
+    result = await agent.run("go", client=client)
+    assert "Token budget for this turn is spent" in result
+    assert agent.turn_tokens >= 500
+
+
+async def test_the_budget_message_says_how_to_carry_on(agent, client, mocker):
+    """It stopped for a reason nobody can see on screen, so it has to say
+    what to do about it."""
+    agent.cfg.max_turn_tokens = 300
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_of(200, 50))
+    result = await agent.run("go", client=client)
+    assert "/max-turn-tokens" in result and "carry on" in result
+
+
+async def test_a_zero_budget_is_no_budget(agent, client, mocker):
+    """The default: a local model costs nothing per token, and a limit
+    nobody asked for is a turn that stops for no visible reason."""
+    agent.cfg.max_turn_tokens = 0
+    agent.cfg.max_steps = 3
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_of(10_000, 10_000))
+    result = await agent.run("go", client=client)
+    assert "Token budget" not in result
+
+
+async def test_the_session_status_records_why_it_stopped(agent, client, mocker):
+    agent.cfg.max_turn_tokens = 200
+    mocker.patch.object(agent_mod, "chat", side_effect=usage_of(150, 100))
+    await agent.run("go", client=client)
+    row = agent.store.list_sessions()[0]
+    assert row["status"] == "max_tokens"
+
+
+async def test_typing_into_a_turn_restarts_its_token_budget(agent, client, mocker):
+    """Same rule as the step cap, same reason: someone typing is the
+    oversight the cap stands in for."""
+    agent.cfg.max_turn_tokens = 400
+    agent.cfg.max_steps = 12
+    spend = usage_of(150, 50)
+    seen = {"n": 0}
+
+    async def chat_and_interject(*args, **kwargs):
+        reply = await spend(*args, **kwargs)
+        seen["n"] += 1
+        if seen["n"] == 2:
+            agent.inject("keep going, but in pkg/")
+        return reply
+
+    mocker.patch.object(agent_mod, "chat", side_effect=chat_and_interject)
+    await agent.run("go", client=client)
+    # Without the restart the turn would have stopped at 400; the
+    # interjection bought it another full budget.
+    assert agent.turn_tokens > 400
+
+
+async def test_a_budget_already_spent_stops_before_calling_the_model_again(agent, client, mocker):
+    agent.cfg.max_turn_tokens = 100
+    m = mocker.patch.object(agent_mod, "chat", side_effect=usage_of(200, 0))
+    await agent.run("go", client=client)
+    assert m.call_count == 1          # spent on the first call, stopped before a second
+
+
+# ---------------- typing while it reads ----------------
+
+
+async def test_typing_abandons_read_only_calls_in_flight(agent, client, mocker):
+    """Reads are the one thing worth dropping half-done: nothing has changed,
+    the answer is about to be irrelevant, and waiting for eight file reads
+    before the model hears "wrong directory" is the delay this is for."""
+    started = asyncio.Event()
+
+    async def never_finishes(name, args):
+        started.set()
+        await asyncio.sleep(30)
+        return "too late"
+
+    client.call_tool.side_effect = never_finishes
+    replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("stopped"))
+
+    async def drive():
+        turn = asyncio.ensure_future(agent.run("read it", client=client))
+        await started.wait()
+        await asyncio.sleep(0)
+        agent.inject("wrong directory")
+        return await turn
+
+    result = await asyncio.wait_for(drive(), timeout=5)
+    assert result == "stopped"
+
+
+async def test_an_abandoned_call_says_it_was_superseded_not_interrupted(agent, client, mocker):
+    """Why it stopped matters to the model: "the user said something" is
+    followed by that something and reads as a change of direction, where
+    "Ctrl+C" reads as a refusal."""
+    started = asyncio.Event()
+
+    async def never_finishes(name, args):
+        started.set()
+        await asyncio.sleep(30)
+
+    client.call_tool.side_effect = never_finishes
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("ok"))
+
+    async def drive():
+        turn = asyncio.ensure_future(agent.run("read it", client=client))
+        await started.wait()
+        await asyncio.sleep(0)
+        agent.inject("wrong directory")
+        return await turn
+
+    await asyncio.wait_for(drive(), timeout=5)
+    tool_messages = [m_ for m_ in m.sent[-1] if m_["role"] == "tool"]
+    assert "superseded" in tool_messages[0]["content"]
+    assert "Ctrl+C" not in tool_messages[0]["content"]
+
+
+async def test_a_write_in_flight_is_never_torn_in_half(agent, client, mocker):
+    """Abandoning a write is how you get a truncated file, so only the
+    read-only branch is interruptible."""
+    agent.cfg.auto_approve = True
+    running = asyncio.Event()
+
+    async def slow_write(name, args):
+        running.set()
+        await asyncio.sleep(0.05)
+        return "written in full"
+
+    client.call_tool.side_effect = slow_write
+    m = replies(mocker, tool_reply(("write_file", '{"path": "x"}')), text_reply("done"))
+
+    async def drive():
+        turn = asyncio.ensure_future(agent.run("write it", client=client))
+        await running.wait()
+        agent.inject("actually stop")
+        return await turn
+
+    await asyncio.wait_for(drive(), timeout=5)
+    tool_messages = [m_ for m_ in m.sent[-1] if m_["role"] == "tool"]
+    assert tool_messages[0]["content"] == "written in full"
+
+
+async def test_nothing_is_interruptible_between_steps(agent, client, mocker):
+    """Outside a read, there is no in-flight call to abandon — injecting is
+    just the ordinary fold-in."""
+    replies(mocker, text_reply("done"))
+    assert agent._tool_cancel is None
+    agent.inject("hello")
+    assert agent._tool_cancel is None
+
+
+async def test_the_canceller_is_cleared_once_the_reads_finish(agent, client, mocker):
+    """Left set, a later interjection would cancel tasks that are long gone."""
+    replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("done"))
+    await agent.run("go", client=client)
+    assert agent._tool_cancel is None

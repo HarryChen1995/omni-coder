@@ -250,6 +250,9 @@ SETTINGS = (
             "tokens of history allowed before it is compacted",
             f"a whole number of tokens, at least {MIN_CONTEXT_WINDOW_BUDGET:,}, or the "
             "history compacts on every step"),
+    Setting("max-turn-tokens", "max_turn_tokens", "maxTurnTokens", _whole(0),
+            "tokens one turn may spend before it stops (0 = no cap)",
+            "a whole number of tokens, or 0 to lift the cap"),
     Setting("embedding-model", "embedding_model", "embeddingModel", _embedding_backend,
             "embedding backend ranking search_tools against deferred MCP tools",
             'a model name, or "off" for plain keyword matching',
@@ -384,6 +387,15 @@ class AgentConfig:
     shell_timeout_s: int = 30
     max_output_chars: int = 8000      # truncate tool output before feeding back to model
     context_window_budget: int = 50_000  # tokens of context before compaction kicks in
+    # What one turn may spend before it gives up, counting everything done on
+    # its behalf — its own calls, intent parsing, compaction. 0 is no cap,
+    # which is the default because a local model costs nothing per token and
+    # a limit nobody asked for is a turn that stops for no visible reason.
+    # Set it where tokens are billed, and for subagents especially: those run
+    # with nobody watching and report back only a final answer, so one that
+    # loops spends invisibly. Like max_steps, this counts what is spent
+    # *unattended* — typing into the turn restarts it.
+    max_turn_tokens: int = 0
 
     # When the context grows past context_window_budget tokens — measured by
     # the prompt_tokens the server reports for the last call, so it's the real

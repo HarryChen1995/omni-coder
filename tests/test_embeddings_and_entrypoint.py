@@ -137,8 +137,12 @@ def test_module_entrypoint_is_wired_to_the_cli(mocker):
 
 def test_module_entrypoint_runs_as_a_subprocess():
     """`python -m omni --help` must work for real, not just when imported."""
+    # utf-8 explicitly: the help is drawn with box-drawing characters, and
+    # decoding them with whatever codepage the machine happens to use fails
+    # outright on Windows.
     r = subprocess.run([sys.executable, "-m", "omni", "--help"],
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60,
+                       encoding="utf-8", errors="replace")
     assert r.returncode == 0
     assert "--project-root" in r.stdout
 

@@ -1216,9 +1216,15 @@ _TOOL_EMOJI = {
     "read_file": "🔍", "write_file": "📄", "edit_file": "📝",
     "list_dir": "📁", "glob_files": "📂", "search_files": "🔎",
     "run_shell": "💻",
-    "git_diff": "📊", "git_status": "📋", "git_log": "📜", "git_show": "🧾",
-    "git_branch": "🌿", "git_fetch": "📥", "git_add": "➕", "git_commit": "💾",
-    "git_pull": "🔽", "git_push": "🔼",
+    # Git reads as one family — 🐙, for the "octo" of Octocat, since
+    # GitHub's own mark is a proprietary image and not a codepoint a
+    # terminal can draw. The calls that only look stay on the octopus; the
+    # four that change something keep a glyph of their own, because "this
+    # rewrites history / touches the remote" is worth seeing before you
+    # read the name.
+    "git_diff": "🐙", "git_status": "🐙", "git_log": "🐙", "git_show": "🐙",
+    "git_branch": "🌿", "git_fetch": "📥",
+    "git_add": "➕", "git_commit": "💾", "git_pull": "🔽", "git_push": "🚀",
     "save_memory": "🧠", "search_tools": "🧰", "ask_user": "❓", "spawn_agent": "👥",
     "list_resources": "📚", "read_resource": "📖",
 }
@@ -1236,6 +1242,9 @@ _SERVER_EMOJI_PALETTE = ["🔧", "🔌", "🛸", "📡", "🧪", "🧭", "🧬",
 def _emoji_for(name: str) -> str:
     if name in _TOOL_EMOJI:
         return _TOOL_EMOJI[name]
+    # Any git tool added later joins the family without being listed twice.
+    if name.startswith("git_"):
+        return _TOOL_EMOJI["git_status"]
     if "__" in name:
         server = name.split("__", 1)[0]
         return _SERVER_EMOJI_PALETTE[zlib.crc32(server.encode()) % len(_SERVER_EMOJI_PALETTE)]
@@ -1896,11 +1905,73 @@ def injected(text: str, images: int = 0):
     console.print(line)
 
 
+def wrap_choice(lead: str, option: str, width: int, suffix: str = "") -> tuple:
+    """One choice as the lines it actually occupies, wrapped to `width`.
+
+    Returns (lines, suffix_on_its_own_line). A choice drawn as a single
+    unwrapped fragment is simply cut off at the terminal's edge, and an
+    answer you cannot read is one you cannot pick — so the text is folded
+    here instead, where the width is known.
+
+    Continuation lines hang under the option's text rather than under its
+    number, so a wrapped choice still reads as one item and the numbers stay
+    a clean column down the left edge:
+
+        ▸ 2. Switch to Postgres and migrate the existing
+             rows in the same deployment
+
+    `suffix` is a short tag like "(recommended)" that belongs to the choice
+    but is styled separately. It rides on the last line when there is room
+    and drops to a line of its own when there isn't, which is the caller's
+    business — hence the flag rather than a second string to concatenate."""
+    lead = lead or ""
+    indent = " " * len(lead)
+    # A floor on the text column: a terminal narrow enough to leave nothing
+    # for the words would otherwise wrap to one character per line.
+    room = max(int(width) - len(lead), 20)
+    pieces = textwrap.wrap(" ".join((option or "").split()), room,
+                            break_long_words=True, break_on_hyphens=False) or [""]
+    lines = [lead + pieces[0]] + [indent + piece for piece in pieces[1:]]
+    if not suffix:
+        return lines, False
+    return lines, len(lines[-1]) + len(suffix) > int(width)
+
+
 def _one_line(text: str, width: int) -> str:
     """Whitespace collapsed and clipped — this is a reference to something
     printed in full above, so it only has to be recognisable."""
     flat = " ".join((text or "").split())
     return flat if len(flat) <= width else flat[:width - 1] + "…"
+
+
+def cost_report(rows: list, budget: int = 0):
+    """What this session has spent, per agent and in total.
+
+    Per agent rather than one number, because subagents are where spend goes
+    unnoticed: they run with nobody watching and report back only a final
+    answer, so one that looped is invisible in a session total. Tokens rather
+    than currency — the models this drives are usually local, where a price
+    per token would be invented rather than reported."""
+    table = Table(box=box.SIMPLE, expand=False, pad_edge=False)
+    table.add_column("agent", style=ACCENT, no_wrap=True)
+    table.add_column("sent", justify="right")
+    table.add_column("received", justify="right")
+    table.add_column("total", justify="right", style="bold")
+    total = 0
+    for name, prompt, completion in rows:
+        total += prompt + completion
+        table.add_row(name, f"{prompt:,}", f"{completion:,}", f"{prompt + completion:,}")
+    if len(rows) > 1:
+        table.add_section()
+        table.add_row("all agents", "", "", f"{total:,}")
+    console.print()
+    console.print(table)
+    if budget:
+        console.print(Text(f"  cap: {budget:,} tokens per turn (/max-turn-tokens)",
+                            style=_FRAME_HINT))
+    else:
+        console.print(Text("  no per-turn cap — set one with /max-turn-tokens <n>",
+                            style=_FRAME_HINT))
 
 
 def recommended_index(recommended, options: list):
@@ -2121,7 +2192,8 @@ for _name in (
     "reasoning_full", "call_detail", "assistant_message", "final_result",
     "sessions_table", "resources_table", "resource_content",
     "server_tools_table", "mcp_status", "model_switched", "interrupted",
-    "compacted", "btw_answer", "instruction", "injected", "note", "warning", "error",
+    "compacted", "btw_answer", "instruction", "injected", "cost_report",
+    "note", "warning", "error",
     "subagent_summary",
 ):
     globals()[_name] = _as_block(globals()[_name])
