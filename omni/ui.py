@@ -272,41 +272,174 @@ def shimmer_text(text: str, bold: bool = True, now: float = None) -> Text:
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
-def _render_diff(diff_text: str) -> Text:
-    """Render a unified diff (as produced by difflib.unified_diff) with a
-    line-number gutter and red/green highlighting for removed/added lines —
-    GitHub-style — instead of relying on pygments' diff-lexer coloring."""
+# A changed file is read the way a code review is read: you find the line you
+# want by its colour and its number, not by hunting for a leading "+" in a wall
+# of monochrome text. So every changed line gets a full-width band behind it, a
+# line-number gutter, and the file's own syntax highlighting inside — the code
+# still looks like code, which is the part a plain red/green diff throws away.
+_DIFF_ADD_BG = "#16341f"
+_DIFF_DEL_BG = "#43171c"
+_DIFF_ADD_SIGN = "#56d364"
+_DIFF_DEL_SIGN = "#f85149"
+_DIFF_GUTTER = "#6e7681"
+_DIFF_FOLD = "#545d68"
+
+# Extension -> pygments lexer. Only what a coding agent actually edits; an
+# unknown extension highlights as nothing rather than guessing wrong, which
+# reads worse than plain text.
+_DIFF_LEXERS = {
+    ".py": "python", ".pyi": "python", ".js": "javascript", ".mjs": "javascript",
+    ".jsx": "jsx", ".ts": "typescript", ".tsx": "tsx", ".json": "json",
+    ".toml": "toml", ".yaml": "yaml", ".yml": "yaml", ".md": "markdown",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash", ".ps1": "powershell",
+    ".html": "html", ".css": "css", ".scss": "scss", ".sql": "sql",
+    ".rs": "rust", ".go": "go", ".java": "java", ".rb": "ruby", ".php": "php",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cs": "csharp",
+    ".swift": "swift", ".kt": "kotlin", ".xml": "xml", ".ini": "ini", ".cfg": "ini",
+}
+_HIGHLIGHTERS = {}
+
+
+def _diff_lexer(path: str):
+    """The lexer for `path`, or None to leave the code unhighlighted."""
+    name = _DIFF_LEXERS.get(os.path.splitext(str(path or ""))[1].lower())
+    if name is None:
+        name = {"dockerfile": "docker", "makefile": "make"}.get(
+            os.path.basename(str(path or "")).lower())
+    return name
+
+
+def _highlight(code: str, lexer: str) -> Text:
+    """One line of source as coloured text.
+
+    Per line rather than per file because a diff is all we have — the
+    surrounding lines were never sent. A string opened on one line and closed
+    on another therefore colours oddly, which is a fair price for the rest of
+    the file reading as code."""
+    if not lexer or not code.strip():
+        return Text(code)
+    try:
+        highlighter = _HIGHLIGHTERS.get(lexer)
+        if highlighter is None:
+            highlighter = _HIGHLIGHTERS[lexer] = Syntax("", lexer, theme="ansi_dark")
+        out = highlighter.highlight(code)
+        out.rstrip()          # highlight() appends a newline of its own
+        return out
+    except Exception:
+        return Text(code)
+
+
+def _diff_row(number, sign: str, code: Text, width: int, background: str,
+               sign_colour: str) -> Text:
+    """One line of a diff: the number, the sign, the code, and the band behind
+    all three.
+
+    The band runs the full width rather than stopping where the text does: a
+    ragged right edge turns a block of changes into a staircase, and the shape
+    of the block is most of what tells you where a change begins and ends."""
+    row = Text(style=("on " + background) if background else "")
+    row.append(("%5s " % number) if number else "      ", style=_DIFF_GUTTER)
+    row.append((sign + " ") if sign else "  ",
+                style=("bold " + sign_colour) if sign else "")
+    row.append_text(code)
+    # Cropped, never wrapped. A wrapped line breaks the band across two rows
+    # and pushes everything below it out of step with its own line number,
+    # which costs more than the tail of one long line is worth — /expand
+    # reprints the call whole when that tail matters.
+    row.truncate(width, overflow="ellipsis")
+    if row.cell_len < width:
+        row.pad_right(width - row.cell_len)
+    return row
+
+
+def _render_diff(diff_text: str, path: str = "", width: int = None) -> Text:
+    """A unified diff as a reviewable block.
+
+    The @@ hunk headers are dropped for a dim "..." rule. They are addressed
+    to `patch`, not to a person: the line numbers they carry are already down
+    the gutter and the counts are already in the header above."""
+    width = width or _panel_width()
+    lexer = _diff_lexer(path)
     body = Text()
     old_no = new_no = None
+    seen = False
     for line in diff_text.splitlines():
         if line.startswith("---") or line.startswith("+++"):
             continue
-        m = _HUNK_RE.match(line)
-        if m:
-            old_no, new_no = int(m.group(1)), int(m.group(2))
-            body.append(f"{line}\n", style="dim cyan")
+        hunk = _HUNK_RE.match(line)
+        if hunk:
+            old_no, new_no = int(hunk.group(1)), int(hunk.group(2))
+            body.append("   ...\n" if seen else "", style=_DIFF_FOLD)
             continue
         if line.startswith("-"):
-            gutter = old_no if old_no is not None else ""
-            body.append(f"{gutter:>5} ", style="dim")
-            body.append(f"{line}\n", style="bold red")
+            row = _diff_row(old_no, "-", _highlight(line[1:], lexer), width,
+                             _DIFF_DEL_BG, _DIFF_DEL_SIGN)
             if old_no is not None:
                 old_no += 1
         elif line.startswith("+"):
-            gutter = new_no if new_no is not None else ""
-            body.append(f"{gutter:>5} ", style="dim")
-            body.append(f"{line}\n", style="bold green")
+            row = _diff_row(new_no, "+", _highlight(line[1:], lexer), width,
+                             _DIFF_ADD_BG, _DIFF_ADD_SIGN)
             if new_no is not None:
                 new_no += 1
         else:
-            gutter = new_no if new_no is not None else ""
-            body.append(f"{gutter:>5} ", style="dim")
-            body.append(f"{line}\n")
+            row = _diff_row(new_no, "", _highlight(line[1:] if line else "", lexer),
+                             width, "", "")
             if old_no is not None:
                 old_no += 1
             if new_no is not None:
                 new_no += 1
+        body.append_text(row)
+        body.append("\n")
+        seen = True
+    if body.plain.endswith("\n"):
+        body.right_crop(1)
     return body
+
+
+def _diff_header(path: str, added: int, removed: int, label: str) -> Text:
+    """The one line above a diff: what happened, to what, and how much of it.
+
+    A verb rather than a tool name — "Created", "Updated", "Deleted" — because
+    that is the thing you check before reading a single line of the body, and
+    write_file(overwrite=True) and edit_file are the same event to a reader
+    even though they are different calls."""
+    verb, colour = {
+        "new": ("Created", _DIFF_ADD_SIGN),
+        "delete": ("Deleted", _DIFF_DEL_SIGN),
+    }.get(label, ("Updated", ACCENT))
+    line = Text()
+    line.append("  " + verb + " ", style="bold " + colour)
+    line.append(str(path or "(unnamed)"), style="bold")
+    line.append(" (", style=_DIFF_GUTTER)
+    line.append("+%d" % added, style=_DIFF_ADD_SIGN)
+    line.append(" ", style=_DIFF_GUTTER)
+    line.append("-%d" % removed, style=_DIFF_DEL_SIGN)
+    line.append(")", style=_DIFF_GUTTER)
+    return line
+
+
+def _elided_note(diff_text: str) -> Text:
+    """"... +8 lines" — how much of the file sits above the first hunk.
+
+    Said because the first line on screen being line 404 otherwise looks like
+    the file starts there, and a reviewer who cannot see the elision cannot
+    tell a small edit from a truncated one."""
+    above = 0
+    for line in (diff_text or "").splitlines():
+        # Line by line: _HUNK_RE is anchored, and a unified diff opens with
+        # the --- / +++ header, so a search over the whole blob never matches.
+        hunk = _HUNK_RE.match(line)
+        if hunk:
+            above = int(hunk.group(1)) - 1
+            break
+    if above <= 0:
+        return None
+    return Text("   ... +%d line%s" % (above, "" if above == 1 else "s"), style=_DIFF_FOLD)
+
+
+def _diff_path(args) -> str:
+    """The file a write tool was pointed at, for choosing a lexer."""
+    return str((args or {}).get("path") or "") if isinstance(args, dict) else ""
 
 
 def _diff_stats(diff_text: str) -> tuple:
@@ -1335,13 +1468,25 @@ def _preview_failed(name: str, path: str, message: str):
                          border_style="red", width=_panel_width()))
 
 
-def _preview_diff(name: str, path: str, diff: str, label: str):
+def diff_block(path: str, diff: str, label: str = "edit", width: int = None):
+    """A changed file, drawn the one way it is drawn anywhere.
+
+    Every place a write is shown goes through here — the approval preview, the
+    no-frame fallback, and the ⎿ line a finished call expands under — because
+    the same change rendered three ways is three things to learn. No panel
+    around it: a border costs two columns of code width, and every copy-paste
+    out of the transcript drags the box-drawing with it."""
     added, removed = _diff_stats(diff)
-    title = (f"{_emoji_for(name)} {name} ({label}): {path}  "
-              f"[green]+{added}[/green] [red]-{removed}[/red]")
     console.print()
-    console.print(Panel(_render_diff(diff), title=title, width=_panel_width(),
-                         border_style="green" if label == "new" else "yellow"))
+    console.print(_diff_header(path, added, removed, label))
+    elided = _elided_note(diff)
+    if elided is not None:
+        console.print(elided)
+    console.print(_render_diff(diff, path, width))
+
+
+def _preview_diff(name: str, path: str, diff: str, label: str):
+    diff_block(path, diff, label)
 
 
 def _preview_other(name: str, args: dict):
@@ -1365,18 +1510,11 @@ async def _request_approval(name: str, args: dict, client) -> bool:
             console.print(Panel(f"[red]{preview}[/red]", title=f"{emoji} edit_file: {path}",
                                  border_style="red", width=_panel_width()))
             return False
-        added, removed = _diff_stats(preview)
-        title = f"{emoji} edit_file: {path}  [green]+{added}[/green] [red]-{removed}[/red]"
-        console.print(Panel(_render_diff(preview), title=title, border_style="yellow",
-                             width=_panel_width()))
+        diff_block(path, preview, "edit")
     elif name == "write_file":
         path = args.get("path", "")
         is_new, preview = await client.preview_write(path, args.get("content", ""), args.get("overwrite", False))
-        added, removed = _diff_stats(preview)
-        label = "new" if is_new else "overwrite"
-        title = f"{emoji} write_file ({label}): {path}  [green]+{added}[/green] [red]-{removed}[/red]"
-        console.print(Panel(_render_diff(preview), title=title, width=_panel_width(),
-                             border_style="green" if is_new else "yellow"))
+        diff_block(path, preview, "new" if is_new else "overwrite")
     elif name == "run_shell":
         cmd = args.get("command", "")
         console.print(Panel(Syntax(cmd, "bash", theme="ansi_dark"),
@@ -1433,7 +1571,11 @@ def _one_call(c: dict, marker: str = ""):
         line += f"  [dim]·  /expand {c['index']}[/dim]"
     console.print(f"  [dim]⎿[/dim]  {line}")
     if diff_body is not None:
-        console.print(Padding(_render_diff(diff_body), (0, 0, 0, 5)))
+        # Same renderer as the preview above it, so the change you approved
+        # and the change that happened are told apart by their content and
+        # not by their formatting.
+        console.print(_render_diff(diff_body, _diff_path(c.get("args")),
+                                    max(_panel_width() - 5, 20)))
 
 
 def step_display(calls: list):

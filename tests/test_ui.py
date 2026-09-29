@@ -77,9 +77,37 @@ def test_diff_stats_all_additions():
 
 def test_render_diff_numbers_and_marks_lines():
     out = ui._render_diff(DIFF).plain
-    assert "-gone" in out and "+added" in out
+    assert "- gone" in out and "+ added" in out
     assert "--- a/x.py" not in out and "+++ b/x.py" not in out   # headers dropped
-    assert "@@ -1,3 +1,4 @@" in out                              # hunk header kept
+
+
+def test_the_hunk_header_is_replaced_by_a_rule():
+    """@@ -1,3 +1,4 @@ is addressed to `patch`, not to a person: its line
+    numbers are already down the gutter and its counts are in the header."""
+    out = ui._render_diff("@@ -1,2 +1,2 @@\n keep\n@@ -40,2 +40,2 @@\n keep\n").plain
+    assert "@@" not in out and "..." in out
+
+
+def test_a_single_hunk_needs_no_rule_above_it():
+    """The rule means "and then, elsewhere in the file" — there is no
+    elsewhere before the first hunk."""
+    out = ui._render_diff("@@ -1,2 +1,2 @@\n keep\n-old\n+new\n").plain
+    assert "..." not in out
+
+
+def test_every_changed_line_is_padded_to_the_full_width():
+    """The band behind a change runs the whole width: a ragged right edge
+    turns a block of changes into a staircase, and the block's shape is most
+    of what shows where a change begins and ends."""
+    out = ui._render_diff("@@ -1,2 +1,2 @@\n-x\n+y\n", "a.py", 40).plain
+    assert [len(line) for line in out.splitlines()] == [40, 40]
+
+
+def test_a_long_line_is_cropped_rather_than_wrapped():
+    """A wrapped line breaks the band across two rows and puts everything
+    below it out of step with its own line number."""
+    out = ui._render_diff("@@ -1,1 +1,1 @@\n+" + "x" * 300 + "\n", "a.py", 50).plain
+    assert out.splitlines() == [out.splitlines()[0]] and len(out.splitlines()[0]) == 50
 
 
 def test_render_diff_gutter_tracks_line_numbers():
@@ -89,7 +117,7 @@ def test_render_diff_gutter_tracks_line_numbers():
 
 
 def test_render_diff_without_hunk_header_does_not_crash():
-    assert "+lonely" in ui._render_diff("+lonely\n").plain
+    assert "+ lonely" in ui._render_diff("+lonely\n").plain
 
 
 # ---------------- summaries ----------------
@@ -228,7 +256,7 @@ def test_step_display_renders_every_parallel_call(cap):
 def test_step_display_includes_the_diff_for_writes(cap):
     ui.step_display([{"name": "write_file", "args": {"path": "a.py"},
                       "result": "Wrote a.py.\n" + DIFF, "ok": True}])
-    assert "+added" in flat(cap)
+    assert "+ added" in flat(cap)
 
 
 def test_step_display_handles_malformed_args(cap):
@@ -632,7 +660,7 @@ async def test_request_approval_shows_edit_diff_and_asks(cap, mocker):
     mocker.patch.object(ui.Confirm, "ask", return_value=True)
     assert await ui.request_approval("edit_file", {"path": "a.py", "old_str": "x", "new_str": "y"}, client)
     out = flat(cap)
-    assert "edit_file" in out and "a.py" in out and "+2" in out and "-1" in out
+    assert "Updated" in out and "a.py" in out and "+2" in out and "-1" in out
 
 
 async def test_request_approval_rejects_when_preview_fails(cap, mocker):
@@ -644,13 +672,15 @@ async def test_request_approval_rejects_when_preview_fails(cap, mocker):
     assert "not found" in flat(cap)
 
 
-@pytest.mark.parametrize("is_new,label", [(True, "new"), (False, "overwrite")])
-async def test_request_approval_write_file_labels_new_vs_overwrite(cap, mocker, is_new, label):
+@pytest.mark.parametrize("is_new,verb", [(True, "Created"), (False, "Updated")])
+async def test_request_approval_write_file_labels_new_vs_overwrite(cap, mocker, is_new, verb):
+    """A verb, not a tool name: write_file(overwrite=True) and edit_file are
+    the same event to whoever is reading it."""
     client = mocker.AsyncMock()
     client.preview_write.return_value = (is_new, DIFF)
     mocker.patch.object(ui.Confirm, "ask", return_value=True)
     await ui.request_approval("write_file", {"path": "a.py", "content": "x"}, client)
-    assert label in flat(cap)
+    assert verb in flat(cap)
 
 
 async def test_request_approval_shows_shell_command(cap, mocker):
@@ -1482,3 +1512,126 @@ def test_no_cap_says_how_to_set_one(cap):
     ui.cost_report([("main", 1, 1)], 0)
     assert "no per-turn cap" in " ".join(cap.getvalue().split())
     assert "/max-turn-tokens" in " ".join(cap.getvalue().split())
+
+
+# ---------------- how a changed file is drawn ----------------
+#
+# One renderer for every place a write is shown — the approval preview, the
+# no-frame fallback, and the line a finished call expands under — because the
+# same change rendered three ways is three things to learn.
+
+
+def test_the_header_says_what_happened_to_what_and_how_much():
+    line = ui._diff_header("omni/agent.py", 30, 2, "edit").plain
+    assert line.strip() == "Updated omni/agent.py (+30 -2)"
+
+
+@pytest.mark.parametrize("label,verb", [
+    ("new", "Created"), ("delete", "Deleted"), ("edit", "Updated"),
+    ("overwrite", "Updated"), ("anything else", "Updated"),
+])
+def test_the_header_verb_follows_the_kind_of_change(label, verb):
+    assert ui._diff_header("a.py", 1, 1, label).plain.strip().startswith(verb)
+
+
+def test_a_deletion_is_red():
+    """Asked for specifically: removing a file should look like removing a
+    file, not like any other write."""
+    header = ui._diff_header("a.py", 0, 9, "delete")
+    styles = [str(span.style) for span in header.spans]
+    assert any(ui._DIFF_DEL_SIGN in style for style in styles)
+
+
+def test_a_creation_is_green():
+    header = ui._diff_header("a.py", 9, 0, "new")
+    assert any(ui._DIFF_ADD_SIGN in str(span.style) for span in header.spans)
+
+
+def test_both_counts_are_always_shown():
+    """+0 is information — it says the change only removed things."""
+    assert "(+0 -3)" in ui._diff_header("a.py", 0, 3, "edit").plain
+    assert "(+3 -0)" in ui._diff_header("a.py", 3, 0, "edit").plain
+
+
+def test_the_elision_note_says_how_much_is_above_the_first_hunk():
+    """The first line on screen being 404 otherwise looks like the file
+    starts there, and a reviewer who can't see the elision can't tell a small
+    edit from a truncated one."""
+    note = ui._elided_note("--- a/x\n+++ b/x\n@@ -404,5 +404,7 @@\n keep\n")
+    assert note is not None and "+403 lines" in note.plain
+
+
+def test_a_diff_from_the_top_of_the_file_elides_nothing():
+    assert ui._elided_note("@@ -1,2 +1,2 @@\n keep\n") is None
+
+
+def test_the_elision_note_is_singular_for_one_line():
+    assert "+1 line" in ui._elided_note("@@ -2,2 +2,2 @@\n keep\n").plain
+
+
+def test_nothing_is_elided_when_there_is_no_hunk_header():
+    assert ui._elided_note("+lonely\n") is None
+
+
+@pytest.mark.parametrize("path,lexer", [
+    ("a.py", "python"), ("a.ts", "typescript"), ("a.rs", "rust"),
+    ("Dockerfile", "docker"), ("a.unknown", None), ("", None),
+])
+def test_the_lexer_follows_the_file_being_changed(path, lexer):
+    """An unknown extension highlights as nothing rather than guessing
+    wrong, which reads worse than plain text."""
+    assert ui._diff_lexer(path) == lexer
+
+
+def test_highlighting_a_line_keeps_its_text_exactly():
+    """Colour may be added; characters may not."""
+    assert ui._highlight("def hello():", "python").plain == "def hello():"
+
+
+def test_an_unknown_lexer_leaves_the_line_alone():
+    assert ui._highlight("def hello():", None).plain == "def hello():"
+
+
+def test_highlighting_survives_a_lexer_that_throws(mocker):
+    """A preview is not worth failing an approval over."""
+    mocker.patch.object(ui, "Syntax", side_effect=RuntimeError("no lexer"))
+    ui._HIGHLIGHTERS.clear()
+    assert ui._highlight("x = 1", "python").plain == "x = 1"
+    ui._HIGHLIGHTERS.clear()
+
+
+def test_the_block_prints_header_then_body(cap):
+    ui.diff_block("a.py", "@@ -1,2 +1,2 @@\n-old\n+new\n", "edit")
+    lines = [l for l in cap.getvalue().splitlines() if l.strip()]
+    assert lines[0].strip() == "Updated a.py (+1 -1)"
+    assert "- old" in lines[1] and "+ new" in lines[2]
+
+
+def test_the_block_carries_no_panel_border(cap):
+    """A border costs two columns of code width, and every copy-paste out of
+    the transcript drags the box-drawing with it."""
+    ui.diff_block("a.py", "@@ -1,2 +1,2 @@\n-old\n+new\n", "edit")
+    assert not any(ch in cap.getvalue() for ch in "\u256d\u2570\u2502\u256e\u256f")
+
+
+def test_a_write_preview_and_a_finished_write_look_the_same(cap, mocker):
+    """The change you approved and the change that happened are told apart by
+    their content, not by their formatting."""
+    diff = "@@ -1,2 +1,2 @@\n-old\n+new\n"
+    ui.diff_block("a.py", diff, "edit")
+    preview = flat(cap)
+    cap.truncate(0), cap.seek(0)
+    ui.step_display([{"name": "edit_file", "args": {"path": "a.py"},
+                      "result": "Edited a.py.\n" + diff, "ok": True}])
+    after = flat(cap)
+    assert "- old" in preview and "- old" in after
+    assert "+ new" in preview and "+ new" in after
+
+
+def test_the_diff_path_is_read_off_the_call_arguments():
+    assert ui._diff_path({"path": "omni/a.py"}) == "omni/a.py"
+
+
+@pytest.mark.parametrize("junk", [None, {}, "not a dict", 7])
+def test_a_call_with_no_usable_path_highlights_as_plain_text(junk):
+    assert ui._diff_path(junk) == ""

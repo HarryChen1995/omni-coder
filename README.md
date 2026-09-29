@@ -241,6 +241,39 @@ runs alongside the turn in front of it, and a turn that fails still lets it
 move on. Images pasted with a line travel with that line, not with whichever
 turn happens to pick it up.
 
+## 📝 Seeing a change before it happens
+
+Every write is shown the same way — in the approval prompt, and again under
+the ⎿ line once it has run — so the change you approved and the change that
+happened are told apart by their content, not their formatting:
+
+```
+  Updated omni/agent.py (+3 -1)
+   ... +403 lines
+  404           self._inbox: list = []
+  405 +         # What the turn in flight has spent.
+  406 +         self._turn_tokens = {"prompt": 0}
+  407           self.store = SessionStore(cfg.db_path)
+   ...
+  470 -         old line
+  472 +         new line
+```
+
+A full-width band behind every changed line, a line-number gutter, and the
+file's own **syntax highlighting inside** — the code still looks like code,
+which is what a plain red/green diff throws away. The verb says what happened
+(`Created` green, `Updated`, `Deleted` red) and `... +403 lines` says how much
+of the file sits above, because a diff opening at line 404 otherwise looks
+like a file that starts there.
+
+The `@@ -404,5 +404,7 @@` hunk headers are replaced by a dim `...`: they are
+addressed to `patch`, not to a person, and their line numbers are already down
+the gutter. Lines are cropped rather than wrapped — a wrapped line breaks the
+band and puts everything below it out of step with its own number — and
+`/expand <n>` reprints the call whole when the tail matters. There is no panel
+border: it would cost two columns of code width, and every copy-paste out of
+the transcript would drag the box-drawing along.
+
 ## 💰 What a turn may spend
 
 `--max-steps` caps how many iterations a turn may run, but it stopped being a
