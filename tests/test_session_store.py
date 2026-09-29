@@ -96,6 +96,22 @@ def test_session_name_gives_back_what_the_session_is_called(store):
     assert store.session_name("no-such-session") == ""
 
 
+def test_display_name_prefers_the_name_and_falls_back_to_the_id(store):
+    """One rule in one place: the chip on the frame, the terminal tab and the
+    resume banner all have to agree about what a session is called."""
+    named = store.create_session("/p", "m", "t", name="my refactor")
+    unnamed = store.create_session("/p", "m", "t")
+    assert store.display_name(named) == "my refactor"
+    assert store.display_name(unnamed) == unnamed
+
+
+def test_display_name_of_something_unknown_is_the_id_it_was_given(store):
+    """Never empty — every caller is about to put this on screen."""
+    assert store.display_name("no-such-session") == "no-such-session"
+    assert store.display_name("") == ""
+    assert store.display_name(None) == ""
+
+
 def test_session_names_are_unique(store):
     """The DB's UNIQUE index is surfaced as an actionable ValueError, not a
     raw sqlite3.IntegrityError."""

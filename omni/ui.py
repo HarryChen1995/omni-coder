@@ -1853,10 +1853,20 @@ def instruction(text: str, images: int = 0):
 
     In a full-screen session the input line is cleared the moment it is
     submitted, so without this the request would vanish and the turn's output
-    would have nothing above it. (The ❯ stays with the input frame; it isn't
-    part of what was said.)"""
+    would have nothing above it.
+
+    Marked with a grey "›" and given room to breathe above and below. Bold
+    text alone did not read as *yours*: a transcript is mostly the agent's
+    own output, much of which is also emphasised, so the one line you wrote
+    sat in the middle of it with nothing to say where the turn began. The
+    marker is grey rather than accent-coloured because it is punctuation —
+    the words are the content, and the eye only needs the left edge to find
+    them."""
     console.print()
-    console.print(Text(text, style="bold"))
+    line = Text()
+    line.append("› ", style=_FRAME_HINT)
+    line.append(text, style="bold")
+    console.print(line)
     if images:
         # The placeholders in the line say where the images go; this says they
         # are actually going, which is the part you can't see otherwise.

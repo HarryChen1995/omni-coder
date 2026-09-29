@@ -493,8 +493,8 @@ class CodingAgent:
             if _HAS_UI and show_banner:
                 # By the name it was given where it has one: that is what was
                 # typed to get back here, and the id says nothing you can read.
-                called = self.store.session_name(session_id) or session_id
-                ui.banner(f"(resumed {called}) {label}", self.cfg.model)
+                ui.banner(f"(resumed {self.store.display_name(session_id)}) {label}",
+                           self.cfg.model)
             self.logger.info(f"RESUME session={session_id} TASK: {label}")
             if task:
                 messages.append(build_user_message(task, attachments))

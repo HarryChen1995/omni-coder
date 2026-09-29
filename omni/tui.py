@@ -490,6 +490,12 @@ class TuiApp:
                 note = f"  {pane.error}"[:40]
             elif pane.unseen:
                 note = "  new output"
+            if pane.pending:
+                # Lines typed at this agent while it works, waiting their
+                # turn. Shown here because the queue is per agent: without it,
+                # walking away from a busy subagent you have just queued two
+                # follow-ups at leaves no sign anywhere that they exist.
+                note += f"  +{len(pane.pending)} queued"
 
             def handler(event, target=index):
                 if event.event_type == MouseEventType.MOUSE_UP:
@@ -623,6 +629,12 @@ class TuiApp:
             words = [("class:frame.label.attention", label)]
         else:
             words = _ui.shimmer_fragments(label)
+        if pane.pending:
+            # What you have already typed at this agent and it hasn't reached
+            # yet. On the status line rather than only in the tree, because
+            # this is the pane you are looking at and the queue is the reason
+            # the line you just sent produced no visible turn.
+            detail += f" · {len(pane.pending)} queued"
         return ([("class:frame.spinner", f"{glyph} ")] + words
                  + [("class:frame.hint", f"  ({detail})")])
 
@@ -691,9 +703,18 @@ class TuiApp:
         return self._asking() and bool(self.pane.options)
 
     def _accepts_typing(self) -> bool:
-        """Idle and ask both read a line from the input row — the difference
-        is only where the line goes."""
-        return self._idle() or self._asking()
+        """Every mode but one reads a line from the input row; the difference
+        is only where the line goes — a new turn when idle, back to the tool
+        when a question is up, onto the queue when the agent is working.
+
+        Busy included, because a turn can run for minutes and the next thing
+        you want to ask is very often obvious long before it lands. Hiding
+        the row meant waiting with your hands off the keyboard, and it made
+        the queue that already sits behind it (Pane.pending) unreachable by
+        the one route anyone would look for. Only an approval takes the row
+        away, and only because y/n has to land on the question rather than
+        into a sentence you were part-way through."""
+        return not self._approving()
 
     def _hint(self):
         switch = "  ·  ctrl+←→ switch" if len(self.panes) > 1 else ""
@@ -710,7 +731,7 @@ class TuiApp:
         if self._approving():
             return _ui._hint_segments(self.model, "y approve  ·  n deny  ·  ctrl+c interrupt")
         if self._busy():
-            return _ui._hint_segments(self.model, _ui._HINT_BUSY + switch)
+            return _ui._hint_segments(self.model, _HINT_BUSY + switch)
         return _ui._hint_segments(self.model, _HINT_TUI + switch)
 
     # ---- picking an agent from the tree ----
@@ -876,8 +897,13 @@ class TuiApp:
         def _switch_agent(event):
             self._take_pick()
 
-        @keys.add("enter", filter=Condition(lambda: self._idle() and not self._picking))
+        @keys.add("enter", filter=Condition(
+            lambda: (self._idle() or self._busy()) and not self._picking))
         def _submit(event):
+            """Send the line. While the agent is working it goes onto that
+            pane's queue instead of starting a turn — the REPL's _start_turn
+            decides which, since it is the thing that knows whether the pane
+            is still busy by the time the line reaches it."""
             text = self._buffer.text
             self._buffer.reset()
             if text.strip():
@@ -1175,5 +1201,9 @@ class TuiApp:
 
 _HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  ctrl+s select text  ·  "
               "ctrl+d exit  ·  wheel/pgup scroll")
+# The frame's own busy hint. It differs from ui._HINT_BUSY in the one thing
+# only a full-screen session can offer: there is a live input row under this,
+# and a line sent at it waits its turn instead of being refused.
+_HINT_BUSY = "working…  ·  ⏎ queues what's next  ·  ctrl+c interrupts the turn"
 _HINT_SELECTING = ("selecting: drag to select, then copy as usual  ·  "
                     "ctrl+s back  ·  /copy takes the whole transcript")

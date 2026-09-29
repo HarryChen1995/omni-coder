@@ -648,7 +648,11 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 attachments, pane.attachments = pane.attachments, []
             if pane.task is not None and not pane.task.done():
                 pane.pending.append((text, attachments))
-                _echo(f"queued for {pane.name!r} — it's still working")
+                # Says where in the line it landed, not just that it did:
+                # typing while busy is now the ordinary way to reach this
+                # queue, so "it went somewhere" is not enough feedback.
+                _echo(f"queued #{len(pane.pending)} — runs in order "
+                       f"once {pane.name!r} finishes")
                 return
             # Recorded synchronously: the exit path waits on in-flight turns,
             # and a task only known once _run_turn starts could be dropped.
@@ -1045,7 +1049,11 @@ async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finis
                 _echo(f"Error: {e}", err=True)
         pane.session_id = agent.session_id or pane.session_id
         if pane.kind == "main" and pane.session_id:
-            _set_title(pane.session_id)
+            # By name where the session has one. This runs after every turn,
+            # so setting the raw id here used to undo the name the tab started
+            # under — the session was called "my refactor" until its first
+            # turn landed and a hex blob thereafter.
+            _set_title(_display_name(agent, pane.session_id))
         if result is not None:
             try:
                 ui.final_result(result)
@@ -1194,6 +1202,17 @@ async def _handle_btw(cfg: AgentConfig, question: str):
         ui.btw_answer(question, answer)
     except ImportError:
         _echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
+
+
+def _display_name(agent, session_id: str) -> str:
+    """What to call `session_id` on screen, tolerating an agent whose store
+    can't answer — a stubbed one in a test, or a DB that has gone away. The
+    id is always a usable answer, so this never raises into a turn's tail."""
+    try:
+        name = agent.store.display_name(session_id)
+    except Exception:
+        return session_id
+    return name if isinstance(name, str) and name else session_id
 
 
 def _set_title(text: str):

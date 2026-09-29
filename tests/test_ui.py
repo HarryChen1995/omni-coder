@@ -666,6 +666,45 @@ async def test_request_approval_falls_back_to_json_for_other_tools(cap, mocker):
     assert "docs__publish" in out and "prod" in out
 
 
+# ---------------- the echo of what you typed ----------------
+
+
+def test_your_line_is_marked_so_it_reads_as_yours(cap):
+    """A transcript is mostly the agent's output, much of which is also
+    emphasised — bold text alone did not say "you wrote this", so the turn
+    had no visible beginning."""
+    ui.instruction("add type hints to utils.py")
+    out = cap.getvalue()
+    assert "› add type hints to utils.py" in " ".join(out.split())
+
+
+def test_the_marker_is_grey_rather_than_accent_coloured(cap, mocker):
+    """It is punctuation: the words are the content, and the eye only needs
+    the left edge to find them. Accent here would compete with every label
+    that legitimately uses it."""
+    printed = []
+    mocker.patch.object(ui.console, "print", side_effect=lambda *a, **k: printed.append(a))
+    ui.instruction("do the thing")
+    line = next(a[0] for a in printed if a and hasattr(a[0], "spans") and a[0].plain.startswith("›"))
+    marker = next(s for s in line.spans if line.plain[s.start:s.end].strip() == "›")
+    assert marker.style == ui._FRAME_HINT
+    assert ui.ACCENT not in str(marker.style)
+
+
+def test_your_line_gets_air_above_it(cap):
+    """It starts a section; jammed against the previous turn's output it
+    reads as part of it."""
+    ui.instruction("next thing")
+    assert cap.getvalue().startswith("\n")
+
+
+def test_attached_images_are_counted_under_the_line(cap):
+    ui.instruction("describe [Image #1]", images=1)
+    assert "1 image attached" in " ".join(cap.getvalue().split())
+    ui.instruction("and these", images=3)
+    assert "3 images attached" in " ".join(cap.getvalue().split())
+
+
 # ---------------- ask_user ----------------
 
 async def test_ask_user_numbered_choice_maps_to_the_option(cap, mocker):

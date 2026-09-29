@@ -187,11 +187,22 @@ class SessionStore:
     def session_name(self, session_id: str) -> str:
         """The name this session was given, or "" if it was never named.
 
-        What a resumed session should be called on screen: the name is the
-        half a person chose, and the id is the half the database did."""
+        The name is the half a person chose; the id is the half the database
+        did. Callers that just want something to show should use
+        `display_name` — this is for the ones that need to know which."""
         with _connect(self.db_path) as conn:
             row = conn.execute("SELECT name FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return (row["name"] or "") if row else ""
+
+    def display_name(self, session_id: str) -> str:
+        """What to call this session on screen: its name where it has one,
+        its id otherwise.
+
+        One rule in one place, because the places that show it have to agree
+        — the chip on the input frame, the terminal tab and the resume banner
+        — and each of them applying the rule for itself is exactly how the
+        tab ended up reverting to the raw id after every turn."""
+        return self.session_name(session_id) or (session_id or "")
 
     def load_messages(self, session_id: str) -> list:
         """The conversation exactly as the model saw it — nothing else, since

@@ -180,7 +180,16 @@ everything that agent did, its answer is already in the conversation, and its
 session is still in the database (`--list-sessions`, `--resume`).
 
 Turns run concurrently, so main keeps working while you read or type at a
-subagent, and anything you type at a busy agent queues for its next turn.
+subagent, and anything you type at a busy agent queues for its next turn. The
+input row stays live the whole time an agent is working — a turn can run for
+minutes and the next thing you want to ask is usually obvious long before it
+lands, so Enter sends the line and the frame says `queued #2` rather than
+refusing it. Each agent has its own queue and drains it **strictly in order,
+one turn at a time**: a queued line never runs alongside the turn in front of
+it and never at another agent. The status line shows the backlog for the
+agent you are looking at, and the tree shows `+n queued` for every other one,
+so work you left waiting at a subagent is visible from anywhere. A turn that
+fails still lets the queue move on.
 Approvals and questions stay with the agent that raised them: a background
 subagent asking to write a file waits in its own pane (flagged `!`) instead of
 seizing the screen. A subagent can't spawn subagents — one level, on purpose.

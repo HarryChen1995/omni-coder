@@ -962,3 +962,233 @@ def test_copy_hands_the_transcript_to_the_clipboard(mocker, client, cfg):
     finally:
         ui.use_tui(None)
     assert "Copied 1 line to the clipboard." in rendered
+
+
+# ---------------- the queue behind a busy pane ----------------
+#
+# Typing while an agent works is allowed — the input row stays live (see
+# test_tui.py) — so the line has to go somewhere sane. It goes onto that
+# pane's own queue and runs strictly in order, one at a time: never
+# concurrently with the turn already running, and never at another agent.
+
+
+@pytest.fixture
+async def dispatcher(tui_app, mocker, cfg):
+    """_interactive's _start_turn / _turn_finished pair, over a _run_turn
+    stand-in that finishes only when told.
+
+    Rebuilt here rather than driven through the REPL loop because the
+    ordering is the thing under test, and a scripted REPL would be choosing
+    the interleaving for us."""
+    order = []
+    gates = {}
+    live = []
+
+    async def fake_run_turn(pane, task, *, on_finished=None, **kwargs):
+        order.append((pane.name, task))
+        gate = gates.setdefault(task, asyncio.Event())
+        pane.task = asyncio.current_task()
+        try:
+            await gate.wait()
+        finally:
+            pane.task = None
+            if on_finished is not None:
+                on_finished(pane)
+
+    mocker.patch.object(cli_mod, "_run_turn", fake_run_turn)
+    mocker.patch.object(cli_mod, "_echo")
+
+    def turn_finished(pane):
+        if pane.pending:
+            text, attachments = pane.pending.pop(0)
+            start(pane, text, attachments)
+
+    def start(pane, text, attachments=None):
+        if attachments is None:
+            attachments, pane.attachments = pane.attachments, []
+        if pane.task is not None and not pane.task.done():
+            pane.pending.append((text, attachments))
+            return
+        pane.task = asyncio.ensure_future(
+            cli_mod._run_turn(pane, text, cfg=cfg, client=mocker.Mock(), tui=tui_app,
+                               session_name=None, on_finished=turn_finished,
+                               attachments=attachments))
+        live.append(pane.task)
+
+    async def finish(task):
+        """Let the named turn complete, and let its successor start."""
+        for _ in range(50):
+            if task in gates:
+                break
+            await asyncio.sleep(0)
+        gates.setdefault(task, asyncio.Event()).set()
+        for _ in range(4):
+            await asyncio.sleep(0)
+
+    start.order = order
+    start.finish = finish
+    yield start
+
+    # Nothing may outlive the test. A gate still being awaited would be
+    # cancelled as the loop closes, and its `finally` would then try to
+    # dispatch the next queued line with no loop left to dispatch onto — so
+    # the queues are emptied first and the tasks cancelled here, while this
+    # (async, hence in-loop) fixture still has a loop to do it on.
+    for pane in tui_app.panes:
+        pane.pending.clear()
+    for task in live:
+        task.cancel()
+    await asyncio.gather(*live, return_exceptions=True)
+
+
+async def test_a_line_typed_while_busy_waits_instead_of_running_alongside(dispatcher, tui_app):
+    pane = tui_app.main
+    dispatcher(pane, "first")
+    await asyncio.sleep(0)
+    dispatcher(pane, "second")
+    assert dispatcher.order == [("main", "first")]          # the second hasn't started
+    assert [text for text, _ in pane.pending] == ["second"]
+
+
+async def test_queued_lines_run_in_the_order_they_were_typed(dispatcher, tui_app):
+    """Sequential, not parallel and not reversed: the queue is a FIFO and
+    only one turn per pane is ever in flight."""
+    pane = tui_app.main
+    dispatcher(pane, "first")
+    await asyncio.sleep(0)
+    for text in ("second", "third", "fourth"):
+        dispatcher(pane, text)
+
+    for text in ("first", "second", "third"):
+        await dispatcher.finish(text)
+    await dispatcher.finish("fourth")
+
+    assert dispatcher.order == [("main", t) for t in
+                                 ("first", "second", "third", "fourth")]
+    assert pane.pending == []
+
+
+async def test_only_one_turn_per_pane_is_ever_in_flight(dispatcher, tui_app):
+    pane = tui_app.main
+    dispatcher(pane, "first")
+    await asyncio.sleep(0)
+    dispatcher(pane, "second")
+    dispatcher(pane, "third")
+    # Three lines sent, one running, two waiting.
+    assert len(dispatcher.order) == 1 and len(pane.pending) == 2
+
+
+async def test_each_agent_drains_its_own_queue(dispatcher, tui_app):
+    """Two agents working at once, each with its own backlog — neither line
+    may run at the other's agent."""
+    main = tui_app.main
+    sub = tui_app.add_pane("audit", depth=1)
+    dispatcher(main, "main first")
+    dispatcher(sub, "sub first")
+    await asyncio.sleep(0)
+    dispatcher(main, "main second")
+    dispatcher(sub, "sub second")
+
+    assert [t for t, _ in main.pending] == ["main second"]
+    assert [t for t, _ in sub.pending] == ["sub second"]
+
+    await dispatcher.finish("sub first")
+    assert dispatcher.order[-1] == ("audit", "sub second")
+    assert [t for t, _ in main.pending] == ["main second"]   # untouched
+
+    await dispatcher.finish("main first")
+    assert dispatcher.order[-1] == ("main", "main second")
+
+
+async def test_images_pasted_with_a_queued_line_stay_with_that_line(dispatcher, tui_app):
+    """The attachments are taken when the line is typed, not when its turn
+    finally runs — otherwise a screenshot pasted for the second question
+    would arrive with the third."""
+    pane = tui_app.main
+    dispatcher(pane, "first")
+    await asyncio.sleep(0)
+    pane.attachments.append({"mime": "image/png", "data": b"shot"})
+    dispatcher(pane, "look at this")
+    assert pane.attachments == []                       # taken with the line
+    assert pane.pending[0][1] == [{"mime": "image/png", "data": b"shot"}]
+
+
+async def test_a_turn_that_raises_still_lets_the_queue_move_on(tui_app, mocker, cfg):
+    """on_finished sits in the real _run_turn's `finally`, so a turn that
+    fails must not strand everything typed behind it."""
+    from omni.llm_client import LLMError
+    agent = mocker.Mock(session_id="s", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(side_effect=LLMError("the server fell over"))
+    pane = tui_app.add_pane("flaky", agent=agent, depth=1)
+    pane.pending.append(("still my turn next", []))
+
+    drained = []
+    await cli_mod._run_turn(pane, "explodes", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None,
+                             on_finished=lambda p: drained.append(p.pending.pop(0)[0]))
+    assert drained == ["still my turn next"]
+    assert pane.outcome == "error"
+
+
+# ---------------- what the terminal tab says ----------------
+
+
+async def test_the_tab_keeps_the_session_name_after_a_turn(tui_app, mocker, cfg):
+    """_run_turn renames the tab after every main turn. It used to set the
+    raw id, so a session was called "my refactor" until its first turn landed
+    and a hex blob from then on."""
+    from omni.session_store import SessionStore
+    store = SessionStore(cfg.db_path)
+    sid = store.create_session(cfg.project_root, cfg.model, "earlier", name="my refactor")
+
+    agent = mocker.Mock(session_id=sid, store=store, tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    tui_app.main.agent = agent
+    title = mocker.patch("omni.ui.set_terminal_title")
+
+    await cli_mod._run_turn(tui_app.main, "carry on", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+    assert title.call_args.args[0] == "my refactor"
+
+
+async def test_an_unnamed_session_still_titles_the_tab_with_its_id(tui_app, mocker, cfg):
+    from omni.session_store import SessionStore
+    store = SessionStore(cfg.db_path)
+    sid = store.create_session(cfg.project_root, cfg.model, "earlier")
+
+    agent = mocker.Mock(session_id=sid, store=store, tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    tui_app.main.agent = agent
+    title = mocker.patch("omni.ui.set_terminal_title")
+
+    await cli_mod._run_turn(tui_app.main, "carry on", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+    assert title.call_args.args[0] == sid
+
+
+async def test_a_subagents_turn_never_renames_the_tab(tui_app, mocker, cfg):
+    """The tab belongs to the session you are in, not to whatever a
+    background agent happened to finish."""
+    agent = mocker.Mock(session_id="child", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    sub = tui_app.add_pane("audit", agent=agent, depth=1)
+    title = mocker.patch("omni.ui.set_terminal_title")
+
+    await cli_mod._run_turn(sub, "look", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+    title.assert_not_called()
+
+
+async def test_a_store_that_cannot_answer_does_not_break_the_turns_tail(tui_app, mocker, cfg):
+    """The id is always a usable answer, so naming the tab must never raise
+    into the end of an otherwise successful turn."""
+    agent = mocker.Mock(session_id="sid", tokens={"prompt": 0, "completion": 0})
+    agent.store.display_name.side_effect = RuntimeError("database is locked")
+    agent.run = mocker.AsyncMock(return_value="done")
+    tui_app.main.agent = agent
+    title = mocker.patch("omni.ui.set_terminal_title")
+
+    result = await cli_mod._run_turn(tui_app.main, "carry on", cfg=cfg, client=mocker.Mock(),
+                                      tui=tui_app, session_name=None)
+    assert result == "done"
+    assert title.call_args.args[0] == "sid"

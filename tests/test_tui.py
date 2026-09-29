@@ -237,6 +237,75 @@ def test_ctrl_c_interrupts_the_turn_when_busy(app, mocker):
     cancel.assert_called_once()
 
 
+# ---------------- typing while the agent works ----------------
+#
+# A turn can run for minutes, and the next thing you want to ask is often
+# obvious long before it lands. The input row stays live throughout and the
+# line goes onto that pane's queue (Pane.pending, drained by cli's
+# _turn_finished), so nothing runs concurrently and nothing is refused.
+
+
+def test_the_input_row_stays_live_while_the_agent_works(app):
+    """It used to be hidden, which meant waiting with your hands off the
+    keyboard and left Pane.pending unreachable by the one route anyone would
+    look for."""
+    app.set_busy("Thinking…")
+    assert app.mode == "busy" and app._accepts_typing()
+
+
+async def test_only_an_approval_takes_the_input_row_away(app, mocker):
+    """y/n has to land on the question, not into a half-written sentence."""
+    pending = asyncio.ensure_future(app.ask_approval("Approve write_file?"))
+    await asyncio.sleep(0)
+    assert app.mode == "approve" and not app._accepts_typing()
+    binding(app, "n")(mocker.Mock())
+    assert await pending is False
+    assert app._accepts_typing()          # and it comes straight back
+
+
+async def test_a_question_keeps_the_input_row(app, mocker):
+    """ask_user reads its answer from the same row; only where the line goes
+    is different."""
+    pending = asyncio.ensure_future(app.ask_text("your answer"))
+    await asyncio.sleep(0)
+    assert app.mode == "ask" and app._accepts_typing()
+    app._buffer.text = "this one"
+    binding(app, "enter")(mocker.Mock())
+    assert await pending == "this one"
+
+
+def test_a_line_typed_while_busy_is_submitted(app, mocker):
+    """It reaches the REPL the same way an idle line does; _start_turn is
+    what decides it has to wait, since it is the thing that knows whether
+    the pane is still busy by the time the line arrives."""
+    app.set_busy("Thinking…")
+    app._buffer.text = "and then run the tests"
+    binding(app, "enter")(mocker.Mock())
+    assert app._queue.get_nowait() == (app.pane, "and then run the tests")
+    assert app._buffer.text == ""
+
+
+def test_the_busy_hint_says_enter_queues(app):
+    app.set_busy("Thinking…")
+    hint = "".join(f[1] for f in app._hint())
+    assert "queues" in hint and "ctrl+c interrupts" in hint
+
+
+def test_the_status_line_says_how_much_is_queued(app):
+    """The pane you are looking at is where the queue matters most: it is the
+    reason the line you just sent produced no visible turn."""
+    app.set_busy("Thinking…")
+    app.pane.pending.append(("later", []))
+    assert "1 queued" in "".join(f[1] for f in app._status_line())
+    app.pane.pending.append(("later still", []))
+    assert "2 queued" in "".join(f[1] for f in app._status_line())
+
+
+def test_an_empty_queue_says_nothing_on_the_status_line(app):
+    app.set_busy("Thinking…")
+    assert "queued" not in "".join(f[1] for f in app._status_line())
+
+
 def test_ctrl_d_on_an_empty_line_ends_the_session(app, mocker):
     binding(app, "c-d")(mocker.Mock())
     assert app._queue.get_nowait() == (None, None)
@@ -533,6 +602,50 @@ async def test_typing_goes_to_the_focused_pane(app, mocker):
     binding(app, "enter")(mocker.Mock())
     pane, text = app._queue.get_nowait()
     assert pane is sub and text == "narrow it to save_memory"
+
+
+async def test_a_line_typed_at_a_busy_subagent_goes_to_that_subagent(app, mocker):
+    """The queue is per agent, so a follow-up typed at a working subagent
+    waits for that subagent and never lands in main's turn."""
+    sub = app.add_pane("audit", depth=1)
+    app.set_busy("Searching the repo…", pane=sub)
+    app.focus(1)
+    app._buffer.text = "also check the tests"
+    binding(app, "enter")(mocker.Mock())
+    pane, text = app._queue.get_nowait()
+    assert pane is sub and text == "also check the tests"
+    assert app.main.pending == []
+
+
+def test_the_tree_shows_what_is_queued_at_each_agent(app, mocker):
+    """Walk away from a busy subagent you have just queued two follow-ups at
+    and there would otherwise be no sign anywhere that they exist."""
+    sub = app.add_pane("audit", depth=1)
+    app.set_busy("Searching the repo…", pane=sub)
+    sub.pending.extend([("one", []), ("two", [])])
+    tree = "".join(f[1] for f in app._agent_tree())
+    assert "+2 queued" in tree
+
+
+def test_the_tree_says_nothing_about_an_empty_queue(app, mocker):
+    app.add_pane("audit", depth=1)
+    assert "queued" not in "".join(f[1] for f in app._agent_tree())
+
+
+def test_each_agents_queue_is_counted_separately(app, mocker):
+    sub = app.add_pane("audit", depth=1)
+    app.main.pending.append(("main work", []))
+    sub.pending.extend([("a", []), ("b", []), ("c", [])])
+    tree = "".join(f[1] for f in app._agent_tree())
+    assert "+1 queued" in tree and "+3 queued" in tree
+
+
+def test_every_tree_fragment_still_carries_its_handler_with_a_queue(app, mocker):
+    """The queued note is appended to a row that has to stay clickable."""
+    sub = app.add_pane("audit", depth=1)
+    sub.pending.append(("later", []))
+    rows = [f for f in app._agent_tree() if f[1].strip()]
+    assert rows and all(len(f) == 3 for f in rows)
 
 
 def test_status_and_tokens_are_per_pane(app, mocker):
