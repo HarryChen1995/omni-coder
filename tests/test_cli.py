@@ -920,6 +920,39 @@ def test_resume_with_an_id_never_opens_the_picker(mocker, tmp_path):
     picked.assert_not_called()
 
 
+@pytest.mark.parametrize("name", ["my refactor", "utils typing", "Release 2.1"])
+def test_a_quoted_session_name_reaches_resume_intact(mocker, tmp_path, name):
+    """`--resume "my refactor"` — a name with spaces must arrive as one
+    value, not be eaten as the task or split into two."""
+    picked = mocker.patch.object(cli_mod, "_pick_session")
+    interactive = mocker.patch.object(cli_mod, "_interactive", new=mocker.AsyncMock())
+    result = CliRunner().invoke(app, ["--resume", name, "--model", "m", "-p", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    picked.assert_not_called()
+    assert interactive.await_args.args[1] == name
+
+
+def test_a_quoted_name_is_not_mistaken_for_a_bare_resume():
+    """fill_bare_resume only fills in a sentinel when nothing follows; a name
+    with spaces is something following."""
+    assert cli_mod.fill_bare_resume(["--resume", "my refactor"]) == ["--resume", "my refactor"]
+
+
+def test_a_one_shot_run_resumes_by_name_too(mocker, cfg):
+    """`omni --resume "my refactor" "carry on"` — the same lookup as the REPL,
+    since both hand the raw value to agent.run."""
+    from omni.session_store import SessionStore
+    sid = SessionStore(cfg.db_path).create_session(cfg.project_root, "m", "earlier", name="my refactor")
+    run = mocker.patch.object(cli_mod.CodingAgent, "run", new=mocker.AsyncMock(return_value="done"))
+    mocker.patch.object(cli_mod, "_show_resumed_history")
+    mocker.patch("omni.ui.final_result")
+    result = CliRunner().invoke(app, ["carry on", "--resume", "my refactor", "--model", "m",
+                                       "-p", cfg.project_root, "--db-path", cfg.db_path])
+    assert result.exit_code == 0, result.output
+    assert run.await_args.kwargs["resume_session_id"] == "my refactor"
+    assert SessionStore(cfg.db_path).resolve_session_id("my refactor") == sid
+
+
 def test_the_picker_is_handed_this_projects_sessions_and_branch(mocker, cfg):
     from omni.session_store import SessionStore
     store = SessionStore(cfg.db_path)

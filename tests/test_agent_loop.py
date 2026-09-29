@@ -677,6 +677,56 @@ async def test_a_resumed_session_keeps_the_prompt_it_started_with(agent, client,
     assert system_of(m.sent[0]) == "Original prompt."
 
 
+async def test_a_session_can_be_resumed_by_the_name_it_was_given(agent, client, mocker):
+    """The whole point of --session-name: getting back in without the id."""
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client, session_name="my refactor")
+    started = agent.session_id
+
+    replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id="my refactor", client=client)
+    assert agent.session_id == started
+
+
+async def test_resuming_by_name_ignores_case_and_surrounding_space(agent, client, mocker):
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client, session_name="My Refactor")
+    started = agent.session_id
+
+    replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id="  my refactor ", client=client)
+    assert agent.session_id == started
+
+
+async def test_a_name_that_matches_nothing_still_says_so(agent, client, mocker):
+    replies(mocker, text_reply("a"))
+    with pytest.raises(ValueError, match="No session found"):
+        await agent.run("t", resume_session_id="never-existed", client=client)
+
+
+async def test_the_resume_banner_calls_the_session_by_its_name(agent, client, mocker):
+    """The id says nothing you can read; the name is what was typed to get
+    back here."""
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client, session_name="my refactor")
+
+    banner = mocker.patch("omni.ui.banner")
+    replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id="my refactor", client=client, show_banner=True)
+    assert "my refactor" in banner.call_args.args[0]
+
+
+async def test_an_unnamed_session_is_still_announced_by_its_id(agent, client, mocker):
+    replies(mocker, text_reply("a"))
+    await agent.run("first", client=client)
+    started = agent.session_id
+
+    banner = mocker.patch("omni.ui.banner")
+    replies(mocker, text_reply("b"))
+    await agent.run("second", resume_session_id=started, client=client, show_banner=True)
+    assert started in banner.call_args.args[0]
+
+
 # ---------------- token accounting ----------------
 #
 # The count beside the spinner should be what the session actually cost, so

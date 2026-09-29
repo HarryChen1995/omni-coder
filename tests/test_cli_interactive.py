@@ -95,6 +95,7 @@ def repl(mocker, client, cfg):
         # completion tests, which is where that dict is assembled.
         def fake_make_tui(commands, session_label, model):
             captured["commands"] = commands
+            captured["label"] = session_label      # what the frame's chip says
             return None
 
         mocker.patch.object(cli_mod, "_make_tui", fake_make_tui)
@@ -213,6 +214,77 @@ def test_title_follows_a_resumed_session(repl, mocker):
     title = mocker.patch("omni.ui.set_terminal_title")
     repl([], resume="utils-typing")
     assert title.call_args_list[0].args[0] == "utils-typing"
+
+
+# ---------------- what a resumed session is called ----------------
+
+def saved(cfg, name=None, task="earlier work"):
+    """A session already in the DB the REPL is about to open."""
+    from omni.session_store import SessionStore
+    return SessionStore(cfg.db_path).create_session(cfg.project_root, cfg.model, task, name=name)
+
+
+def test_a_resumed_session_is_labelled_with_its_name(repl, cfg):
+    """Not "<hex id> (resumed)". The name is what was chosen and what was
+    typed to get back here; that it was resumed is the least interesting
+    thing about it once you are sitting in it."""
+    saved(cfg, name="my refactor")
+    repl([], resume="my refactor")
+    assert repl.captured["label"] == "my refactor"
+
+
+def test_resuming_by_id_still_shows_the_name(repl, cfg):
+    """The label says what the session is, not what you typed to reach it."""
+    sid = saved(cfg, name="my refactor")
+    repl([], resume=sid)
+    assert repl.captured["label"] == "my refactor"
+
+
+def test_an_unnamed_session_falls_back_to_its_id(repl, cfg):
+    """There is nothing else to call it."""
+    sid = saved(cfg)
+    repl([], resume=sid)
+    assert repl.captured["label"] == sid
+
+
+def test_the_resumed_label_carries_no_suffix(repl, cfg):
+    sid = saved(cfg, name="my refactor")
+    repl([], resume=sid)
+    assert "(resumed)" not in repl.captured["label"]
+
+
+def test_a_resume_naming_nothing_is_left_for_the_turn_to_complain_about(repl, cfg):
+    """Unresolvable names must not be swallowed here — agent.run() raises the
+    proper "no session found" on the first turn, and the label has only the
+    raw value to show meanwhile."""
+    repl([], resume="never-existed")
+    assert repl.captured["label"] == "never-existed"
+
+
+def test_a_new_named_session_is_labelled_with_its_name(repl):
+    repl([], session_name="white-house-3d")
+    assert repl.captured["label"] == "white-house-3d"
+
+
+def test_a_fresh_unnamed_session_says_it_is_new(repl):
+    repl([])
+    assert repl.captured["label"] == "(new)"
+
+
+def test_resuming_by_name_finds_the_session_whatever_the_case(repl, cfg):
+    """The point of quoting a name: it is typed from memory."""
+    sid = saved(cfg, name="My Refactor")
+    run = repl(["carry on then"], resume="  my refactor  ")
+    assert repl.captured["label"] == "My Refactor"
+    # and the turn runs against that session, not a new one
+    assert run.await_args.kwargs["resume_session_id"] == sid
+
+
+def test_the_window_title_uses_the_name_too(repl, mocker, cfg):
+    title = mocker.patch("omni.ui.set_terminal_title")
+    sid = saved(cfg, name="my refactor")
+    repl([], resume=sid)
+    assert title.call_args_list[0].args[0] == "my refactor"
 
 
 def test_unnamed_session_is_titled_once_it_has_an_id(repl, mocker):

@@ -491,7 +491,10 @@ class CodingAgent:
             persisted = len(messages)  # already in the DB, don't re-write these
             label = task or "[continuing previous task]"
             if _HAS_UI and show_banner:
-                ui.banner(f"(resumed {session_id}) {label}", self.cfg.model)
+                # By the name it was given where it has one: that is what was
+                # typed to get back here, and the id says nothing you can read.
+                called = self.store.session_name(session_id) or session_id
+                ui.banner(f"(resumed {called}) {label}", self.cfg.model)
             self.logger.info(f"RESUME session={session_id} TASK: {label}")
             if task:
                 messages.append(build_user_message(task, attachments))

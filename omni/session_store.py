@@ -155,12 +155,43 @@ class SessionStore:
 
     def resolve_session_id(self, id_or_name: str) -> str:
         """Accept either a session id or a session --session-name and return
-        the underlying id, or None if neither matches."""
+        the underlying id, or None if neither matches.
+
+        A name is matched forgivingly, because it is the half a person types
+        from memory: surrounding whitespace is ignored (a quoted name picked
+        out of a table brings its padding with it) and so is case. An id is
+        matched exactly — it is copied, never remembered, and a hex blob has
+        no case worth being clever about.
+
+        Exact wins over case-insensitive, so two sessions whose names differ
+        only in case can each still be reached by typing its name as it is;
+        past that it is the most recently touched, which is the one a person
+        typing a half-remembered name almost always means."""
+        if id_or_name is None:
+            return None
+        text = str(id_or_name).strip()
+        if not text:
+            return None
         with _connect(self.db_path) as conn:
             row = conn.execute(
-                "SELECT id FROM sessions WHERE id = ? OR name = ?", (id_or_name, id_or_name),
+                "SELECT id FROM sessions WHERE id = ? OR name = ? "
+                "ORDER BY updated_at DESC LIMIT 1", (text, text),
             ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT id FROM sessions WHERE lower(name) = lower(?) "
+                    "ORDER BY updated_at DESC LIMIT 1", (text,),
+                ).fetchone()
         return row["id"] if row else None
+
+    def session_name(self, session_id: str) -> str:
+        """The name this session was given, or "" if it was never named.
+
+        What a resumed session should be called on screen: the name is the
+        half a person chose, and the id is the half the database did."""
+        with _connect(self.db_path) as conn:
+            row = conn.execute("SELECT name FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return (row["name"] or "") if row else ""
 
     def load_messages(self, session_id: str) -> list:
         """The conversation exactly as the model saw it — nothing else, since

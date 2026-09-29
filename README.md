@@ -66,7 +66,7 @@ one-shot run — see [Session management](#session-management) below.
 | Context window | Unbounded growth | Once the conversation exceeds `--context-window-budget` (default 50k tokens, off the server's reported `prompt_tokens`), it's compacted via an LLM-written summary instead of growing forever |
 | Observability | `print()` only | Structured log file (`agent_run.log`) recording every model call, tool call, args, and result — plus a separate `mcp_servers.log` for MCP server stderr, and a `/mcp` command showing live connection status |
 | Config | Hardcoded constants | `AgentConfig` dataclass — one place to tune model, project root, limits, policy |
-| Sessions | Each run started from a blank conversation | Every message is persisted to SQLite (`session_store.py`); resume by id or name, or pick from a searchable list with a bare `--resume`. Resuming redraws the earlier turns — tool calls, results, timings — through the live renderers, so it reads like a session that never stopped |
+| Sessions | Each run started from a blank conversation | Every message is persisted to SQLite (`session_store.py`); resume by id or by quoted `--session-name` (case and surrounding space ignored), or pick from a searchable list with a bare `--resume`. Resuming redraws the earlier turns — tool calls, results, timings — through the live renderers, so it reads like a session that never stopped |
 | Codebase search | `grep` piped through a subprocess | Pure-Python `search_files` (regex + glob filter, skips `.git`/`node_modules`/etc.) and a `glob_files` tool for pattern-based file discovery |
 | Git integration | Only `git_diff` (read-only) | Full toolset — `git_status`, `git_log`, `git_show`, `git_branch`, `git_fetch` (read-only, auto-approved) plus `git_add`, `git_commit`, `git_pull`, `git_push` (approval-gated, same as any other write) |
 | Long-term memory | Every session starts blank | `save_memory` tool appends durable notes (conventions, gotchas, preferences) to a project-local `agent_memory.md`, auto-injected into the system prompt at the start of every new session |
@@ -386,8 +386,25 @@ omni "Add type hints to utils.py" --session-name utils-typing
 omni --resume utils-typing "Also add docstrings"
 ```
 `--resume` accepts either the session id it printed at the end of a run, or
-the `--session-name` you gave it. `--session-name` is optional — without it
-you just get an 8-character id.
+the `--session-name` you gave it. A name with spaces goes in quotes:
+
+```bash
+omni --session-name "my refactor" "Add type hints to utils.py"
+omni --resume "my refactor" "Also add docstrings"
+```
+
+The name is matched forgivingly, because it is the half you type from
+memory: case is ignored, and so is any space around it (a name copied out of
+`--list-sessions` brings its padding with it). The id is matched exactly — it
+is copied, never remembered, and a hex blob has no case worth guessing at.
+Where two sessions' names differ only in case, typing either one exactly
+still reaches its own. `--session-name` is optional — without it you just get
+an 8-character id, and that is what you resume by.
+
+Once you are in, the chip on the input frame says what the session is
+called: its name where it has one, the id otherwise. It is the name rather
+than the `--resume` value you happened to type, so resuming by id still puts
+you in a session labelled "my refactor".
 
 When you resume, the earlier turns are redrawn before the run continues —
 your instructions, the replies, every tool call with its ⎿ result line, and
@@ -708,7 +725,9 @@ open/closed state you left it, rather than vanishing with the app.
 
 The terminal window/tab is named after the session, so several sessions side
 by side are tellable apart: `--session-name` if you gave one, otherwise the id
-the session is assigned after its first turn. Two mechanisms cover the
+the session is assigned after its first turn. A resumed session is named the
+same way — by what it is called, not by the `--resume` value you typed to
+reach it. Two mechanisms cover the
 platforms — the OSC 0 escape for xterm-family terminals, Terminal.app/iTerm
 and Windows Terminal, and `SetConsoleTitleW` for older Windows consoles that
 ignore it. Nothing restores the previous title on exit (a terminal can't be

@@ -247,8 +247,9 @@ def main(
     ),
     resume: Optional[str] = typer.Option(
         None, "--resume",
-        help="Resume a previous session instead of starting a new one. Give it an id or a "
-             "--session-name, or pass it bare to pick from a searchable list of this "
+        help="Resume a previous session instead of starting a new one. Give it an id, or a "
+             "--session-name in quotes (--resume \"my refactor\"; case and surrounding "
+             "spaces don't matter), or pass it bare to pick from a searchable list of this "
              "project's sessions (Ctrl+T there widens it to every project).",
     ),
     session_name: Optional[str] = typer.Option(
@@ -515,19 +516,36 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
     agent = CodingAgent(cfg)
     session_id = resume
 
+    # Resolve --resume (which may be a --session-name, not a raw id) to the
+    # real DB id before anything is drawn with it. It used to happen after the
+    # header and the frame were built, which is why both could only show the
+    # string you happened to type; /compact and /delete use session_id
+    # directly and a name doesn't match the id column, so they needed it too.
+    # Left unresolved when it names nothing, so the "no session found" error
+    # still surfaces from agent.run() on the first turn rather than here.
+    resumed_name = ""
+    if resume:
+        resolved = agent.store.resolve_session_id(resume)
+        if resolved is not None:
+            session_id = resolved
+            resumed_name = agent.store.session_name(resolved)
+
     def session_title() -> str:
-        """What the terminal window/tab is named. The session's own name where
-        there is one, otherwise the id it was given — the "(resumed)" suffix
-        that session_label() carries is noise in a window title."""
-        return session_name or resume or session_id or "omni"
+        """What the terminal window/tab is named."""
+        return resumed_name or session_name or resume or session_id or "omni"
 
     def session_label() -> str:
-        # Prefer whatever human-chosen name identifies this session — the
-        # --session-name given for a new one, or the --resume value (which
-        # may itself be a name) — over the opaque hex id the DB assigns,
-        # so a name typed at startup never gets silently swapped for an id.
+        """What the chip on the input frame says this session is.
+
+        The name it was given, wherever it has one — that is the half a person
+        chose, and it is what they typed to get back here. A resumed session
+        used to be labelled with the raw --resume value and "(resumed)"
+        after it, which said the wrong thing twice: the value is usually the
+        hex id, and that the session was resumed is the least interesting
+        thing about it once you are sitting in it. An unnamed session still
+        falls back to the id, because then there is nothing else to call it."""
         if resume:
-            return f"{resume} (resumed)"
+            return resumed_name or session_id or resume
         return session_name or session_id or "(new)"
 
     # The header is drawn once, at startup, and never redrawn: the two things
@@ -549,18 +567,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                    "/exit to quit. Ctrl+C interrupts the current turn without leaving the session.")
 
     if resume:
-        _show_resumed_history(agent, resume)
-        # Resolve --resume (which may be a --session-name, not a raw id) to
-        # the real DB id now rather than waiting for the first turn to set
-        # it — /compact and /delete use session_id directly, and a name
-        # doesn't match the DB's id column, so e.g. /compact would silently
-        # find "no messages" and report nothing to compact. Left unresolved
-        # (falls through to the raw value) if the name/id doesn't exist, so
-        # the existing "no session found" error still surfaces from
-        # agent.run() on the first turn.
-        resolved = agent.store.resolve_session_id(resume)
-        if resolved is not None:
-            session_id = resolved
+        # Resolved above, before the frame was built; this replays the
+        # conversation into the transcript it now has.
+        _show_resumed_history(agent, session_id)
 
     # Main is pane 0. Every pane owns its agent and its session, which is what
     # lets several run at once without their transcripts or histories mixing.

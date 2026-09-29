@@ -39,9 +39,12 @@ Run `omni --help` for the full option list.
   feature, refactor, risk level, target files) before any action is taken,
   and high-risk tasks force human approval even under `--auto-approve`.
 - **Session persistence** — every message is saved to SQLite as the run
-  happens. Resume a previous run by id or a name you gave it
-  (`--resume`), browse saved sessions (`--list-sessions`), or delete one
-  (`--delete-session`). Resuming redraws the earlier turns through the same
+  happens. Resume a previous run by id or by a name you gave it, quoted if
+  it has spaces (`--resume "my refactor"` — case and surrounding space are
+  ignored, since the name is the half you type from memory). Browse saved
+  sessions (`--list-sessions`) or delete one (`--delete-session`). Once
+  resumed, the frame names the session by what it is called rather than by
+  what you typed to reach it. Resuming redraws the earlier turns through the same
   renderers a live turn uses — tool calls, results and reply timings and
   all — so it reads like a session that never stopped, and `/expand <n>`
   still reaches a call from before the resume.

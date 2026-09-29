@@ -49,6 +49,53 @@ def test_resolve_session_id_by_id_and_name(store):
     assert store.resolve_session_id("missing") is None
 
 
+@pytest.mark.parametrize("typed", [
+    "My Refactor",          # as it was given
+    "my refactor",          # as it is remembered
+    "MY REFACTOR",
+    "  My Refactor  ",      # as it arrives out of a table, padding and all
+    "\tMy Refactor\n",
+])
+def test_a_name_is_matched_forgivingly(store, typed):
+    """The name is the half a person types from memory, in quotes, off a
+    list they are reading — so case and surrounding space can't be the thing
+    that decides whether they get their session back."""
+    sid = store.create_session("/p", "m", "t", name="My Refactor")
+    assert store.resolve_session_id(typed) == sid
+
+
+def test_an_id_is_still_matched_exactly(store):
+    """An id is copied, never remembered, and a hex blob has no case worth
+    being clever about — a near-miss must not resolve to something."""
+    sid = store.create_session("/p", "m", "t")
+    assert store.resolve_session_id(sid.upper()) is None
+    assert store.resolve_session_id(sid[:-1]) is None
+
+
+def test_an_exact_name_wins_over_one_that_only_matches_loosely(store):
+    """Two sessions whose names differ only in case can each still be
+    reached by typing its name as it is."""
+    lower = store.create_session("/p", "m", "t", name="release")
+    upper = store.create_session("/p", "m", "t", name="RELEASE")
+    assert store.resolve_session_id("release") == lower
+    assert store.resolve_session_id("RELEASE") == upper
+
+
+@pytest.mark.parametrize("nothing", [None, "", "   ", "\n"])
+def test_resolving_nothing_finds_nothing(store, nothing):
+    """An empty --resume must not quietly land on whatever row comes first."""
+    store.create_session("/p", "m", "t", name="real")
+    assert store.resolve_session_id(nothing) is None
+
+
+def test_session_name_gives_back_what_the_session_is_called(store):
+    named = store.create_session("/p", "m", "t", name="my-name")
+    unnamed = store.create_session("/p", "m", "t")
+    assert store.session_name(named) == "my-name"
+    assert store.session_name(unnamed) == ""
+    assert store.session_name("no-such-session") == ""
+
+
 def test_session_names_are_unique(store):
     """The DB's UNIQUE index is surfaced as an actionable ValueError, not a
     raw sqlite3.IntegrityError."""
