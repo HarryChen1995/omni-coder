@@ -661,7 +661,19 @@ class CodingAgent:
             self.store.append_message(session_id, persisted, m)
             persisted += 1
 
-        for step in range(1, self.cfg.max_steps + 1):
+        # The step cap is a backstop against an agent looping *unattended* —
+        # it is not a limit on how long a piece of work may take. Someone
+        # typing into the turn is precisely the oversight it stands in for, so
+        # every interjection restarts the count from where it landed. You can
+        # steer a long job for as long as you keep steering it, and a turn
+        # left to its own devices still stops exactly where it always did.
+        #
+        # Only a keystroke reaches the inbox (cli's _inject, off the input
+        # row), so nothing the model does can extend its own leash.
+        budget = self.cfg.max_steps
+        step = 0
+        while step < budget:
+            step += 1
             # Anything typed while this turn was working joins the
             # conversation here, before the model is asked again — so it is
             # acted on during this turn rather than queued behind it. Ahead of
@@ -669,6 +681,7 @@ class CodingAgent:
             # towards the context budget it actually adds to.
             if self._inbox:
                 persisted = self._absorb_inbox(session_id, messages, persisted)
+                budget = step + self.cfg.max_steps
 
             # Trigger on the real context size: the prompt_tokens the server
             # reported for the last call is exactly how large what we keep
@@ -911,7 +924,8 @@ class CodingAgent:
                                            {"duration": c.get("duration"), "ok": c.get("ok")})
                 persisted += 1
 
-        msg = "Max steps reached without completion. Check the log for progress."
+        msg = (f"Max steps reached without completion ({step} steps). Check the log for "
+                f"progress, then say what to do next to carry on.")
         self.logger.info(msg)
         self.store.finish_session(session_id, "max_steps", msg)
         return msg

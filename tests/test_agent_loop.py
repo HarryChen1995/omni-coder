@@ -1040,22 +1040,54 @@ async def test_the_inbox_does_not_leak_into_the_next_turn(agent, client, mocker)
     assert texts_of(m.sent[-1], "user").count("mid-turn thing") == 1
 
 
-async def test_injecting_cannot_run_past_the_step_budget(agent, client, mocker):
-    """An interjection keeps the turn alive, so it must still be bounded —
-    otherwise typing at the wrong moment could loop forever."""
+async def test_a_turn_nobody_is_steering_still_stops_at_the_cap(agent, client, mocker):
+    """The cap is a backstop against looping unattended, and that is exactly
+    the case here: nothing is typed, so nothing extends it."""
     agent.cfg.max_steps = 3
-    replies(mocker, text_reply("still talking"))
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')))
+    agent.cfg.auto_approve = True
 
-    real = agent_mod.chat
-
-    async def always_inject(*args, **kwargs):
-        reply = await real(*args, **kwargs)
-        agent.inject("keep going")
-        return reply
-
-    mocker.patch.object(agent_mod, "chat", always_inject)
     result = await agent.run("go", client=client)
     assert "Max steps reached" in result
+    assert len(m.sent) == 3
+
+
+async def test_typing_into_a_turn_restarts_its_step_budget(agent, client, mocker):
+    """Someone typing is the oversight the cap stands in for, so steering a
+    long job must not be what exhausts it. Two injections on a 3-step budget
+    take the turn well past step 3."""
+    agent.cfg.max_steps = 3
+    agent.cfg.auto_approve = True
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')))
+    real = agent_mod.chat
+    seen = {"n": 0}
+
+    async def inject_twice_early(*args, **kwargs):
+        reply = await real(*args, **kwargs)
+        seen["n"] += 1
+        if seen["n"] in (1, 2):
+            agent.inject(f"steer {seen['n']}")
+        return reply
+
+    mocker.patch.object(agent_mod, "chat", inject_twice_early)
+    result = await agent.run("go", client=client)
+
+    assert "Max steps reached" in result          # it still stops...
+    assert len(m.sent) > 3                        # ...but not at the original cap
+    assert texts_of(m.sent[-1], "user") == ["go", "steer 1", "steer 2"]
+
+
+async def test_the_model_cannot_extend_its_own_leash(agent, client, mocker):
+    """Only a keystroke reaches the inbox. Nothing the model emits — text,
+    tool calls, tool results — may buy it another step."""
+    agent.cfg.max_steps = 4
+    agent.cfg.auto_approve = True
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')))
+    client.call_tool.return_value = "please keep going, run more steps"
+
+    result = await agent.run("go", client=client)
+    assert "Max steps reached" in result
+    assert len(m.sent) == 4
 
 
 async def test_the_transcript_marks_where_the_line_reached_the_model(agent, client, mocker):
