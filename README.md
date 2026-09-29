@@ -180,16 +180,9 @@ everything that agent did, its answer is already in the conversation, and its
 session is still in the database (`--list-sessions`, `--resume`).
 
 Turns run concurrently, so main keeps working while you read or type at a
-subagent, and anything you type at a busy agent queues for its next turn. The
-input row stays live the whole time an agent is working — a turn can run for
-minutes and the next thing you want to ask is usually obvious long before it
-lands, so Enter sends the line and the frame says `queued #2` rather than
-refusing it. Each agent has its own queue and drains it **strictly in order,
-one turn at a time**: a queued line never runs alongside the turn in front of
-it and never at another agent. The status line shows the backlog for the
-agent you are looking at, and the tree shows `+n queued` for every other one,
-so work you left waiting at a subagent is visible from anywhere. A turn that
-fails still lets the queue move on.
+subagent. The input row stays live the whole time an agent is working, and
+what you type **joins the turn already running** rather than waiting behind
+it — see below.
 Approvals and questions stay with the agent that raised them: a background
 subagent asking to write a file waits in its own pane (flagged `!`) instead of
 seizing the screen. A subagent can't spawn subagents — one level, on purpose.
@@ -198,6 +191,47 @@ Flags: `--subagent-model` runs them on something smaller and faster than main
 (exploration and review are where that pays off), `--subagent-max-steps`
 (default 40) caps one subagent separately from `--max-steps` so a runaway one
 can't eat the whole run.
+
+## ⌨️ Talking to a turn that's already running
+
+A turn can run for minutes, and the next thing you want to say is usually
+obvious long before it lands — so the input row stays live throughout, and
+Enter sends the line **into the turn that's running**:
+
+```
+› set up session storage
+
+● I'll use SQLite.
+  ↳ sent to the model mid-turn: actually use Postgres
+● Switched to Postgres — writing the migration now.
+```
+
+It becomes an ordinary user message in the conversation the model is
+reasoning from, folded in at the next step boundary, so the model acts on it
+during this turn instead of finishing the wrong work first. Concretely:
+
+- **Folded in on a step boundary, never mid-step.** A user message wedged
+  between an assistant's `tool_calls` and the tool results answering them is
+  rejected outright by a strict server, so it always lands after the results
+  are in.
+- **It keeps the turn alive.** If the reply that was about to be the answer
+  carries no tool calls, the turn doesn't end — the interjection is folded in
+  and the model is asked again, because ending would mean answering a
+  question that has just been added to. Still bounded by `--max-steps`.
+- **It's part of the conversation.** Persisted like any other message, so
+  `--resume` replays it in the right place.
+- **Per agent.** A line typed at a working subagent joins *that* subagent's
+  turn and nobody else's. The status line shows `n waiting` for the agent
+  you're looking at and the tree shows `+n waiting` for the others, so
+  anything unanswered is visible from anywhere.
+- **Never dropped.** A line typed on a turn's very last step arrives after
+  the final boundary, so that turn can't see it. It's moved to the front of
+  that pane's queue and runs as a turn of its own — late, but never lost.
+
+The fallback queue drains **strictly in order, one turn at a time**: it never
+runs alongside the turn in front of it, and a turn that fails still lets it
+move on. Images pasted with a line travel with that line, not with whichever
+turn happens to pick it up.
 
 ## ❓ Asking you a question
 

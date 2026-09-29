@@ -38,10 +38,13 @@ Run `omni --help` for the full option list.
 - **Structured intent parsing** — the raw task is classified (bug fix,
   feature, refactor, risk level, target files) before any action is taken,
   and high-risk tasks force human approval even under `--auto-approve`.
-- **Type while it works** — the input row stays live during a turn. Enter
-  queues the line for that agent and the frame says where in the line it
-  landed; each agent drains its own queue strictly in order, one turn at a
-  time, so nothing runs alongside the turn in front of it.
+- **Talk to a turn that's already running** — the input row stays live during
+  a turn, and Enter sends the line *into* it: it becomes a user message in the
+  conversation the model is reasoning from, folded in at the next step
+  boundary, so the model changes course during this turn instead of finishing
+  the wrong work first. An interjection even keeps a turn alive that was about
+  to end. Per agent, persisted like any other message, and a line that arrives
+  after the last boundary runs as its own turn rather than being lost.
 - **Session persistence** — every message is saved to SQLite as the run
   happens. Resume a previous run by id or by a name you gave it, quoted if
   it has spaces (`--resume "my refactor"` — case and surrounding space are

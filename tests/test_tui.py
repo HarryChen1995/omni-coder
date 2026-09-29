@@ -285,20 +285,48 @@ def test_a_line_typed_while_busy_is_submitted(app, mocker):
     assert app._buffer.text == ""
 
 
-def test_the_busy_hint_says_enter_queues(app):
+def test_the_busy_hint_says_enter_reaches_this_turn(app):
+    """Not "queues": the line joins the turn already running, which is a
+    different promise and the one the code now keeps."""
     app.set_busy("Thinking…")
     hint = "".join(f[1] for f in app._hint())
-    assert "queues" in hint and "ctrl+c interrupts" in hint
+    assert "sends it to this turn" in hint and "ctrl+c interrupts" in hint
 
 
-def test_the_status_line_says_how_much_is_queued(app):
-    """The pane you are looking at is where the queue matters most: it is the
-    reason the line you just sent produced no visible turn."""
+def test_the_status_line_says_how_much_is_outstanding(app):
+    """The pane you are looking at is where this matters most: it is the
+    reason the line you just sent has produced nothing visible yet."""
     app.set_busy("Thinking…")
     app.pane.pending.append(("later", []))
-    assert "1 queued" in "".join(f[1] for f in app._status_line())
+    assert "1 waiting" in "".join(f[1] for f in app._status_line())
     app.pane.pending.append(("later still", []))
-    assert "2 queued" in "".join(f[1] for f in app._status_line())
+    assert "2 waiting" in "".join(f[1] for f in app._status_line())
+
+
+def test_the_status_line_counts_what_the_running_turn_has_not_read(app, mocker):
+    """The normal path for a line typed mid-turn is the agent's inbox, not
+    the pane's queue — the frame has to count that too or typing while busy
+    looks like it did nothing."""
+    app.pane.agent = mocker.Mock(inbox_depth=2, tokens=None)
+    app.set_busy("Thinking…")
+    assert "2 waiting" in "".join(f[1] for f in app._status_line())
+
+
+def test_both_routes_are_counted_as_one_number(app, mocker):
+    app.pane.agent = mocker.Mock(inbox_depth=1, tokens=None)
+    app.pane.pending.append(("ran out of turn", []))
+    app.set_busy("Thinking…")
+    assert "2 waiting" in "".join(f[1] for f in app._status_line())
+
+
+@pytest.mark.parametrize("odd", [None, "3", -1, True, object()])
+def test_an_agent_that_answers_oddly_never_breaks_the_frame(app, mocker, odd):
+    """`waiting` is read on every repaint; a frame that raises because an
+    agent answered strangely takes the whole screen down with it."""
+    app.pane.agent = mocker.Mock(inbox_depth=odd, tokens=None)
+    app.set_busy("Thinking…")
+    assert app.pane.waiting == 0
+    assert "waiting" not in "".join(f[1] for f in app._status_line())
 
 
 def test_an_empty_queue_says_nothing_on_the_status_line(app):
@@ -617,27 +645,36 @@ async def test_a_line_typed_at_a_busy_subagent_goes_to_that_subagent(app, mocker
     assert app.main.pending == []
 
 
-def test_the_tree_shows_what_is_queued_at_each_agent(app, mocker):
-    """Walk away from a busy subagent you have just queued two follow-ups at
-    and there would otherwise be no sign anywhere that they exist."""
+def test_the_tree_shows_what_is_outstanding_at_each_agent(app, mocker):
+    """Walk away from a busy subagent you have just said two things to and
+    there would otherwise be no sign anywhere that they are unanswered."""
     sub = app.add_pane("audit", depth=1)
     app.set_busy("Searching the repo…", pane=sub)
     sub.pending.extend([("one", []), ("two", [])])
     tree = "".join(f[1] for f in app._agent_tree())
-    assert "+2 queued" in tree
+    assert "+2 waiting" in tree
 
 
-def test_the_tree_says_nothing_about_an_empty_queue(app, mocker):
+def test_the_tree_says_nothing_when_nothing_is_outstanding(app, mocker):
     app.add_pane("audit", depth=1)
-    assert "queued" not in "".join(f[1] for f in app._agent_tree())
+    assert "waiting" not in "".join(f[1] for f in app._agent_tree())
 
 
-def test_each_agents_queue_is_counted_separately(app, mocker):
+def test_each_agents_backlog_is_counted_separately(app, mocker):
+    """Multi-agent: one number per row, its own agent's."""
     sub = app.add_pane("audit", depth=1)
     app.main.pending.append(("main work", []))
     sub.pending.extend([("a", []), ("b", []), ("c", [])])
     tree = "".join(f[1] for f in app._agent_tree())
-    assert "+1 queued" in tree and "+3 queued" in tree
+    assert "+1 waiting" in tree and "+3 waiting" in tree
+
+
+def test_a_subagents_inbox_is_counted_on_its_own_row(app, mocker):
+    sub = app.add_pane("audit", agent=mocker.Mock(inbox_depth=2, tokens=None), depth=1)
+    app.set_busy("Searching…", pane=sub)
+    tree = "".join(f[1] for f in app._agent_tree())
+    assert "+2 waiting" in tree
+    assert app.main.waiting == 0
 
 
 def test_every_tree_fragment_still_carries_its_handler_with_a_queue(app, mocker):

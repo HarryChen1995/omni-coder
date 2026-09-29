@@ -395,8 +395,72 @@ class CodingAgent:
         # What the last reply cost and how long it took, so it can be stored
         # beside the message and replayed on resume.
         self._last_call_meta = {}
+        # Lines typed while a turn is running, waiting to be folded into the
+        # conversation the model is working from. Drained at each step
+        # boundary — see `inject` and `_absorb_inbox`.
+        #
+        # No lock: `inject` is called from the REPL's own loop and the drain
+        # from the turn running on that same loop, and the drain never awaits
+        # part-way through, so the two can't interleave. A lock here would
+        # imply a second thread that does not exist.
+        self._inbox: list = []
         self.store = SessionStore(cfg.db_path)
         self.session_id = None  # set by run() to whichever session the last turn used
+
+    # ---- talking to a turn that is already running ----
+
+    def inject(self, text: str, attachments: list = None) -> bool:
+        """Hand the running turn something the person typed while it worked.
+
+        It becomes an ordinary user message in the conversation the model is
+        reasoning from, folded in at the next step boundary, so the model acts
+        on it during this turn instead of after it. Returns False for an empty
+        line, which is nothing to say rather than an error.
+
+        Whether the model actually gets to see it is not knowable here: a turn
+        that is already on its last step will finish before the next boundary
+        arrives. `take_inbox` is how the caller recovers anything left over,
+        so a line is never silently dropped."""
+        if not (text or "").strip():
+            return False
+        self._inbox.append((text, list(attachments or [])))
+        return True
+
+    @property
+    def inbox_depth(self) -> int:
+        """How many typed lines the running turn hasn't folded in yet. Read by
+        the frame, which shows the count next to what the agent is doing."""
+        return len(self._inbox)
+
+    def take_inbox(self) -> list:
+        """Remove and return whatever the turn never got to — [(text,
+        attachments)]. The caller runs these as a turn of their own.
+
+        Called once the turn is over, which is the only moment this is
+        unambiguous: up to then, anything still here is about to be read."""
+        left, self._inbox = self._inbox, []
+        return left
+
+    def _absorb_inbox(self, session_id: str, messages: list, persisted: int) -> int:
+        """Fold everything typed since the last step into `messages`.
+
+        Only ever called at the top of a step, and that matters: by then the
+        previous step's tool results have all been appended, so a user message
+        lands on a clean boundary. Inserted anywhere else it would sit between
+        an assistant message carrying tool_calls and the tool results that
+        answer them, which a strict server rejects outright.
+
+        Persisted as it goes, so the injected line survives a resume — it is
+        part of the conversation now, not a UI flourish."""
+        while self._inbox:
+            text, attachments = self._inbox.pop(0)
+            messages.append(build_user_message(text, attachments))
+            self.store.append_message(session_id, persisted, messages[-1])
+            persisted += 1
+            self.logger.info(f"INJECTED mid-turn (session={session_id}): {text}")
+            if _HAS_UI:
+                ui.injected(text, images=len(attachments))
+        return persisted
 
     def _count(self, usage: dict):
         """Fold one usage block into this agent's running total.
@@ -598,6 +662,14 @@ class CodingAgent:
             persisted += 1
 
         for step in range(1, self.cfg.max_steps + 1):
+            # Anything typed while this turn was working joins the
+            # conversation here, before the model is asked again — so it is
+            # acted on during this turn rather than queued behind it. Ahead of
+            # the compaction check below, so a long interjection counts
+            # towards the context budget it actually adds to.
+            if self._inbox:
+                persisted = self._absorb_inbox(session_id, messages, persisted)
+
             # Trigger on the real context size: the prompt_tokens the server
             # reported for the last call is exactly how large what we keep
             # sending has grown. Before the first call of a run there's no
@@ -670,6 +742,29 @@ class CodingAgent:
                     print(f"\n{interim}")
 
             if not tool_calls:
+                if self._inbox:
+                    # Something was typed while this reply was being
+                    # generated, so the turn isn't over after all: loop round,
+                    # fold it in and ask again rather than returning an answer
+                    # to a question that has just been added to. The reply so
+                    # far is already in `messages`, which is what makes the
+                    # exchange read as a conversation instead of the model
+                    # being cut off. Still bounded by max_steps.
+                    self.logger.info(
+                        f"[step {step}] reply carried no tool calls, but "
+                        f"{len(self._inbox)} typed line(s) arrived — continuing the turn"
+                    )
+                    # This reply was going to be the answer, so nothing has
+                    # shown it yet (the display above is for replies that came
+                    # with tool calls, and cli.py renders the final one as the
+                    # result). It turns out to be interim, so it is shown as
+                    # interim — otherwise the model's words vanish.
+                    if interim:
+                        if _HAS_UI:
+                            ui.assistant_message(interim)
+                        else:
+                            print(f"\n{interim}")
+                    continue
                 final = msg.get("content", "")
                 self.logger.info(f"DONE: {final}")
                 self.store.finish_session(session_id, "done", final)

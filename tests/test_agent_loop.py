@@ -857,3 +857,214 @@ async def test_spawn_needs_no_approval_but_what_it_does_still_might(cfg, mocker)
     approve.assert_not_called()
     await _approve("write_file", {}, cfg, mocker.AsyncMock())
     approve.assert_awaited_once()
+
+
+# ---------------- lines typed while a turn is running ----------------
+#
+# The input row stays live during a turn (see test_tui.py), and what you type
+# there is handed to the agent running it — agent.inject. It becomes an
+# ordinary user message in the conversation the model is reasoning from,
+# folded in at the next step boundary, so the turn acts on it rather than
+# queueing it behind itself.
+
+
+def roles_of(conversation):
+    return [m["role"] for m in conversation]
+
+
+def texts_of(conversation, role):
+    return [str(m.get("content")) for m in conversation if m["role"] == role]
+
+
+def inject_from_the_tool_call(agent, client, *texts, result="file contents"):
+    """Make the next tool call be the moment the person types."""
+    async def run(*a, **k):
+        for text in texts:
+            agent.inject(text)
+        return result
+    client.call_tool.side_effect = run
+
+
+def inject_after_the_first_reply(agent, mocker, *texts):
+    """Make the model's first reply be the moment the person types — the
+    reply is already written, so the turn is on the edge of ending."""
+    real = agent_mod.chat
+    seen = {"n": 0}
+
+    async def chat_then_inject(*args, **kwargs):
+        reply = await real(*args, **kwargs)
+        seen["n"] += 1
+        if seen["n"] == 1:
+            for text in texts:
+                agent.inject(text)
+        return reply
+
+    mocker.patch.object(agent_mod, "chat", chat_then_inject)
+
+
+async def test_an_injected_line_reaches_the_model_in_the_same_turn(agent, client, mocker):
+    """The whole point: acted on now, not in a turn of its own afterwards."""
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x.py"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+    inject_from_the_tool_call(agent, client, "also check the tests")
+
+    await agent.run("read x.py", client=client)
+
+    assert "also check the tests" in texts_of(m.sent[-1], "user")
+    assert len(m.sent) == 2                # one turn, two model calls
+
+
+async def test_the_injected_line_lands_after_the_tool_result(agent, client, mocker):
+    """A user message between an assistant's tool_calls and the tool results
+    that answer them is rejected outright by a strict server, so the fold-in
+    happens on a step boundary and nowhere else."""
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x.py"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+    inject_from_the_tool_call(agent, client, "and the tests")
+
+    await agent.run("read x.py", client=client)
+
+    assert roles_of(m.sent[-1]) == ["system", "user", "assistant", "tool", "user"]
+
+
+async def test_a_line_typed_during_the_final_reply_keeps_the_turn_alive(agent, client, mocker):
+    """That reply carried no tool calls, so the turn was about to end.
+    Ending it would answer a question that had just been added to."""
+    m = replies(mocker, text_reply("I will use SQLite."), text_reply("Switched to Postgres."))
+    inject_after_the_first_reply(agent, mocker, "actually use Postgres")
+
+    result = await agent.run("set up the store", client=client)
+
+    assert result == "Switched to Postgres."
+    assert texts_of(m.sent[-1], "user") == ["set up the store", "actually use Postgres"]
+
+
+async def test_the_interim_reply_is_not_swallowed_when_the_turn_continues(agent, client, mocker):
+    """It was going to be the answer, so nothing had shown it yet. It turns
+    out to be interim, so it has to be shown as interim."""
+    replies(mocker, text_reply("I will use SQLite."), text_reply("Switched."))
+    shown = mocker.patch("omni.ui.assistant_message")
+    inject_after_the_first_reply(agent, mocker, "actually use Postgres")
+
+    await agent.run("set up the store", client=client)
+    assert any("SQLite" in call.args[0] for call in shown.call_args_list)
+
+
+async def test_an_injected_line_is_persisted_so_a_resume_replays_it(agent, client, mocker):
+    """It is part of the conversation now, not a UI flourish."""
+    replies(mocker, tool_reply(("read_file", '{"path": "x.py"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+    inject_from_the_tool_call(agent, client, "and the tests")
+
+    await agent.run("read x.py", client=client)
+
+    stored = agent.store.load_messages(agent.session_id)
+    assert texts_of(stored, "user") == ["read x.py", "and the tests"]
+
+
+async def test_several_injected_lines_are_folded_in_the_order_typed(agent, client, mocker):
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+    inject_from_the_tool_call(agent, client, "first", "second", "third")
+
+    await agent.run("go", client=client)
+    assert texts_of(m.sent[-1], "user") == ["go", "first", "second", "third"]
+
+
+async def test_an_injected_image_travels_with_its_line(agent, client, mocker):
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+
+    async def inject_with_image(*a, **k):
+        agent.inject("what is wrong here", [{"mime": "image/png", "data": b"shot"}])
+        return "contents"
+
+    client.call_tool.side_effect = inject_with_image
+    await agent.run("go", client=client)
+
+    injected = [msg for msg in m.sent[-1] if msg["role"] == "user"][-1]
+    assert isinstance(injected["content"], list)
+    assert any(part.get("type") == "image_url" for part in injected["content"])
+
+
+@pytest.mark.parametrize("nothing", ["", "   ", "\n", None])
+def test_an_empty_line_is_nothing_to_say(agent, nothing):
+    """Not an error — there is simply nothing to hand over."""
+    assert agent.inject(nothing) is False
+    assert agent.inbox_depth == 0
+
+
+def test_inject_reports_that_it_took_the_line(agent):
+    """cli believes only an exact True: a stub agent answers every call with
+    something truthy, and trusting one would lose the line for real."""
+    assert agent.inject("something") is True
+    assert agent.inbox_depth == 1
+
+
+def test_take_inbox_empties_it(agent):
+    agent.inject("one")
+    agent.inject("two")
+    assert [text for text, _ in agent.take_inbox()] == ["one", "two"]
+    assert agent.inbox_depth == 0
+    assert agent.take_inbox() == []
+
+
+async def test_a_line_that_arrived_too_late_is_left_for_the_caller(agent, client, mocker):
+    """Injected after the last boundary, so the turn never saw it. It has to
+    stay recoverable — cli moves it onto the pane's queue."""
+    replies(mocker, text_reply("done"))
+    result = await agent.run("go", client=client)
+    agent.inject("too late")                 # the turn is already over
+    assert result == "done"
+    assert [text for text, _ in agent.take_inbox()] == ["too late"]
+
+
+async def test_the_inbox_does_not_leak_into_the_next_turn(agent, client, mocker):
+    """Whatever a turn absorbed is gone, so turn two must not re-send turn
+    one's interjection."""
+    m = replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("a"),
+                 text_reply("b"))
+    agent.cfg.auto_approve = True
+
+    async def inject_once(*a, **k):
+        agent.inject("mid-turn thing")
+        client.call_tool.side_effect = None
+        client.call_tool.return_value = "contents"
+        return "contents"
+
+    client.call_tool.side_effect = inject_once
+    await agent.run("first", client=client)
+    assert agent.inbox_depth == 0
+
+    await agent.run("second", resume_session_id=agent.session_id, client=client)
+    assert texts_of(m.sent[-1], "user").count("mid-turn thing") == 1
+
+
+async def test_injecting_cannot_run_past_the_step_budget(agent, client, mocker):
+    """An interjection keeps the turn alive, so it must still be bounded —
+    otherwise typing at the wrong moment could loop forever."""
+    agent.cfg.max_steps = 3
+    replies(mocker, text_reply("still talking"))
+
+    real = agent_mod.chat
+
+    async def always_inject(*args, **kwargs):
+        reply = await real(*args, **kwargs)
+        agent.inject("keep going")
+        return reply
+
+    mocker.patch.object(agent_mod, "chat", always_inject)
+    result = await agent.run("go", client=client)
+    assert "Max steps reached" in result
+
+
+async def test_the_transcript_marks_where_the_line_reached_the_model(agent, client, mocker):
+    """Your words were echoed when you sent them; this is the moment they
+    landed, which is what explains the agent changing course."""
+    replies(mocker, tool_reply(("read_file", '{"path": "x"}')), text_reply("done"))
+    agent.cfg.auto_approve = True
+    marked = mocker.patch("omni.ui.injected")
+    inject_from_the_tool_call(agent, client, "and the tests")
+
+    await agent.run("go", client=client)
+    marked.assert_called_once_with("and the tests", images=0)

@@ -964,12 +964,14 @@ def test_copy_hands_the_transcript_to_the_clipboard(mocker, client, cfg):
     assert "Copied 1 line to the clipboard." in rendered
 
 
-# ---------------- the queue behind a busy pane ----------------
+# ---------------- the fallback queue behind a pane ----------------
 #
-# Typing while an agent works is allowed — the input row stays live (see
-# test_tui.py) — so the line has to go somewhere sane. It goes onto that
-# pane's own queue and runs strictly in order, one at a time: never
-# concurrently with the turn already running, and never at another agent.
+# The normal home for a line typed mid-turn is the running agent's inbox
+# (see "routing a line typed mid-turn" below). Pane.pending is what catches
+# the rest — a line typed with no agent to hand it to, and one the turn
+# ended before it could fold in. Those run as turns of their own, and this
+# is the guarantee about how: strictly in order, one at a time, never
+# concurrently with the turn already running and never at another agent.
 
 
 @pytest.fixture
@@ -1192,3 +1194,166 @@ async def test_a_store_that_cannot_answer_does_not_break_the_turns_tail(tui_app,
                                       tui=tui_app, session_name=None)
     assert result == "done"
     assert title.call_args.args[0] == "sid"
+
+
+# ---------------- routing a line typed mid-turn ----------------
+#
+# A line typed while an agent works goes to the agent running that turn, so
+# the model acts on it during the turn. Only what no turn could take — no
+# agent yet, or a turn that ended before the fold-in came round — falls back
+# to running as a turn of its own.
+
+
+class _Inbox:
+    """A stand-in agent with the inbox contract _start_turn relies on."""
+
+    def __init__(self, accepts=True, raises=False):
+        self.taken = []
+        self.accepts = accepts
+        self.raises = raises
+
+    def inject(self, text, attachments=None):
+        if self.raises:
+            raise RuntimeError("the turn just tore down")
+        if not self.accepts:
+            return False
+        self.taken.append((text, list(attachments or [])))
+        return True
+
+    @property
+    def inbox_depth(self):
+        return len(self.taken)
+
+    def take_inbox(self):
+        left, self.taken = self.taken, []
+        return left
+
+
+def test_a_line_typed_at_a_working_agent_is_handed_to_it(tui_app):
+    pane = tui_app.main
+    pane.agent = _Inbox()
+    assert cli_mod._inject(pane, "also check the tests", []) is True
+    assert pane.agent.taken == [("also check the tests", [])]
+
+
+def test_a_pane_with_no_agent_takes_nothing(tui_app):
+    tui_app.main.agent = None
+    assert cli_mod._inject(tui_app.main, "hello", []) is False
+
+
+def test_an_agent_that_predates_the_inbox_takes_nothing(tui_app, mocker):
+    """An older stub has no inject at all; the line must fall back rather
+    than raise into the REPL."""
+    tui_app.main.agent = object()
+    assert cli_mod._inject(tui_app.main, "hello", []) is False
+
+
+def test_an_agent_that_refuses_is_believed(tui_app):
+    tui_app.main.agent = _Inbox(accepts=False)
+    assert cli_mod._inject(tui_app.main, "hello", []) is False
+
+
+def test_an_agent_that_raises_does_not_take_the_repl_down(tui_app):
+    """A turn tearing down mid-handover is not a reason to lose the line —
+    the caller parks it instead."""
+    tui_app.main.agent = _Inbox(raises=True)
+    assert cli_mod._inject(tui_app.main, "hello", []) is False
+
+
+def test_only_an_exact_true_counts_as_taken(tui_app, mocker):
+    """A Mock answers every call with something truthy. Believing one would
+    drop the line on the floor, which is the one outcome not allowed."""
+    tui_app.main.agent = mocker.Mock()
+    assert cli_mod._inject(tui_app.main, "hello", []) is False
+
+
+def test_taking_the_inbox_empties_it(tui_app):
+    pane = tui_app.main
+    pane.agent = _Inbox()
+    pane.agent.inject("one")
+    pane.agent.inject("two")
+    assert [text for text, _ in cli_mod._take_inbox(pane)] == ["one", "two"]
+    assert cli_mod._take_inbox(pane) == []
+
+
+@pytest.mark.parametrize("agent", [None, object(), "not an agent"])
+def test_taking_from_something_that_is_not_an_agent_is_empty(tui_app, agent):
+    tui_app.main.agent = agent
+    assert cli_mod._take_inbox(tui_app.main) == []
+
+
+def test_taking_from_a_stub_that_answers_oddly_is_empty(tui_app, mocker):
+    """This runs in a turn's `finally`: a stub whose answer is not iterable
+    must not turn a finished turn into an exception."""
+    tui_app.main.agent = mocker.Mock()          # take_inbox() -> a Mock
+    assert cli_mod._take_inbox(tui_app.main) == []
+
+
+async def test_what_the_turn_never_read_is_moved_to_the_panes_queue(tui_app, mocker, cfg):
+    """Typed on the turn's last step, so it arrived too late to be folded in.
+    Late is recoverable; silently dropped is not."""
+    inbox = _Inbox()
+    agent = mocker.Mock(session_id="s", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    agent.inject = inbox.inject
+    agent.take_inbox = inbox.take_inbox
+    agent.inbox_depth = 0
+    pane = tui_app.add_pane("worker", agent=agent, depth=1)
+    inbox.inject("arrived too late")
+
+    await cli_mod._run_turn(pane, "go", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+
+    assert [text for text, _ in pane.pending] == ["arrived too late"]
+
+
+async def test_a_late_line_goes_in_front_of_anything_already_parked(tui_app, mocker, cfg):
+    """It was typed before whatever is already sitting on the queue."""
+    inbox = _Inbox()
+    agent = mocker.Mock(session_id="s", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    agent.inject = inbox.inject
+    agent.take_inbox = inbox.take_inbox
+    agent.inbox_depth = 0
+    pane = tui_app.add_pane("worker", agent=agent, depth=1)
+    pane.pending.append(("parked later", []))
+    inbox.inject("typed earlier")
+
+    await cli_mod._run_turn(pane, "go", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+
+    assert [text for text, _ in pane.pending] == ["typed earlier", "parked later"]
+
+
+async def test_a_turn_with_nothing_outstanding_leaves_the_queue_alone(tui_app, mocker, cfg):
+    agent = mocker.Mock(session_id="s", tokens={"prompt": 0, "completion": 0})
+    agent.run = mocker.AsyncMock(return_value="done")
+    agent.take_inbox = lambda: []
+    pane = tui_app.add_pane("worker", agent=agent, depth=1)
+
+    await cli_mod._run_turn(pane, "go", cfg=cfg, client=mocker.Mock(),
+                             tui=tui_app, session_name=None)
+    assert pane.pending == []
+
+
+def test_each_agent_is_handed_only_what_was_typed_at_it(tui_app):
+    """Multi-agent: the inbox is the agent's, so a line typed at a working
+    subagent joins that subagent's turn and nobody else's."""
+    main, sub = tui_app.main, tui_app.add_pane("audit", depth=1)
+    main.agent, sub.agent = _Inbox(), _Inbox()
+
+    cli_mod._inject(main, "main thing", [])
+    cli_mod._inject(sub, "sub thing", [])
+    cli_mod._inject(sub, "another sub thing", [])
+
+    assert [t for t, _ in main.agent.taken] == ["main thing"]
+    assert [t for t, _ in sub.agent.taken] == ["sub thing", "another sub thing"]
+    assert main.waiting == 1 and sub.waiting == 2
+
+
+def test_images_travel_with_the_line_that_was_typed_with_them(tui_app):
+    pane = tui_app.main
+    pane.agent = _Inbox()
+    shot = [{"mime": "image/png", "data": b"x"}]
+    cli_mod._inject(pane, "what is wrong here", shot)
+    assert pane.agent.taken == [("what is wrong here", shot)]

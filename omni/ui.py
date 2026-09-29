@@ -1874,6 +1874,35 @@ def instruction(text: str, images: int = 0):
                             style="dim"))
 
 
+def injected(text: str, images: int = 0):
+    """A line typed mid-turn, at the point the running turn folded it into
+    the conversation.
+
+    Your line was already echoed when you sent it (`instruction`), so this is
+    not the line again — it is the moment it reached the model, which is the
+    part you were waiting for and the only thing that explains why the agent
+    changes course two steps later. Placed in the transcript between the step
+    that was running and the step that acts on it, so reading downwards gives
+    the real order of events.
+
+    Deliberately quiet: the words are already above, so this is a marker, not
+    a second copy competing with them."""
+    console.print()
+    line = Text("  ↳ ", style=f"bold {ACCENT}")
+    line.append("sent to the model mid-turn: ", style=_FRAME_HINT)
+    line.append(_one_line(text, 60), style="dim")
+    if images:
+        line.append(f"  (+{images} image{'s' if images != 1 else ''})", style=_FRAME_HINT)
+    console.print(line)
+
+
+def _one_line(text: str, width: int) -> str:
+    """Whitespace collapsed and clipped — this is a reference to something
+    printed in full above, so it only has to be recognisable."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= width else flat[:width - 1] + "…"
+
+
 def recommended_index(recommended, options: list):
     """The row a `recommended` answer points at, as a 0-based index, or None.
 
@@ -2092,7 +2121,7 @@ for _name in (
     "reasoning_full", "call_detail", "assistant_message", "final_result",
     "sessions_table", "resources_table", "resource_content",
     "server_tools_table", "mcp_status", "model_switched", "interrupted",
-    "compacted", "btw_answer", "instruction", "note", "warning", "error",
+    "compacted", "btw_answer", "instruction", "injected", "note", "warning", "error",
     "subagent_summary",
 ):
     globals()[_name] = _as_block(globals()[_name])

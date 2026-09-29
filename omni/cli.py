@@ -647,10 +647,17 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
             if attachments is None:
                 attachments, pane.attachments = pane.attachments, []
             if pane.task is not None and not pane.task.done():
+                # The turn is still going, so hand the line to the agent
+                # running it: it joins the conversation at that turn's next
+                # step and is acted on now, rather than waiting for a turn of
+                # its own. Per pane, so a line typed at a subagent reaches
+                # that subagent's turn and nobody else's.
+                if _inject(pane, text, attachments):
+                    _echo(f"sent to {pane.name!r} — the model picks it up at its next step")
+                    return
+                # Nothing took it (no agent on this pane yet): park it, and it
+                # runs as its own turn once the current one is done.
                 pane.pending.append((text, attachments))
-                # Says where in the line it landed, not just that it did:
-                # typing while busy is now the ordinary way to reach this
-                # queue, so "it went somewhere" is not enough feedback.
                 _echo(f"queued #{len(pane.pending)} — runs in order "
                        f"once {pane.name!r} finishes")
                 return
@@ -1063,6 +1070,14 @@ async def _run_turn(pane, task: str, *, cfg, client, tui, session_name, on_finis
         return result
     finally:
         pane.task = None
+        # A line typed while the turn was on its last step arrives too late
+        # for it — the loop finished before the next boundary came round. Move
+        # whatever is left to the front of this pane's queue so it runs as its
+        # own turn: late is recoverable, silently dropped is not. In front,
+        # because it was typed before anything already parked behind it.
+        leftover = _take_inbox(pane)
+        if leftover:
+            pane.pending[:0] = leftover
         if previous_sigint is not None:
             signal.signal(signal.SIGINT, previous_sigint)
         if token is not None:
@@ -1202,6 +1217,42 @@ async def _handle_btw(cfg: AgentConfig, question: str):
         ui.btw_answer(question, answer)
     except ImportError:
         _echo(f"\n[/btw] Q: {question}\nA: {answer}\n")
+
+
+def _inject(pane, text: str, attachments: list) -> bool:
+    """Hand `text` to the turn running at `pane`, and say whether it landed.
+
+    False means "no turn took it" — no agent yet, an agent that predates the
+    inbox, or a refusal — and the caller then parks the line so it runs as a
+    turn of its own. Only an exact True counts: a stub agent answers every
+    call with something truthy, and quietly believing one would lose the line
+    for real.
+    """
+    inject = getattr(getattr(pane, "agent", None), "inject", None)
+    if inject is None:
+        return False
+    try:
+        return inject(text, attachments) is True
+    except Exception:
+        # A turn that has just torn down, or a stub. The line is not lost: the
+        # caller parks it on the pane's queue instead.
+        return False
+
+
+def _take_inbox(pane) -> list:
+    """Whatever this pane's agent never folded in, emptied out of it.
+
+    Tolerant of an agent with no inbox — a stub in a test, a _PlainPane's None
+    — because this runs in a turn's `finally` and must not turn a finished
+    turn into an exception. The conversion is inside the `try` for the same
+    reason: a stub's answer is not a list, and iterating it raises."""
+    taker = getattr(getattr(pane, "agent", None), "take_inbox", None)
+    if taker is None:
+        return []
+    try:
+        return [item for item in (taker() or ())]
+    except Exception:
+        return []
 
 
 def _display_name(agent, session_id: str) -> str:

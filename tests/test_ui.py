@@ -698,6 +698,30 @@ def test_your_line_gets_air_above_it(cap):
     assert cap.getvalue().startswith("\n")
 
 
+def test_the_injection_marker_says_the_line_reached_the_model(cap):
+    """Your words were already echoed when you sent them, so this is the
+    moment they landed — the thing that explains the agent changing course
+    two steps later."""
+    ui.injected("also check the tests")
+    out = " ".join(cap.getvalue().split())
+    assert "↳ sent to the model mid-turn: also check the tests" in out
+
+
+def test_the_injection_marker_clips_a_long_line(cap):
+    """It is a reference to something printed in full above, so it only has
+    to be recognisable."""
+    ui.injected("x" * 200)
+    line = " ".join(cap.getvalue().split())
+    assert "…" in line and len(line) < 120
+
+
+def test_the_injection_marker_counts_images_that_went_with_it(cap):
+    ui.injected("look at this", images=1)
+    assert "(+1 image)" in " ".join(cap.getvalue().split())
+    ui.injected("and these", images=3)
+    assert "(+3 images)" in " ".join(cap.getvalue().split())
+
+
 def test_attached_images_are_counted_under_the_line(cap):
     ui.instruction("describe [Image #1]", images=1)
     assert "1 image attached" in " ".join(cap.getvalue().split())

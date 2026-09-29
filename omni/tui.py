@@ -284,7 +284,11 @@ class Pane:
         self.error = ""
 
         self.task = None              # the turn running now, if any
-        self.pending: list = []       # (text, attachments) typed while busy
+        # (text, attachments) typed here that will run as a turn of their own
+        # — only what arrived too late for the turn in flight to fold in, or
+        # what was typed with no agent to hand it to. The normal path for a
+        # line typed mid-turn is the agent's own inbox; see Pane.waiting.
+        self.pending: list = []
         # Images pasted at this pane, waiting for the prompt they belong to.
         # Each is {"mime": str, "data": bytes}; the nth is what "[Image #n]"
         # in the typed line refers to.
@@ -313,6 +317,26 @@ class Pane:
     @property
     def needs_you(self) -> bool:
         return self.approval is not None or self.ask is not None
+
+    @property
+    def waiting(self) -> int:
+        """Lines typed at this agent that it hasn't taken up yet.
+
+        Both routes counted as one number, because the distinction is not
+        something you should have to hold in your head while reading a frame:
+        what is waiting to be folded into the turn in flight (the agent's
+        inbox) and what arrived too late and will run on its own
+        (Pane.pending). Either way it is something you said that hasn't been
+        answered.
+
+        `agent` is whatever a caller put there, so the depth is only believed
+        when it is really a count. This is read on every repaint: a frame that
+        raises because an agent answered oddly takes the whole screen down,
+        and no number on it is worth that."""
+        depth = getattr(self.agent, "inbox_depth", 0)
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+            depth = 0
+        return len(self.pending) + depth
 
 
 # The pane a turn's output belongs to. A ContextVar rather than an attribute
@@ -490,12 +514,12 @@ class TuiApp:
                 note = f"  {pane.error}"[:40]
             elif pane.unseen:
                 note = "  new output"
-            if pane.pending:
-                # Lines typed at this agent while it works, waiting their
-                # turn. Shown here because the queue is per agent: without it,
-                # walking away from a busy subagent you have just queued two
-                # follow-ups at leaves no sign anywhere that they exist.
-                note += f"  +{len(pane.pending)} queued"
+            if pane.waiting:
+                # Lines typed at this agent that it hasn't taken up. Shown
+                # here because this is per agent: without it, walking away
+                # from a busy subagent you have just said two things to leaves
+                # no sign anywhere that they are outstanding.
+                note += f"  +{pane.waiting} waiting"
 
             def handler(event, target=index):
                 if event.event_type == MouseEventType.MOUSE_UP:
@@ -629,12 +653,12 @@ class TuiApp:
             words = [("class:frame.label.attention", label)]
         else:
             words = _ui.shimmer_fragments(label)
-        if pane.pending:
-            # What you have already typed at this agent and it hasn't reached
+        if pane.waiting:
+            # What you have already typed at this agent and it hasn't taken up
             # yet. On the status line rather than only in the tree, because
-            # this is the pane you are looking at and the queue is the reason
-            # the line you just sent produced no visible turn.
-            detail += f" · {len(pane.pending)} queued"
+            # this is the pane you are looking at, and it is the reason the
+            # line you just sent has produced nothing visible so far.
+            detail += f" · {pane.waiting} waiting"
         return ([("class:frame.spinner", f"{glyph} ")] + words
                  + [("class:frame.hint", f"  ({detail})")])
 
@@ -1204,6 +1228,6 @@ _HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  ctrl+s sele
 # The frame's own busy hint. It differs from ui._HINT_BUSY in the one thing
 # only a full-screen session can offer: there is a live input row under this,
 # and a line sent at it waits its turn instead of being refused.
-_HINT_BUSY = "working…  ·  ⏎ queues what's next  ·  ctrl+c interrupts the turn"
+_HINT_BUSY = "working…  ·  ⏎ sends it to this turn  ·  ctrl+c interrupts the turn"
 _HINT_SELECTING = ("selecting: drag to select, then copy as usual  ·  "
                     "ctrl+s back  ·  /copy takes the whole transcript")
