@@ -284,28 +284,50 @@ _DIFF_DEL_SIGN = "#f85149"
 _DIFF_GUTTER = "#6e7681"
 _DIFF_FOLD = "#545d68"
 
-# Extension -> pygments lexer. Only what a coding agent actually edits; an
-# unknown extension highlights as nothing rather than guessing wrong, which
-# reads worse than plain text.
-_DIFF_LEXERS = {
-    ".py": "python", ".pyi": "python", ".js": "javascript", ".mjs": "javascript",
-    ".jsx": "jsx", ".ts": "typescript", ".tsx": "tsx", ".json": "json",
-    ".toml": "toml", ".yaml": "yaml", ".yml": "yaml", ".md": "markdown",
-    ".sh": "bash", ".bash": "bash", ".zsh": "bash", ".ps1": "powershell",
-    ".html": "html", ".css": "css", ".scss": "scss", ".sql": "sql",
-    ".rs": "rust", ".go": "go", ".java": "java", ".rb": "ruby", ".php": "php",
-    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cs": "csharp",
-    ".swift": "swift", ".kt": "kotlin", ".xml": "xml", ".ini": "ini", ".cfg": "ini",
+# Pygments already knows what every extension is written in, so the lexer is
+# looked up there rather than kept in a list here. A hand-written map is
+# always a list of the languages somebody happened to think of — .vb was
+# missing from ours, and a 2000-line VB file edited in the middle is exactly
+# where losing the highlighting hurts most.
+#
+# These few override it. "text" and the data formats are mapped to nothing on
+# purpose: prose or a CSV tinted like source code reads worse than leaving it
+# alone, and pygments will happily claim .txt.
+_LEXER_OVERRIDES = {"text": None, "csv": None, "tsv": None, "output": None}
+
+# The handful pygments has no lexer for at all. Each is a real language
+# somebody edits, and each is close enough to markup that html reads well.
+_LEXER_BY_EXTENSION = {
+    ".cshtml": "html", ".razor": "html", ".svelte": "html", ".astro": "html",
 }
 _HIGHLIGHTERS = {}
+_LEXER_CACHE = {}
 
 
 def _diff_lexer(path: str):
-    """The lexer for `path`, or None to leave the code unhighlighted."""
-    name = _DIFF_LEXERS.get(os.path.splitext(str(path or ""))[1].lower())
-    if name is None:
-        name = {"dockerfile": "docker", "makefile": "make"}.get(
-            os.path.basename(str(path or "")).lower())
+    """The lexer for `path`, or None to leave the code unhighlighted.
+
+    Pygments is asked by filename, so every language it ships with is covered
+    and a compound name resolves the way it should — AfterSaleSupport.aspx.vb
+    is VB, Dockerfile and Makefile have no extension to go on at all. Cached
+    per path because a diff asks once per line.
+
+    Anything pygments does not recognise highlights as nothing, which reads
+    better than a wrong guess."""
+    text = str(path or "")
+    if text in _LEXER_CACHE:
+        return _LEXER_CACHE[text]
+    name = None
+    if text:
+        try:
+            from pygments.lexers import get_lexer_for_filename
+            name = get_lexer_for_filename(os.path.basename(text)).aliases[0]
+        except Exception:
+            name = None                       # unknown, or pygments unavailable
+        name = _LEXER_OVERRIDES.get(name, name)
+        if name is None:
+            name = _LEXER_BY_EXTENSION.get(os.path.splitext(text)[1].lower())
+    _LEXER_CACHE[text] = name
     return name
 
 
@@ -329,27 +351,46 @@ def _highlight(code: str, lexer: str) -> Text:
         return Text(code)
 
 
-def _diff_row(number, sign: str, code: Text, width: int, background: str,
-               sign_colour: str) -> Text:
-    """One line of a diff: the number, the sign, the code, and the band behind
-    all three.
+_DIFF_GUTTER_WIDTH = 8        # "%5s " plus the sign and its space
 
-    The band runs the full width rather than stopping where the text does: a
-    ragged right edge turns a block of changes into a staircase, and the shape
-    of the block is most of what tells you where a change begins and ends."""
-    row = Text(style=("on " + background) if background else "")
-    row.append(("%5s " % number) if number else "      ", style=_DIFF_GUTTER)
-    row.append((sign + " ") if sign else "  ",
-                style=("bold " + sign_colour) if sign else "")
-    row.append_text(code)
-    # Cropped, never wrapped. A wrapped line breaks the band across two rows
-    # and pushes everything below it out of step with its own line number,
-    # which costs more than the tail of one long line is worth — /expand
-    # reprints the call whole when that tail matters.
-    row.truncate(width, overflow="ellipsis")
-    if row.cell_len < width:
-        row.pad_right(width - row.cell_len)
-    return row
+
+def _diff_rows(number, sign: str, code: Text, width: int, background: str,
+                sign_colour: str) -> list:
+    """One line of a diff as the rows it occupies: number, sign, code, and
+    the band behind all three.
+
+    Wrapped, not cropped. A truncated line is the one thing a reviewer cannot
+    work around — you cannot tell whether the tail you were not shown is the
+    important half — and an edit to a long file is exactly where the long
+    lines live. Continuations keep the band and the indent but leave the
+    gutter blank, so the numbers stay a clean column and one source line still
+    reads as one item.
+
+    The band runs the full width on every row: a ragged right edge turns a
+    block of changes into a staircase, and the block's shape is most of what
+    shows where a change begins and ends."""
+    style = ("on " + background) if background else ""
+    room = max(width - _DIFF_GUTTER_WIDTH, 20)
+    # Text.wrap keeps the syntax spans across the split and measures in cells,
+    # which slicing by character would not.
+    # no_wrap=False explicitly: Syntax.highlight() hands back a Text with
+    # no_wrap set, and wrap() then crops to one line instead of folding —
+    # which is exactly the truncation this is here to stop.
+    chunks = list(code.wrap(console, room, overflow="fold", no_wrap=False)) or [Text("")]
+    rows = []
+    for index, chunk in enumerate(chunks):
+        row = Text(style=style)
+        if index == 0:
+            row.append(("%5s " % number) if number else "      ", style=_DIFF_GUTTER)
+            row.append((sign + " ") if sign else "  ",
+                        style=("bold " + sign_colour) if sign else "")
+        else:
+            row.append(" " * _DIFF_GUTTER_WIDTH)
+        row.append_text(chunk)
+        if row.cell_len < width:
+            row.pad_right(width - row.cell_len)
+        rows.append(row)
+    return rows
 
 
 def _render_diff(diff_text: str, path: str = "", width: int = None) -> Text:
@@ -372,24 +413,25 @@ def _render_diff(diff_text: str, path: str = "", width: int = None) -> Text:
             body.append("   ...\n" if seen else "", style=_DIFF_FOLD)
             continue
         if line.startswith("-"):
-            row = _diff_row(old_no, "-", _highlight(line[1:], lexer), width,
-                             _DIFF_DEL_BG, _DIFF_DEL_SIGN)
+            rows = _diff_rows(old_no, "-", _highlight(line[1:], lexer), width,
+                               _DIFF_DEL_BG, _DIFF_DEL_SIGN)
             if old_no is not None:
                 old_no += 1
         elif line.startswith("+"):
-            row = _diff_row(new_no, "+", _highlight(line[1:], lexer), width,
-                             _DIFF_ADD_BG, _DIFF_ADD_SIGN)
+            rows = _diff_rows(new_no, "+", _highlight(line[1:], lexer), width,
+                               _DIFF_ADD_BG, _DIFF_ADD_SIGN)
             if new_no is not None:
                 new_no += 1
         else:
-            row = _diff_row(new_no, "", _highlight(line[1:] if line else "", lexer),
-                             width, "", "")
+            rows = _diff_rows(new_no, "", _highlight(line[1:] if line else "", lexer),
+                               width, "", "")
             if old_no is not None:
                 old_no += 1
             if new_no is not None:
                 new_no += 1
-        body.append_text(row)
-        body.append("\n")
+        for row in rows:
+            body.append_text(row)
+            body.append("\n")
         seen = True
     if body.plain.endswith("\n"):
         body.right_crop(1)
@@ -407,9 +449,17 @@ def _diff_header(path: str, added: int, removed: int, label: str) -> Text:
         "new": ("Created", _DIFF_ADD_SIGN),
         "delete": ("Deleted", _DIFF_DEL_SIGN),
     }.get(label, ("Updated", ACCENT))
-    line = Text()
+    line = Text(no_wrap=True, overflow="crop")
     line.append("  " + verb + " ", style="bold " + colour)
-    line.append(str(path or "(unnamed)"), style="bold")
+    # An absolute Windows path is long enough to wrap the header on its own,
+    # which puts the counts on a line of their own and breaks the block's top
+    # edge. Shortened from the left when it has to be: the tail is the part
+    # that identifies the file.
+    shown = str(path or "(unnamed)")
+    room = max(_panel_width() - len(verb) - 16, 24)
+    if len(shown) > room:
+        shown = "…" + shown[-(room - 1):]
+    line.append(shown, style="bold")
     line.append(" (", style=_DIFF_GUTTER)
     line.append("+%d" % added, style=_DIFF_ADD_SIGN)
     line.append(" ", style=_DIFF_GUTTER)

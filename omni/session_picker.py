@@ -50,6 +50,7 @@ RESERVED_KEYS = frozenset({
     "c-b",                                    # paste an image (Windows Terminal eats c-v)
     "c-s",                                    # selection mode, for the terminal's own copy
     "c-up", "c-down", "c-left", "c-right",    # walk the agent tree
+    "c-end",                                  # jump the transcript to the bottom
 })
 
 

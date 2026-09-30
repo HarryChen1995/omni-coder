@@ -269,12 +269,19 @@ happened are told apart by their content, not their formatting:
   472 +         new line
 ```
 
-A full-width band behind every changed line, a line-number gutter, and the
-file's own **syntax highlighting inside** — the code still looks like code,
+Lines are **wrapped, never truncated** — continuations keep the band and the
+indent but leave the gutter blank, so one source line still reads as one item
+and the numbers stay a clean column. A full-width band behind every changed
+line, a line-number gutter, and the file's own **syntax highlighting inside** — the code still looks like code,
 which is what a plain red/green diff throws away. The verb says what happened
 (`Created` green, `Updated`, `Deleted` red) and `... +403 lines` says how much
 of the file sits above, because a diff opening at line 404 otherwise looks
 like a file that starts there.
+
+The language comes from pygments' own filename lookup rather than a list kept
+here, so every language it ships with is covered and a compound name resolves
+the way it should — `AfterSaleSupport.aspx.vb` is VB, `Dockerfile` has no
+extension to go on at all. Plain text and CSV are left untinted on purpose.
 
 The `@@ -404,5 +404,7 @@` hunk headers are replaced by a dim `...`: they are
 addressed to `patch`, not to a person, and their line numbers are already down
@@ -867,6 +874,22 @@ region an application draws — so expanding something in place means drawing
 the transcript ourselves. It costs the terminal's own scrollback while the
 session runs, so the transcript is written out on exit, in whatever
 open/closed state you left it, rather than vanishing with the app.
+
+**Scrolling back doesn't fight you.** Output used to snap the view to the
+bottom the moment anything was appended, so you couldn't read what an agent
+did three steps ago while it was still working — which is exactly when you
+want to. At the bottom the transcript still follows along; scrolled up it
+stays put, and a chip above the frame says what is waiting:
+
+```
+ ↓  New 3 messages  ·  ctrl+End
+```
+
+With nothing new it reads `↓  Jump to bottom  ·  ctrl+End` instead. Either way
+**ctrl+End** (or a click on the chip) goes back, and the chip disappears once
+you are there — an indicator pointing at where you already are is one more
+thing on screen that never changes. Each agent keeps its own scroll position,
+so reading back through one is not undone by another producing output.
 
 The terminal window/tab is named after the session, so several sessions side
 by side are tellable apart: `--session-name` if you gave one, otherwise the id

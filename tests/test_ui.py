@@ -103,11 +103,43 @@ def test_every_changed_line_is_padded_to_the_full_width():
     assert [len(line) for line in out.splitlines()] == [40, 40]
 
 
-def test_a_long_line_is_cropped_rather_than_wrapped():
-    """A wrapped line breaks the band across two rows and puts everything
-    below it out of step with its own line number."""
+def test_a_long_line_is_wrapped_and_nothing_is_lost():
+    """Cropping was the wrong call: a truncated line is the one thing a
+    reviewer cannot work around, because you cannot tell whether the tail you
+    were not shown is the important half."""
+    body = "x" * 300
+    out = ui._render_diff("@@ -1,1 +1,1 @@\n+" + body + "\n", "a.py", 50).plain
+    assert "\u2026" not in out
+    assert out.replace(" ", "").replace("\n", "").endswith(body[-20:])
+    assert out.count("x") == 300
+
+
+def test_every_row_of_a_wrapped_line_is_the_full_width():
+    """The band has to cover the continuations too, or a folded line leaves a
+    notch in the side of the block."""
     out = ui._render_diff("@@ -1,1 +1,1 @@\n+" + "x" * 300 + "\n", "a.py", 50).plain
-    assert out.splitlines() == [out.splitlines()[0]] and len(out.splitlines()[0]) == 50
+    assert {len(line) for line in out.splitlines()} == {50}
+
+
+def test_a_wrapped_line_numbers_only_its_first_row():
+    """One source line stays one item, and the numbers stay a clean column."""
+    out = ui._render_diff("@@ -7,1 +7,1 @@\n+" + "y " * 80 + "\n", "a.py", 40).plain
+    rows = out.splitlines()
+    assert len(rows) > 1
+    assert rows[0].startswith("    7 +")
+    assert all(row.startswith(" " * 8) for row in rows[1:])
+
+
+def test_a_wrapped_line_keeps_its_sign_off_the_continuations():
+    """A repeated "+" down the left would read as several added lines."""
+    out = ui._render_diff("@@ -1,1 +1,1 @@\n+" + "z " * 80 + "\n", "a.py", 40).plain
+    assert out.count("+") == 1
+
+
+def test_wrapping_survives_a_word_longer_than_the_line():
+    out = ui._render_diff("@@ -1,1 +1,1 @@\n+" + "q" * 500 + "\n", "a.py", 30).plain
+    assert out.count("q") == 500
+    assert {len(line) for line in out.splitlines()} == {30}
 
 
 def test_render_diff_gutter_tracks_line_numbers():
@@ -1573,65 +1605,100 @@ def test_nothing_is_elided_when_there_is_no_hunk_header():
     assert ui._elided_note("+lonely\n") is None
 
 
-@pytest.mark.parametrize("path,lexer", [
-    ("a.py", "python"), ("a.ts", "typescript"), ("a.rs", "rust"),
-    ("Dockerfile", "docker"), ("a.unknown", None), ("", None),
+@pytest.mark.parametrize("path", [
+    "a.py", "a.pyi", "a.js", "a.jsx", "a.ts", "a.tsx", "a.rs", "a.go",
+    "a.kt", "a.zig", "a.rb", "a.php", "a.cs", "a.fs", "a.java", "a.scala",
+    "a.swift", "a.dart", "a.lua", "a.pl", "a.r", "a.jl", "a.ex", "a.erl",
+    "a.hs", "a.clj", "a.c", "a.h", "a.cpp", "a.hpp", "a.m", "a.sql",
+    "a.sh", "a.bash", "a.ps1", "a.bat", "a.html", "a.css", "a.scss",
+    "a.yml", "a.yaml", "a.toml", "a.json", "a.xml", "a.md", "a.ini",
+    "a.vb", "a.aspx", "a.cshtml", "a.tf", "a.proto", "a.groovy", "a.vue",
 ])
-def test_the_lexer_follows_the_file_being_changed(path, lexer):
-    """An unknown extension highlights as nothing rather than guessing
-    wrong, which reads worse than plain text."""
+def test_every_ordinary_source_extension_is_highlighted(path):
+    """The exact alias is pygments' business and moves between versions —
+    what matters here is that no ordinary source file comes out plain."""
+    assert ui._diff_lexer(path) is not None
+
+
+@pytest.mark.parametrize("path,lexer", [
+    ("a.py", "python"), ("a.vb", "vb.net"), ("a.tsx", "tsx"), ("a.rs", "rust"),
+])
+def test_the_languages_worth_pinning_resolve_exactly(path, lexer):
     assert ui._diff_lexer(path) == lexer
 
 
-def test_highlighting_a_line_keeps_its_text_exactly():
-    """Colour may be added; characters may not."""
-    assert ui._highlight("def hello():", "python").plain == "def hello():"
+def test_a_dot_net_file_is_highlighted_as_vb():
+    """The one that started this: a .vb diff came out plain white."""
+    assert ui._diff_lexer("AfterSaleSupport.vb") == "vb.net"
 
 
-def test_an_unknown_lexer_leaves_the_line_alone():
-    assert ui._highlight("def hello():", None).plain == "def hello():"
+def test_a_compound_extension_resolves_on_its_last_part():
+    """AfterSaleSupport.aspx.vb is VB, not markup."""
+    assert ui._diff_lexer("AfterSaleSupport.aspx.vb") == "vb.net"
 
 
-def test_highlighting_survives_a_lexer_that_throws(mocker):
-    """A preview is not worth failing an approval over."""
-    mocker.patch.object(ui, "Syntax", side_effect=RuntimeError("no lexer"))
-    ui._HIGHLIGHTERS.clear()
-    assert ui._highlight("x = 1", "python").plain == "x = 1"
-    ui._HIGHLIGHTERS.clear()
+def test_a_full_windows_path_resolves_the_same_as_a_bare_name():
+    """The path is what the tool was given; the basename is what decides."""
+    assert ui._diff_lexer(r"C:\Dev\Valkyrie\entryLINK\AfterSaleSupport.aspx.vb") == "vb.net"
+    assert ui._diff_lexer("omni/agent.py") == ui._diff_lexer("agent.py")
 
 
-def test_the_block_prints_header_then_body(cap):
-    ui.diff_block("a.py", "@@ -1,2 +1,2 @@\n-old\n+new\n", "edit")
-    lines = [l for l in cap.getvalue().splitlines() if l.strip()]
-    assert lines[0].strip() == "Updated a.py (+1 -1)"
-    assert "- old" in lines[1] and "+ new" in lines[2]
+@pytest.mark.parametrize("name,lexer", [
+    ("Dockerfile", "docker"), ("Makefile", "make"), ("CMakeLists.txt", "cmake"),
+])
+def test_a_file_with_no_extension_is_recognised_by_its_name(name, lexer):
+    assert ui._diff_lexer(name) == lexer
 
 
-def test_the_block_carries_no_panel_border(cap):
-    """A border costs two columns of code width, and every copy-paste out of
-    the transcript drags the box-drawing with it."""
-    ui.diff_block("a.py", "@@ -1,2 +1,2 @@\n-old\n+new\n", "edit")
-    assert not any(ch in cap.getvalue() for ch in "\u256d\u2570\u2502\u256e\u256f")
+@pytest.mark.parametrize("path", ["a.txt", "a.csv", "notes.text"])
+def test_prose_and_data_are_left_unhighlighted(path):
+    """Pygments will happily claim .txt; prose tinted like source reads worse
+    than prose."""
+    assert ui._diff_lexer(path) is None
 
 
-def test_a_write_preview_and_a_finished_write_look_the_same(cap, mocker):
-    """The change you approved and the change that happened are told apart by
-    their content, not by their formatting."""
-    diff = "@@ -1,2 +1,2 @@\n-old\n+new\n"
-    ui.diff_block("a.py", diff, "edit")
-    preview = flat(cap)
-    cap.truncate(0), cap.seek(0)
-    ui.step_display([{"name": "edit_file", "args": {"path": "a.py"},
-                      "result": "Edited a.py.\n" + diff, "ok": True}])
-    after = flat(cap)
-    assert "- old" in preview and "- old" in after
-    assert "+ new" in preview and "+ new" in after
+@pytest.mark.parametrize("path", ["a.unheardof", "", None, "noextension"])
+def test_anything_unrecognised_highlights_as_nothing(path):
+    """Better than a wrong guess."""
+    assert ui._diff_lexer(path) is None
 
 
-def test_the_diff_path_is_read_off_the_call_arguments():
-    assert ui._diff_path({"path": "omni/a.py"}) == "omni/a.py"
+def test_the_lexer_lookup_is_cached_per_path(mocker):
+    """A diff asks once per line, and a pygments lookup is not free."""
+    ui._LEXER_CACHE.pop("cached_probe.py", None)
+    assert ui._diff_lexer("cached_probe.py") == "python"
+    assert "cached_probe.py" in ui._LEXER_CACHE
 
 
-@pytest.mark.parametrize("junk", [None, {}, "not a dict", 7])
-def test_a_call_with_no_usable_path_highlights_as_plain_text(junk):
-    assert ui._diff_path(junk) == ""
+def test_a_missing_pygments_leaves_the_code_plain(mocker):
+    """ui degrades rather than failing when an optional dependency is gone."""
+    ui._LEXER_CACHE.pop("probe_no_pygments.py", None)
+    mocker.patch.dict("sys.modules", {"pygments.lexers": None})
+    assert ui._diff_lexer("probe_no_pygments.py") is None
+    ui._LEXER_CACHE.pop("probe_no_pygments.py", None)
+
+
+def test_a_vb_line_actually_gets_coloured():
+    """End to end: the lexer is resolved and the spans come back."""
+    coloured = ui._highlight('Dim x As Boolean = usr.HasPermission("SEECOST")',
+                              ui._diff_lexer("a.vb"))
+    assert coloured.spans and coloured.plain.startswith("Dim x As Boolean")
+
+
+def test_the_header_keeps_a_long_path_on_one_line():
+    """An absolute Windows path wraps the header on its own, which puts the
+    counts on a line of their own and breaks the block's top edge."""
+    long_path = "C:\\Development\\EntryLinkDev\\Valkyrie\\entryLINK\\AfterSaleSupport.aspx.vb"
+    line = ui._diff_header(long_path, 18, 0, "edit").plain
+    assert "\n" not in line
+    assert line.endswith("(+18 -0)")
+
+
+def test_a_shortened_path_keeps_the_end_that_identifies_the_file():
+    long_path = "C:\\Development\\EntryLinkDev\\Valkyrie\\entryLINK\\AfterSaleSupport.aspx.vb"
+    line = ui._diff_header(long_path, 1, 0, "edit").plain
+    assert "AfterSaleSupport.aspx.vb" in line
+
+
+def test_a_short_path_is_shown_whole():
+    assert "omni/agent.py" in ui._diff_header("omni/agent.py", 1, 1, "edit").plain

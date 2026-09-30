@@ -195,7 +195,8 @@ def binding(application, key, *, filter_mode=None):
     from prompt_toolkit.keys import Keys
     wanted = {"enter": Keys.ControlM, "c-c": Keys.ControlC, "c-d": Keys.ControlD,
               "y": "y", "n": "n", "pageup": Keys.PageUp,
-              "up": Keys.Up, "down": Keys.Down}[key]
+              "up": Keys.Up, "down": Keys.Down,
+              "c-end": Keys.ControlEnd}[key]
     for b in application._app.key_bindings.bindings:
         if b.keys == (wanted,) and b.filter():
             return b.handler
@@ -1216,3 +1217,168 @@ def test_the_completer_offers_commands_whatever_the_agent_is_doing(app):
     app.set_busy("Thinking…")
     offered = [c.text for c in app._buffer.completer.get_completions(Document("/co"), None)]
     assert "/cost" in offered and "/compact" in offered
+
+
+# ---------------- staying where the reader put the view ----------------
+#
+# Appending a block used to set follow=True, so any output at all snapped the
+# transcript back to the bottom — you could not read what an agent did three
+# steps ago while it was still working, which is exactly when you want to.
+
+
+def filled(n=40):
+    t = Transcript()
+    for i in range(n):
+        t.add(plain(f"line {i}"))
+    t.create_content(60, 10)
+    return t
+
+
+def test_the_view_follows_new_output_while_it_is_at_the_bottom():
+    """The default has to stay what it was: watching a turn go by."""
+    t = filled()
+    t.add(plain("newest"))
+    t.create_content(60, 10)
+    assert t.follow and t.scroll == t.max_scroll(10)
+
+
+def test_new_output_does_not_yank_a_reader_who_scrolled_up():
+    t = filled()
+    t.scroll_by(-5, 10)
+    where = t.scroll
+    t.add(plain("newest"))
+    t.create_content(60, 10)
+    assert t.scroll == where and not t.follow
+
+
+def test_output_arriving_while_scrolled_up_is_counted():
+    t = filled()
+    t.scroll_by(-5, 10)
+    t.add(plain("one"))
+    t.add(plain("two"))
+    assert t.unread == 2
+
+
+def test_output_arriving_at_the_bottom_is_not_counted():
+    """It was watched as it happened; there is nothing to catch up on."""
+    t = filled()
+    t.add(plain("one"))
+    assert t.unread == 0
+
+
+def test_scrolling_up_with_nothing_new_offers_the_jump():
+    t = filled()
+    t.scroll_by(-5, 10)
+    assert t.jump_hint() == "↓  Jump to bottom  ·  ctrl+End"
+
+
+def test_scrolling_up_with_output_waiting_says_how_much():
+    """"something happened" and "eleven things happened" are different
+    decisions about whether to jump."""
+    t = filled()
+    t.scroll_by(-5, 10)
+    for i in range(11):
+        t.add(plain(f"new {i}"))
+    assert t.jump_hint() == "↓  New 11 messages  ·  ctrl+End"
+
+
+def test_one_waiting_message_is_singular():
+    t = filled()
+    t.scroll_by(-5, 10)
+    t.add(plain("just one"))
+    assert "New 1 message  ·" in t.jump_hint()
+
+
+def test_nothing_is_offered_while_the_view_is_at_the_bottom():
+    """An indicator pointing at where you already are is one more thing on
+    screen that never changes."""
+    assert filled().jump_hint() == ""
+
+
+def test_scrolling_back_down_clears_the_indicator():
+    t = filled()
+    t.scroll_by(-5, 10)
+    t.add(plain("new"))
+    t.scroll_by(99, 10)
+    assert t.follow and t.unread == 0 and t.jump_hint() == ""
+
+
+def test_jumping_to_the_bottom_marks_everything_read():
+    t = filled()
+    t.scroll_by(-5, 10)
+    for _ in range(4):
+        t.add(plain("new"))
+    t.scroll_to_bottom()
+    assert t.unread == 0 and t.jump_hint() == ""
+
+
+def test_expanding_a_block_holds_the_view_and_offers_the_jump():
+    """Opening a block deliberately scroll-locks, so the way back has to be
+    offered there too."""
+    t = Transcript()
+    for i in range(20):
+        t.add(foldable(f"B{i}"))
+    t.create_content(60, 10)
+    t.toggle_at_row(2)
+    assert not t.follow and t.jump_hint() == "↓  Jump to bottom  ·  ctrl+End"
+
+
+def test_clearing_puts_the_view_back_at_the_bottom():
+    t = filled()
+    t.scroll_by(-5, 10)
+    t.add(plain("new"))
+    t.clear()
+    assert t.follow and t.unread == 0 and t.jump_hint() == ""
+
+
+def test_ctrl_end_jumps_to_the_bottom(app, mocker):
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"line {i}"))
+    app.pane.transcript.create_content(60, 10)
+    app.pane.transcript.scroll_by(-8, 10)
+    app.emit(lambda: Text("newest"))
+    assert app.pane.transcript.unread == 1
+    binding(app, "c-end")(mocker.Mock())
+    assert app.pane.transcript.follow and app.pane.transcript.unread == 0
+
+
+def test_the_indicator_is_shown_only_when_scrolled_up(app):
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"line {i}"))
+    app.pane.transcript.create_content(60, 10)
+    assert not app._scrolled_up()
+    app.pane.transcript.scroll_by(-5, 10)
+    assert app._scrolled_up()
+
+
+def test_the_indicator_can_be_clicked_to_jump(app, mocker):
+    """The transcript is clickable, and so is this."""
+    from prompt_toolkit.mouse_events import MouseEventType
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"line {i}"))
+    app.pane.transcript.create_content(60, 10)
+    app.pane.transcript.scroll_by(-5, 10)
+    handler = app._jump_line()[0][2]
+    handler(mocker.Mock(event_type=MouseEventType.MOUSE_UP))
+    assert app.pane.transcript.follow
+
+
+def test_each_agent_keeps_its_own_scroll_position(app):
+    """Reading back through one agent must not be undone by another one
+    producing output."""
+    sub = app.add_pane("audit", depth=1)
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"main {i}"))
+    app.pane.transcript.create_content(60, 10)
+    app.pane.transcript.scroll_by(-6, 10)
+    held = app.main.transcript.scroll
+
+    token = current_pane.set(sub)
+    try:
+        app.emit(lambda: Text("subagent output"))
+    finally:
+        current_pane.reset(token)
+
+    assert app.main.transcript.scroll == held
+    assert app.main.transcript.unread == 0      # nothing arrived at *this* agent
+    assert sub.transcript.follow                # and the subagent is at its own bottom

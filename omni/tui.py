@@ -122,6 +122,10 @@ class Transcript(UIControl):
         self.blocks: list = []
         self.scroll = 0
         self.follow = True      # stay pinned to the newest output until scrolled up
+        # Blocks that arrived while scrolled up. The count is what the jump
+        # indicator shows, and it is cleared the moment the bottom is reached
+        # again — having read them is what makes them read.
+        self.unread = 0
         self._width = None
         self._rows: list = []   # one entry per laid-out row: (fragments, block index)
         self._signature = None
@@ -129,14 +133,25 @@ class Transcript(UIControl):
     # ---- content ----
 
     def add(self, block: Block) -> Block:
+        """Append a block, leaving the view where the reader put it.
+
+        This used to set follow=True, so any output at all snapped the
+        transcript back to the bottom — you could not read what an agent did
+        three steps ago while it was still working, which is exactly when you
+        want to. Reading is now the reader's business: at the bottom the view
+        follows as before, and scrolled up it stays put and counts what
+        arrived."""
         self.blocks.append(block)
-        self.follow = True      # new output pulls the view back to the bottom
+        if not self.follow:
+            self.unread += 1
         self._signature = None
         return block
 
     def clear(self):
         self.blocks.clear()
         self.scroll = 0
+        self.follow = True
+        self.unread = 0
         self._signature = None
 
     def _layout(self, width: int):
@@ -195,9 +210,27 @@ class Transcript(UIControl):
     def scroll_by(self, rows: int, height: int):
         self.scroll = max(0, min(self.scroll + rows, self.max_scroll(height)))
         self.follow = self.scroll >= self.max_scroll(height)
+        if self.follow:
+            self.unread = 0     # scrolled back down to it: it has been seen
 
     def scroll_to_bottom(self):
         self.follow = True
+        self.unread = 0
+
+    def jump_hint(self) -> str:
+        """What the indicator above the frame should say, or "" for nothing.
+
+        Nothing at the bottom: an indicator pointing at where you already are
+        is one more thing on screen that never changes. Scrolled up with
+        output waiting it says how much, because "something happened" and
+        "eleven things happened" are different decisions about whether to
+        jump."""
+        if self.follow:
+            return ""
+        if self.unread:
+            plural = "" if self.unread == 1 else "s"
+            return f"↓  New {self.unread} message{plural}  ·  ctrl+End"
+        return "↓  Jump to bottom  ·  ctrl+End"
 
     # ---- clicking ----
 
@@ -614,6 +647,21 @@ class TuiApp:
 
     # ---- the frame ----
 
+    def _jump_line(self):
+        """The "new output below" indicator, clickable like everything else
+        this app draws."""
+        transcript = self.pane.transcript
+
+        def handler(event):
+            if event.event_type == MouseEventType.MOUSE_UP:
+                transcript.scroll_to_bottom()
+                self.invalidate()
+
+        return [("class:frame.chip", f" {transcript.jump_hint()} ", handler)]
+
+    def _scrolled_up(self) -> bool:
+        return bool(self.pane.transcript.jump_hint())
+
     def _rule_with_chip(self):
         chip = f" {self.pane.name or _ui._DEFAULT_LABEL} "
         width = self._width()
@@ -913,6 +961,13 @@ class TuiApp:
                 Window(height=one),
                 filter=Condition(lambda: self._busy() or self._choosing()),
             ),
+            # Only while the reader is somewhere other than the bottom, so it
+            # costs a row exactly when it is telling them something.
+            ConditionalContainer(
+                Window(FormattedTextControl(self._jump_line), height=one,
+                        always_hide_cursor=True),
+                filter=Condition(self._scrolled_up),
+            ),
             Window(FormattedTextControl(self._rule_with_chip), height=one),
             ConditionalContainer(prompt_row, filter=Condition(self._accepts_typing)),
             ConditionalContainer(
@@ -1104,6 +1159,14 @@ class TuiApp:
         @keys.add("c-left")
         def _previous_pane(event):
             self.cycle(-1)
+
+        @keys.add("c-end")
+        def _jump_to_bottom(event):
+            """Back to the newest output, and everything it passed counts as
+            read. Ctrl+End because that is what it means in every editor and
+            pager, and End alone belongs to the input line."""
+            self.pane.transcript.scroll_to_bottom()
+            self.invalidate()
 
         # Keyboard scrolling, for the same reasons a pager has it.
         @keys.add("pageup")
