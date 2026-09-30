@@ -1269,7 +1269,7 @@ def test_output_arriving_at_the_bottom_is_not_counted():
 def test_scrolling_up_with_nothing_new_offers_the_jump():
     t = filled()
     t.scroll_by(-5, 10)
-    assert t.jump_hint() == "↓  Jump to bottom  ·  ctrl+End"
+    assert t.jump_hint() == "↓  Jump to bottom  ·  Ctrl+End"
 
 
 def test_scrolling_up_with_output_waiting_says_how_much():
@@ -1279,7 +1279,7 @@ def test_scrolling_up_with_output_waiting_says_how_much():
     t.scroll_by(-5, 10)
     for i in range(11):
         t.add(plain(f"new {i}"))
-    assert t.jump_hint() == "↓  New 11 messages  ·  ctrl+End"
+    assert t.jump_hint() == "↓  New 11 messages  ·  Ctrl+End"
 
 
 def test_one_waiting_message_is_singular():
@@ -1320,7 +1320,7 @@ def test_expanding_a_block_holds_the_view_and_offers_the_jump():
         t.add(foldable(f"B{i}"))
     t.create_content(60, 10)
     t.toggle_at_row(2)
-    assert not t.follow and t.jump_hint() == "↓  Jump to bottom  ·  ctrl+End"
+    assert not t.follow and t.jump_hint() == "↓  Jump to bottom  ·  Ctrl+End"
 
 
 def test_clearing_puts_the_view_back_at_the_bottom():

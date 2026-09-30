@@ -229,8 +229,8 @@ class Transcript(UIControl):
             return ""
         if self.unread:
             plural = "" if self.unread == 1 else "s"
-            return f"↓  New {self.unread} message{plural}  ·  ctrl+End"
-        return "↓  Jump to bottom  ·  ctrl+End"
+            return f"↓  New {self.unread} message{plural}  ·  Ctrl+End"
+        return "↓  Jump to bottom  ·  Ctrl+End"
 
     # ---- clicking ----
 

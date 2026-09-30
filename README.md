@@ -882,11 +882,11 @@ want to. At the bottom the transcript still follows along; scrolled up it
 stays put, and a chip above the frame says what is waiting:
 
 ```
- ↓  New 3 messages  ·  ctrl+End
+ ↓  New 3 messages  ·  Ctrl+End
 ```
 
-With nothing new it reads `↓  Jump to bottom  ·  ctrl+End` instead. Either way
-**ctrl+End** (or a click on the chip) goes back, and the chip disappears once
+With nothing new it reads `↓  Jump to bottom  ·  Ctrl+End` instead. Either way
+**Ctrl+End** (or a click on the chip) goes back, and the chip disappears once
 you are there — an indicator pointing at where you already are is one more
 thing on screen that never changes. Each agent keeps its own scroll position,
 so reading back through one is not undone by another producing output.
