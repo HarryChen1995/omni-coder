@@ -1155,3 +1155,64 @@ async def test_a_short_choice_still_takes_one_line(app, mocker):
     assert app._options_height() == 3
     binding(app, "enter")(mocker.Mock())
     await pending
+
+
+# ---------------- slash commands while an agent works ----------------
+#
+# A line typed mid-turn is read by the REPL, which checks for a command
+# before it dispatches anything — so /cost has always *run* mid-turn. What
+# did not work was finding out: the completion menu was gated on idle, so
+# typing "/" while an agent worked produced nothing and the commands looked
+# as though they had been taken away.
+
+
+def test_commands_apply_while_an_agent_is_working(app):
+    app.set_busy("Thinking…")
+    assert app._commands_apply()
+
+
+def test_commands_apply_at_an_idle_prompt(app):
+    assert app._commands_apply()
+
+
+async def test_commands_do_not_apply_to_a_question_from_the_model(app, mocker):
+    """That line goes back to the tool that asked, so completing a command
+    there would offer something that is sent as the answer rather than run."""
+    pending = asyncio.ensure_future(app.ask_text("your answer"))
+    await asyncio.sleep(0)
+    assert app.mode == "ask" and not app._commands_apply()
+    app._buffer.text = "x"
+    binding(app, "enter")(mocker.Mock())
+    await pending
+
+
+async def test_commands_do_not_apply_to_an_approval(app, mocker):
+    pending = asyncio.ensure_future(app.ask_approval("Approve write_file?"))
+    await asyncio.sleep(0)
+    assert not app._commands_apply()
+    binding(app, "n")(mocker.Mock())
+    await pending
+
+
+def test_the_busy_hint_says_commands_are_available(app):
+    """It said ctrl+c and nothing else, which read as "commands are off"."""
+    app.set_busy("Thinking…")
+    assert "/ commands" in "".join(f[1] for f in app._hint())
+
+
+def test_a_command_typed_while_busy_reaches_the_repl(app, mocker):
+    app.set_busy("Running read_file…")
+    app._buffer.text = "/cost"
+    binding(app, "enter")(mocker.Mock())
+    assert app._queue.get_nowait() == (app.pane, "/cost")
+
+
+def test_the_completer_offers_commands_whatever_the_agent_is_doing(app):
+    """The menu's filter and the completer have to agree — one gated on idle
+    and the other not is exactly how this broke."""
+    from prompt_toolkit.document import Document
+    app.commands["/cost"] = "what this session has spent"
+    app.commands["/compact"] = "summarize the history"
+    app.set_busy("Thinking…")
+    offered = [c.text for c in app._buffer.completer.get_completions(Document("/co"), None)]
+    assert "/cost" in offered and "/compact" in offered

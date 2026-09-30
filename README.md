@@ -236,6 +236,16 @@ during this turn instead of finishing the wrong work first. Concretely:
   **Writes and shell commands are never interrupted this way** — tearing one
   of those in half is how you get a truncated file.
 
+**Slash commands work mid-turn too.** The REPL checks for a command before it
+dispatches anything, so `/cost`, `/sessions`, `/mcp`, `/expand` and the rest
+are reachable while an agent works — and the `/` completion menu now appears
+there, which it previously didn't, making the commands look as though they'd
+been taken away. Two are refused while that agent's turn is in flight, and say
+so: **`/compact`**, which would rewrite the very history the turn is still
+appending to, and **`/delete`** of a session some pane is mid-turn on, which
+would leave that turn writing to rows that no longer exist. Stop the turn
+first, or wait.
+
 The fallback queue drains **strictly in order, one turn at a time**: it never
 runs alongside the turn in front of it, and a turn that fails still lets it
 move on. Images pasted with a line travel with that line, not with whichever

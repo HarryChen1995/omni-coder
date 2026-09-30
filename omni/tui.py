@@ -747,6 +747,21 @@ class TuiApp:
     def _choosing(self) -> bool:
         return self._asking() and bool(self.pane.options)
 
+    def _commands_apply(self) -> bool:
+        """Whether a line typed now is read by the REPL, where a leading "/"
+        means a command.
+
+        Idle and busy both are — the REPL loop checks for a command before it
+        dispatches anything, so /cost works perfectly well mid-turn. What did
+        not work was finding out: the completion menu was gated on idle, so
+        typing "/" while an agent worked produced no menu and the commands
+        looked as though they had been taken away.
+
+        A question from the model is the exception. That line goes back to
+        the tool that asked, so completing a command there would offer
+        something that will be sent as the answer rather than run."""
+        return self._idle() or self._busy()
+
     def _accepts_typing(self) -> bool:
         """Every mode but one reads a line from the input row; the difference
         is only where the line goes — a new turn when idle, back to the tool
@@ -870,7 +885,8 @@ class TuiApp:
             Window(_FocusedTranscript(self), wrap_lines=False, always_hide_cursor=True),
             ConditionalContainer(
                 CompletionsMenu(max_height=8, scroll_offset=1),
-                filter=Condition(lambda: self._idle() and bool(self._buffer.complete_state)),
+                filter=Condition(lambda: self._commands_apply()
+                                  and bool(self._buffer.complete_state)),
             ),
             # A blank row on each side of the status line / picker, so neither
             # is jammed against the transcript above it or the frame below.
@@ -1254,6 +1270,7 @@ _HINT_TUI = ("⏎ send  ·  / commands  ·  click ▸ to expand  ·  ctrl+s sele
 # The frame's own busy hint. It differs from ui._HINT_BUSY in the one thing
 # only a full-screen session can offer: there is a live input row under this,
 # and a line sent at it waits its turn instead of being refused.
-_HINT_BUSY = "working…  ·  ⏎ sends it to this turn  ·  ctrl+c interrupts the turn"
+_HINT_BUSY = ("working…  ·  ⏎ sends it to this turn  ·  / commands  ·  "
+              "ctrl+c interrupts the turn")
 _HINT_SELECTING = ("selecting: drag to select, then copy as usual  ·  "
                     "ctrl+s back  ·  /copy takes the whole transcript")

@@ -695,6 +695,15 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     continue
                 if task.startswith("/delete "):
                     target = task[len("/delete "):].strip()
+                    working = _pane_working_on(tui, main_pane, agent.store, target)
+                    if working is not None:
+                        # Deleting the rows a running turn is writing to
+                        # leaves it appending to a session that no longer
+                        # exists. Any pane, not just this one: a subagent's
+                        # session is as deletable by name as the main one.
+                        _echo(f"Not while {working!r} is working on it — stop that turn "
+                               "first, or delete it once the turn is done.")
+                        continue
                     if agent.store.delete_session(target):
                         _echo(f"Deleted session {target!r}.")
                         if session_id is not None and agent.store.resolve_session_id(session_id) is None:
@@ -725,6 +734,16 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     _report_cost(cfg, tui, pane)
                     continue
                 if task == "/compact":
+                    if _turn_in_flight(pane):
+                        # It rewrites the very history the turn in flight is
+                        # still appending to — replace_messages against a
+                        # live `persisted` counter leaves the conversation
+                        # interleaved with itself. Its spinner would also
+                        # mark a working pane idle on the way out.
+                        _echo(f"Not while {pane.name!r} is working — /compact rewrites "
+                               "the history this turn is still adding to. Let it finish, "
+                               "or ctrl+c to stop it first.")
+                        continue
                     if session_id is None:
                         _echo("No active session yet — run a task first.")
                     else:
@@ -877,28 +896,24 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                     for m in models:
                         commands[f"/model {m}"] = "switch to this model"
 
-                    if prompt_session is None or not models:
-                        # No prompt_toolkit (plain input() fallback), or the
-                        # server returned no models: fall back to a static
-                        # list — pick with "/model <name>" instead.
-                        _echo(f"Current model: {cfg.model}")
-                        for m in models:
-                            _echo(f"  {'* ' if m == cfg.model else '  '}{m}")
-                        continue
-
-                    from prompt_toolkit.shortcuts import radiolist_dialog
-                    selected = await radiolist_dialog(
-                        title="Select model",
-                        text=f"Current: {cfg.model}  (↑/↓ to move, Enter to select, Esc to cancel)",
-                        values=[(m, m) for m in models],
-                        default=cfg.model if cfg.model in models else None,
-                    ).run_async()
-                    if selected and selected != cfg.model:
-                        # Through the setting, not straight onto the config:
-                        # picking a model from the list is the same act as
-                        # typing /model <name>, and should be remembered the
-                        # same way.
-                        _setting_command(cfg, tui, SETTINGS_BY_NAME["model"], selected)
+                    # Listed, then picked with "/model <name>", which the
+                    # loop above has just given a completion entry each — so
+                    # the list is read and the choice is typed with the menu
+                    # helping, in the one place this session reads input.
+                    #
+                    # This used to try a radiolist_dialog, guarded by a
+                    # `prompt_session` that no longer exists anywhere in this
+                    # module: /model with no argument raised NameError and
+                    # took the whole REPL down with it. The dialog was
+                    # unreachable by then anyway — it is a second full-screen
+                    # Application, and either the frame already owns the
+                    # terminal or prompt_toolkit is missing and it cannot be
+                    # imported at all.
+                    _echo(f"Current model: {cfg.model}")
+                    for m in models:
+                        _echo(f"  {'* ' if m == cfg.model else '  '}{m}")
+                    if models:
+                        _echo("Switch with /model <name> — the menu completes them.")
                     continue
                 verb, _, rest = task.partition(" ")
                 if verb == "/config":
@@ -1268,6 +1283,35 @@ def _report_cost(cfg, tui, pane):
     except ImportError:
         for label, prompt, completion in rows:
             _echo(f"{label}: {prompt + completion} tokens")
+
+
+def _turn_in_flight(pane) -> bool:
+    """Whether this pane has a turn running right now.
+
+    Typing while an agent works is ordinary now, so commands that rewrite or
+    remove a session have to ask this before they touch one. Tolerant of a
+    pane without a task, because _PlainPane and a test's stand-in both have
+    one."""
+    task = getattr(pane, "task", None)
+    return task is not None and not task.done()
+
+
+def _pane_working_on(tui, main_pane, store, target: str):
+    """The name of the pane running a turn against `target`, or None.
+
+    Every pane, not only the one the command was typed at: a subagent's
+    session can be named on a /delete typed at main."""
+    try:
+        wanted = store.resolve_session_id(target)
+    except Exception:
+        wanted = None
+    if wanted is None:
+        return None
+    panes = list(tui.panes) if tui is not None else [main_pane]
+    for one in panes:
+        if _turn_in_flight(one) and getattr(one, "session_id", None) == wanted:
+            return one.name
+    return None
 
 
 def _take_inbox(pane) -> list:

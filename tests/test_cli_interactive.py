@@ -399,17 +399,18 @@ def test_compact_uses_the_resolved_session_id(mocker, client, cfg, capsys):
 
 # ---------------- /model ----------------
 
-def test_model_command_lists_models(mocker, client, cfg, capsys):
+def test_model_command_lists_models(mocker, client, cfg):
+    """This asserted `pytest.raises(Exception)` and passed on the NameError
+    that made /model unusable — the bug stayed green because the test was
+    pinning the crash. It now asserts the command works."""
     mocker.patch.object(cli_mod, "_print_header")
     mocker.patch.object(cli_mod, "list_models", mocker.AsyncMock(return_value=["a", "b"]))
     mocker.patch.object(cli_mod, "_make_tui", lambda *a, **k: None)
     scripted(mocker, ["/model", "/exit"])
-    mocker.patch("prompt_toolkit.PromptSession", mocker.Mock())
-    mocker.patch("prompt_toolkit.patch_stdout.patch_stdout", mocker.MagicMock())
-    # No usable picker without a real terminal -> falls back to the printed list.
-    mocker.patch("prompt_toolkit.shortcuts.radiolist_dialog", side_effect=Exception("no tty"))
-    with pytest.raises(Exception):
-        asyncio.run(cli_mod._interactive(cfg, None, None))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    asyncio.run(cli_mod._interactive(cfg, None, None))
+    said = " ".join(str(c.args[0]) for c in echo.call_args_list if c.args)
+    assert "a" in said and "b" in said
 
 
 def test_model_name_command_switches_without_redrawing_the_header(repl, mocker, cfg, capsys):
@@ -1404,3 +1405,192 @@ def test_cost_before_anything_has_run_says_so(tui_app, mocker, cfg):
     echo = mocker.patch.object(cli_mod, "_echo")
     cli_mod._report_cost(cfg, tui_app, tui_app.main)
     assert "Nothing spent yet" in echo.call_args.args[0]
+
+
+# ---------------- commands that must not run mid-turn ----------------
+#
+# Typing while an agent works is ordinary now, which makes a few commands
+# reachable at a moment they were never reachable before: the ones that
+# rewrite or remove the session a running turn is still writing to.
+
+
+def running_pane(tui_app, mocker, session_id="s1", name=None):
+    pane = tui_app.main if name is None else tui_app.add_pane(name, depth=1)
+    pane.session_id = session_id
+    pane.task = mocker.Mock()
+    pane.task.done.return_value = False
+    return pane
+
+
+def test_a_pane_with_a_live_turn_is_recognised(tui_app, mocker):
+    pane = running_pane(tui_app, mocker)
+    assert cli_mod._turn_in_flight(pane) is True
+
+
+def test_a_finished_turn_is_not_in_flight(tui_app, mocker):
+    pane = tui_app.main
+    pane.task = mocker.Mock()
+    pane.task.done.return_value = True
+    assert cli_mod._turn_in_flight(pane) is False
+
+
+def test_a_pane_that_never_ran_is_not_in_flight(tui_app):
+    assert cli_mod._turn_in_flight(tui_app.main) is False
+
+
+def test_something_without_a_task_attribute_is_not_in_flight():
+    assert cli_mod._turn_in_flight(object()) is False
+
+
+def test_the_pane_working_on_a_session_is_found_by_name(tui_app, mocker):
+    """Every pane, not only the one the command was typed at: a subagent's
+    session can be named on a /delete typed at main."""
+    sub = running_pane(tui_app, mocker, session_id="child", name="audit")
+    store = mocker.Mock()
+    store.resolve_session_id.return_value = "child"
+    assert cli_mod._pane_working_on(tui_app, tui_app.main, store, "whatever") == sub.name
+
+
+def test_no_pane_is_working_on_an_idle_session(tui_app, mocker):
+    tui_app.main.session_id = "s1"
+    store = mocker.Mock()
+    store.resolve_session_id.return_value = "s1"
+    assert cli_mod._pane_working_on(tui_app, tui_app.main, store, "s1") is None
+
+
+def test_a_name_that_resolves_to_nothing_blocks_nobody(tui_app, mocker):
+    running_pane(tui_app, mocker)
+    store = mocker.Mock()
+    store.resolve_session_id.return_value = None
+    assert cli_mod._pane_working_on(tui_app, tui_app.main, store, "ghost") is None
+
+
+def test_a_store_that_throws_blocks_nobody(tui_app, mocker):
+    """A guard that cannot answer must not become a refusal of its own."""
+    running_pane(tui_app, mocker)
+    store = mocker.Mock()
+    store.resolve_session_id.side_effect = RuntimeError("database is locked")
+    assert cli_mod._pane_working_on(tui_app, tui_app.main, store, "s1") is None
+
+
+def test_compact_is_refused_while_that_agent_is_working(repl, mocker, cfg):
+    """It rewrites the very history the turn in flight is still appending to,
+    and its spinner would mark a working pane idle on the way out."""
+    compact = mocker.patch.object(cli_mod.CodingAgent, "compact_history",
+                                  new=mocker.AsyncMock(return_value="compacted"))
+    mocker.patch.object(cli_mod, "_turn_in_flight", return_value=True)
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/compact"])
+    compact.assert_not_awaited()
+    assert any("Not while" in str(c.args[0]) for c in echo.call_args_list if c.args)
+
+
+def test_compact_is_not_refused_at_an_idle_prompt(repl, mocker, cfg):
+    """The guard must fire only while a turn is in flight — an idle /compact
+    goes on to the ordinary session check, whatever that then says."""
+    mocker.patch.object(cli_mod.CodingAgent, "compact_history",
+                        new=mocker.AsyncMock(return_value="compacted"))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/compact"])
+    assert not any("Not while" in str(c.args[0]) for c in echo.call_args_list if c.args)
+
+
+def test_delete_is_refused_while_a_turn_runs_on_that_session(repl, mocker, cfg):
+    """Deleting the rows a running turn is writing to leaves it appending to
+    a session that no longer exists."""
+    mocker.patch.object(cli_mod, "_pane_working_on", return_value="audit")
+    deleted = mocker.patch.object(cli_mod.SessionStore, "delete_session")
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/delete something"])
+    deleted.assert_not_called()
+    assert any("Not while" in str(c.args[0]) for c in echo.call_args_list if c.args)
+
+
+def test_delete_of_an_idle_session_still_works(repl, mocker, cfg):
+    mocker.patch.object(cli_mod, "_pane_working_on", return_value=None)
+    deleted = mocker.patch.object(cli_mod.SessionStore, "delete_session", return_value=True)
+    repl(["/delete old-one"])
+    deleted.assert_called_once_with("old-one")
+
+
+def test_a_read_only_command_is_allowed_mid_turn(repl, mocker, cfg):
+    """The point of the whole thing: /cost, /sessions and friends are safe
+    while an agent works and must stay reachable."""
+    mocker.patch.object(cli_mod, "_turn_in_flight", return_value=True)
+    report = mocker.patch.object(cli_mod, "_report_cost")
+    repl(["/cost"])
+    report.assert_called_once()
+
+
+# ---------------- /model with no argument ----------------
+
+
+def test_bare_model_lists_what_the_server_has(repl, mocker, cfg):
+    """It used to raise NameError on a `prompt_session` that no longer exists
+    anywhere in the module, which took the whole REPL down — /model was
+    simply unusable."""
+    mocker.patch.object(cli_mod, "list_models",
+                        new=mocker.AsyncMock(return_value=["alpha", "beta"]))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/model"])
+    said = " ".join(str(c.args[0]) for c in echo.call_args_list if c.args)
+    assert "alpha" in said and "beta" in said
+
+
+def test_bare_model_marks_the_one_in_use(repl, mocker, cfg):
+    cfg.model = "beta"
+    mocker.patch.object(cli_mod, "list_models",
+                        new=mocker.AsyncMock(return_value=["alpha", "beta"]))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/model"])
+    marked = [str(c.args[0]) for c in echo.call_args_list
+              if c.args and str(c.args[0]).strip().startswith("*")]
+    assert marked and "beta" in marked[0]
+
+
+def test_bare_model_says_how_to_switch(repl, mocker, cfg):
+    mocker.patch.object(cli_mod, "list_models",
+                        new=mocker.AsyncMock(return_value=["alpha"]))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/model"])
+    said = " ".join(str(c.args[0]) for c in echo.call_args_list if c.args)
+    assert "/model <name>" in said
+
+
+def test_bare_model_populates_a_completion_per_model(repl, mocker, cfg):
+    """The list is read and the choice is typed, so the menu has to know the
+    names for that to be a usable pair."""
+    mocker.patch.object(cli_mod, "list_models",
+                        new=mocker.AsyncMock(return_value=["alpha", "beta"]))
+    repl(["/model"])
+    assert "/model alpha" in repl.captured["commands"]
+    assert "/model beta" in repl.captured["commands"]
+
+
+def test_bare_model_survives_a_server_with_no_models(repl, mocker, cfg):
+    mocker.patch.object(cli_mod, "list_models", new=mocker.AsyncMock(return_value=[]))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/model"])
+    said = " ".join(str(c.args[0]) for c in echo.call_args_list if c.args)
+    assert "/model <name>" not in said       # nothing to switch to
+
+
+def test_bare_model_reports_an_unreachable_server_without_dying(repl, mocker, cfg):
+    from omni.llm_client import LLMError
+    mocker.patch.object(cli_mod, "list_models",
+                        new=mocker.AsyncMock(side_effect=LLMError("connection refused")))
+    echo = mocker.patch.object(cli_mod, "_echo")
+    repl(["/model"])
+    said = " ".join(str(c.args[0]) for c in echo.call_args_list if c.args)
+    assert "connection refused" in said
+
+
+def test_the_module_references_no_prompt_session(repl):
+    """A lint of its own: the name was read in one place and written in none,
+    so nothing but running the command revealed it."""
+    import re
+    from pathlib import Path
+    source = Path(cli_mod.__file__).read_text(encoding="utf-8")
+    code = "\n".join(line for line in source.splitlines()
+                     if not line.strip().startswith("#"))
+    assert not re.search(r"\bprompt_session\b", code)
