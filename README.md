@@ -45,7 +45,9 @@ omni "Add type hints to utils.py, then run the test suite" \
 Equivalent alternative: `python -m omni "..." --project-root ./myrepo`.
 
 Add `--auto-approve` to skip confirmation prompts (only in an already-isolated
-environment, e.g. a container you're fine getting wiped). Add `--max-steps N`
+environment, e.g. a container you're fine getting wiped), or `/auto-approve on`
+once, to run that way every time; `--no-auto-approve` puts the prompts back for
+a single run, and `/auto-approve off` puts them back for good. Add `--max-steps N`
 to change the cap of 100 agent-loop iterations (or `/max-steps N` once, to
 change it for good). Run `omni --help`
 for the full option list — it's a Typer app, so `--help` is auto-generated and
@@ -500,7 +502,10 @@ follow from this automatically:
   agent still runs on the raw task text rather than blocking.
 
 Skip it with `--skip-intent-parsing` if you want lower latency on simple
-tasks, or point it at a smaller/faster model with `--intent-model`.
+tasks, or point it at a smaller/faster model with `--intent-model`. In the
+REPL the toggle is `/parse-intent on|off`, and `/skip-intent-parsing on|off`
+is the same switch under the flag's name, read backwards — one saved value,
+two spellings.
 
 ## 🧠 Project memory
 
@@ -701,7 +706,8 @@ MCP prompt exposed by a connected server. Special inputs:
   starts that way; `/<setting>` on its own reports it, and `/<setting> reset`
   restores the default. The settings are the ones `/config` lists: `/model`,
   `/llm-host`, `/llm-timeout`, `/max-steps`, `/subagent-model`,
-  `/subagent-max-steps`, `/parse-intent`, `/intent-model`, `/compact-model`,
+  `/subagent-max-steps`, `/auto-approve`, `/parse-intent`, `/intent-model`,
+  `/compact-model`,
   `/compact-keep-last`, `/context-window-budget`, `/embedding-model`,
   `/max-output-chars`, `/shell-timeout`, `/mcp-connect-timeout`,
   `/system-prompt` and `/theme-color`. Each is the REPL half of the flag of
@@ -711,9 +717,19 @@ MCP prompt exposed by a connected server. Special inputs:
   (`/max_steps`, `/system_prompt`). Everything is written to
   `~/.omni-coder/omni-coder-settings.json`, alongside any MCP servers you've
   registered, which are left untouched. Deliberately *not* saveable:
-  `--auto-approve` (a remembered "never ask me again" outlives the run that
-  wanted it), `--llm-api-key` (a secret doesn't belong in a plaintext file —
-  use `$LLM_API_KEY`), and the per-invocation paths.
+  `--llm-api-key` (a secret doesn't belong in a plaintext file — use
+  `$LLM_API_KEY`) and the per-invocation paths.
+
+  `/auto-approve` is the one to think about before saving. A remembered
+  "never ask me again" outlives the run that wanted it, which is exactly what
+  makes it worth having in a container and worth avoiding on a working tree —
+  so a run that stopped asking because of the settings file says so on its
+  first line, and `--no-auto-approve` overrides it for one run without
+  clearing it. High-risk intent still forces approval either way.
+
+  `/skip-intent-parsing on|off` is an alias rather than a setting of its own:
+  it writes the same saved value `/parse-intent` does, inverted, so the two
+  spellings can't disagree.
 
   **Saved means everywhere.** The settings file is per *user*, not per project
   or per session, so anything saved applies to every later run, in every repo,

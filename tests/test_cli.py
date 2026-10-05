@@ -665,7 +665,8 @@ def test_no_task_enters_interactive(no_interactive, tmp_path):
 def test_help_lists_the_key_flags():
     out = invoke("--help").output
     for flag in ("--project-root", "--model", "--llm-host", "--llm-timeout",
-                 "--auto-approve", "--safe-tool", "--resume", "--add-mcp-server",
+                 "--auto-approve", "--no-auto-approve",
+                 "--safe-tool", "--resume", "--add-mcp-server",
                  "--mcp-log-path", "--system-prompt", "--system-prompt-file",
                  "--mcp-connect-timeout", "--theme-color"):
         assert flag in out
@@ -992,3 +993,138 @@ async def test_restart_mcp_server_wraps_the_client_call(mocker):
 def test_static_commands_are_registered_with_descriptions(command):
     assert command in cli_mod._STATIC_COMMANDS
     assert cli_mod._STATIC_COMMANDS[command].strip()
+
+
+# ---------------- /auto-approve and /skip-intent-parsing ----------------
+#
+# Two toggles that read backwards from each other: approval is a preference
+# whose default has to be the safe one, and intent parsing is a preference
+# people reach for under the flag's negated name.
+
+def test_auto_approve_is_set_and_saved_from_the_repl(settings_path):
+    cfg = AgentConfig()
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["auto-approve"], "on")
+    assert cfg.auto_approve is True
+    assert json.loads(settings_path.read_text()) == {"autoApprove": True}
+
+
+def test_auto_approve_is_turned_back_off_from_the_repl(settings_path):
+    """The way out has to work from the same prompt as the way in — a saved
+    "never ask me again" with no off switch is a trap."""
+    settings_path.write_text(json.dumps({"autoApprove": True}))
+    cfg = AgentConfig(auto_approve=True)
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["auto-approve"], "off")
+    assert cfg.auto_approve is False
+    assert json.loads(settings_path.read_text()) == {"autoApprove": False}
+
+
+def test_auto_approve_reset_clears_it_and_goes_back_to_asking(settings_path):
+    settings_path.write_text(json.dumps({"autoApprove": True}))
+    cfg = AgentConfig(auto_approve=True)
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["auto-approve"], "reset")
+    assert cfg.auto_approve is False
+    assert json.loads(settings_path.read_text()) == {}
+
+
+def test_a_word_that_is_neither_on_nor_off_leaves_auto_approve_alone(mocker, settings_path):
+    """"/auto-approve maybe" reading as False would be harmless; reading as
+    True would not, so neither happens."""
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig()
+    cli_mod._setting_command(cfg, None, cli_mod.SETTINGS_BY_NAME["auto-approve"], "maybe")
+    assert cfg.auto_approve is False and not settings_path.exists()
+    assert "isn't usable" in echoed.call_args.args[0]
+
+
+def test_a_saved_auto_approve_is_used_when_the_flag_is_absent(mocker, tmp_path, settings_path):
+    settings_path.write_text(json.dumps({"autoApprove": True}))
+    captured = captured_cfg(mocker)
+    r = invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].auto_approve is True
+    assert "auto-approve is on (saved)" in r.output
+
+
+def test_no_auto_approve_overrides_the_saved_one_without_replacing_it(mocker, tmp_path, settings_path):
+    """One run can put the prompts back; the preference is still there for
+    the next one."""
+    settings_path.write_text(json.dumps({"autoApprove": True}))
+    captured = captured_cfg(mocker)
+    r = invoke("t", "--no-auto-approve", "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].auto_approve is False
+    assert json.loads(settings_path.read_text()) == {"autoApprove": True}
+    assert "auto-approve is on (saved)" not in r.output
+
+
+def test_the_two_auto_approve_flags_together_are_refused(tmp_path):
+    """Picking one silently would be picking it for the run whose whole
+    question is whether it stops to ask."""
+    r = invoke("t", "--auto-approve", "--no-auto-approve",
+               "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert r.exit_code == 1 and "not both" in r.output
+
+
+def test_the_auto_approve_flag_is_not_announced_as_saved(mocker, tmp_path, settings_path):
+    """Typing --auto-approve is already knowing; the line is for the run that
+    stopped asking because of a file."""
+    captured = captured_cfg(mocker)
+    r = invoke("t", "--auto-approve", "--db-path", str(tmp_path / "d.db"),
+               "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].auto_approve is True
+    assert "(saved)" not in r.output
+    assert not settings_path.exists()        # a flag is one run, never a preference
+
+
+def test_auto_approve_defaults_to_asking_with_nothing_saved(mocker, tmp_path, settings_path):
+    captured = captured_cfg(mocker)
+    invoke("t", "--db-path", str(tmp_path / "d.db"), "--log-path", str(tmp_path / "l.log"))
+    assert captured["cfg"].auto_approve is False
+
+
+def test_skip_intent_parsing_is_parse_intent_inverted(settings_path):
+    cfg = AgentConfig()
+    cli_mod._skip_intent_parsing_command(cfg, None, "on")
+    assert cfg.parse_intent is False
+    assert json.loads(settings_path.read_text()) == {"parseIntent": False}
+
+    cli_mod._skip_intent_parsing_command(cfg, None, "off")
+    assert cfg.parse_intent is True
+    assert json.loads(settings_path.read_text()) == {"parseIntent": True}
+
+
+def test_skip_intent_parsing_writes_the_one_preference_both_spellings_share(settings_path):
+    """Not a second row in the settings file — the same key /parse-intent
+    writes, or the two would drift apart."""
+    cfg = AgentConfig()
+    cli_mod._skip_intent_parsing_command(cfg, None, "yes")
+    saved = json.loads(settings_path.read_text())
+    assert saved == {"parseIntent": False} and "skipIntentParsing" not in saved
+
+
+def test_skip_intent_parsing_reset_goes_back_to_parsing(settings_path):
+    settings_path.write_text(json.dumps({"parseIntent": False}))
+    cfg = AgentConfig(parse_intent=False)
+    cli_mod._skip_intent_parsing_command(cfg, None, "reset")
+    assert cfg.parse_intent is True
+    assert json.loads(settings_path.read_text()) == {}
+
+
+def test_bare_skip_intent_parsing_reports_without_changing_anything(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig(parse_intent=True)
+    cli_mod._skip_intent_parsing_command(cfg, None, "")
+    assert cfg.parse_intent is True and not settings_path.exists()
+    assert "nothing is skipped" in echoed.call_args.args[0]
+
+
+def test_an_unusable_skip_intent_parsing_value_is_refused(mocker, settings_path):
+    echoed = mocker.patch.object(cli_mod, "_echo")
+    cfg = AgentConfig(parse_intent=True)
+    cli_mod._skip_intent_parsing_command(cfg, None, "sometimes")
+    assert cfg.parse_intent is True and not settings_path.exists()
+    assert "expected on or off" in echoed.call_args.args[0]
+
+
+def test_both_toggles_are_listed_as_commands():
+    assert "/auto-approve" in cli_mod._STATIC_COMMANDS
+    assert "/skip-intent-parsing" in cli_mod._STATIC_COMMANDS

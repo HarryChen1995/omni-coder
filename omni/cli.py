@@ -126,6 +126,14 @@ _STATIC_COMMANDS.update({
     for setting in SETTINGS if setting.name != "model"
 })
 
+# The flag is spelled --skip-intent-parsing, so that is what gets typed at the
+# prompt too. It is the same preference as /parse-intent read backwards, not a
+# second one: there is one saved value and both spellings move it.
+_STATIC_COMMANDS["/skip-intent-parsing"] = (
+    "the inverse of /parse-intent, under the flag's name — "
+    "/skip-intent-parsing on skips the upfront intent parse"
+)
+
 app = typer.Typer(add_completion=False, help="Coding agent (Qwen Coder or any OpenAI-compatible model)")
 
 
@@ -181,7 +189,16 @@ def main(
     auto_approve: bool = typer.Option(
         False, "--auto-approve",
         help="Skip human approval for write/edit/shell tools. Only use in an "
-             "already-isolated environment (container/VM). Overridden if intent parsing flags the task high-risk.",
+             "already-isolated environment (container/VM). Overridden if intent parsing flags "
+             "the task high-risk. This session only — it overrides what /auto-approve saved "
+             "without replacing it. Omit to use the saved value, or off if none is saved.",
+    ),
+    no_auto_approve: bool = typer.Option(
+        False, "--no-auto-approve",
+        help="Ask before every write/edit/shell tool for this run, whatever /auto-approve "
+             "saved. The other half of --auto-approve: once the preference can be saved, "
+             "leaving the flag off stops meaning \"ask me\", and this is how one run puts "
+             "the prompts back without clearing the setting.",
     ),
     system_prompt: Optional[str] = typer.Option(
         None, "--system-prompt",
@@ -363,6 +380,12 @@ def main(
         _print_sessions(SessionStore(db_path).list_sessions())
         raise typer.Exit()
 
+    if auto_approve and no_auto_approve:
+        # Picking one silently would be picking it for a run whose whole
+        # question is whether it stops to ask.
+        typer.echo("Error: pass --auto-approve or --no-auto-approve, not both.", err=True)
+        raise typer.Exit(code=1)
+
     if system_prompt is not None and system_prompt_file is not None:
         typer.echo("Error: pass --system-prompt or --system-prompt-file, not both.", err=True)
         raise typer.Exit(code=1)
@@ -390,6 +413,10 @@ def main(
         "llm_host": llm_host,
         "llm_timeout_s": llm_timeout,
         "max_steps": max_steps,
+        # None unless one of the two flags was actually passed, so that an
+        # unflagged run falls through to the saved preference like every other
+        # setting here.
+        "auto_approve": True if auto_approve else (False if no_auto_approve else None),
         "subagent_model": subagent_model,
         "subagent_max_steps": subagent_max_steps,
         # --skip-intent-parsing is the flag; parse_intent is the preference,
@@ -427,6 +454,14 @@ def main(
                    "run).", err=True)
         raise typer.Exit(code=1)
 
+    # A saved auto-approve is the one preference whose whole effect is that
+    # nothing is shown — the run just stops asking. Said once at startup, and
+    # only when the flag isn't what turned it on, because typing
+    # --auto-approve is already knowing.
+    if preferences["auto_approve"] and not auto_approve:
+        typer.echo("auto-approve is on (saved) — write, edit and shell tools will run without "
+                   "asking. /auto-approve off puts the prompts back.")
+
     if preferences["theme_color"]:
         try:
             # Applied before anything renders — the full-screen app copies the
@@ -461,7 +496,6 @@ def main(
     cfg = AgentConfig(
         llm_api_key=llm_api_key or "",
         project_root=project_root,
-        auto_approve=auto_approve,
         log_path=log_path,
         mcp_log_path=mcp_log_path,
         db_path=db_path,
@@ -924,6 +958,9 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 # are read off the AgentConfig fields they set, which are
                 # underscored. They land here rather than falling through to
                 # the MCP-prompt lookup below, which would call them unknown.
+                if verb.lstrip("/").lower().replace("_", "-") == "skip-intent-parsing":
+                    _skip_intent_parsing_command(cfg, tui, rest.strip())
+                    continue
                 setting = find_setting(verb)
                 if setting is not None:
                     _setting_command(cfg, tui, setting, rest.strip())
@@ -1672,6 +1709,35 @@ def _config_command(cfg, tui, argument: str):
 # Named wrappers for the settings that had a command before the registry
 # existed. They are what the REPL and the tests call; the behaviour is the
 # generic one.
+
+def _skip_intent_parsing_command(cfg, tui, argument: str):
+    """/skip-intent-parsing — /parse-intent under the name of the flag.
+
+    --skip-intent-parsing is what the flag is called, so it is what people
+    reach for at the prompt; parse-intent is what the setting is called,
+    because a preference stored as a negative reads as a double negative the
+    moment it is listed. Rather than carry two rows for one value, this
+    translates and hands over, and the confirmation comes back in
+    parse-intent's terms so the two spellings can't drift apart."""
+    setting = SETTINGS_BY_NAME["parse-intent"]
+    text = argument.strip()
+
+    if not text:
+        _echo(f"skip-intent-parsing is /parse-intent inverted: intent parsing is currently "
+              f"{'on, so nothing is skipped' if cfg.parse_intent else 'off, so it is skipped'}. "
+              f"Set it with /skip-intent-parsing on|off, or /skip-intent-parsing reset.")
+        return
+
+    if text.lower() in ("reset", "default", "clear"):
+        return _setting_command(cfg, tui, setting, "reset")
+
+    skip = setting.parse(text)
+    if skip is None:
+        _echo(f"Error: {text!r} isn't usable for /skip-intent-parsing — expected on or off.",
+              err=True)
+        return
+    return _setting_command(cfg, tui, setting, "off" if skip else "on")
+
 
 def _theme_color_command(cfg, tui, argument: str):
     return _setting_command(cfg, tui, SETTINGS_BY_NAME["theme-color"], argument)

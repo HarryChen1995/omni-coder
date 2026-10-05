@@ -92,11 +92,17 @@ def save_setting(key: str, value, path: str = None) -> str:
 # flag beats the saved value beats the built-in default. Adding a preference
 # is adding a row.
 #
-# What is deliberately NOT here: --auto-approve (a saved "never ask me again"
-# is a footgun that outlives the run that wanted it), --llm-api-key (a secret
-# does not belong in a plaintext settings file — use $LLM_API_KEY), and the
-# per-invocation paths (--project-root, --db-path, the log files), which
-# describe one run rather than a preference.
+# What is deliberately NOT here: --llm-api-key (a secret does not belong in a
+# plaintext settings file — use $LLM_API_KEY) and the per-invocation paths
+# (--project-root, --db-path, the log files), which describe one run rather
+# than a preference.
+#
+# auto-approve is here, and it is the one row that needs saying twice: a saved
+# "never ask me again" outlives the run that wanted it, which is exactly the
+# property that makes it useful in a container and dangerous everywhere else.
+# It is saveable because typing --auto-approve on every start is how people
+# end up not reading the prompts either; the startup line that says where it
+# came from is what keeps it from being silent.
 
 
 def _text(value):
@@ -224,6 +230,10 @@ SETTINGS = (
             "a number of seconds, at least 1"),
     Setting("max-steps", "max_steps", "maxSteps", _whole(1),
             "hard cap on agent loop iterations", "a whole number, at least 1"),
+    Setting("auto-approve", "auto_approve", "autoApprove", _flag,
+            "run write/edit/shell tools without stopping to ask",
+            "on or off",
+            empty="off (every write/edit/shell call asks first)"),
     Setting("subagent-model", "subagent_model", "subagentModel", _text,
             "the model subagents run on (unset = the same one)",
             "a model name, or reset to use the main one",

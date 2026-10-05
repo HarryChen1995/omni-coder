@@ -294,12 +294,20 @@ def test_every_settings_default_survives_its_own_parser():
         assert setting.parse(default) == default, setting.name
 
 
-def test_secrets_and_footguns_are_not_saveable():
-    """--auto-approve outliving the run that wanted it is a footgun, and a
-    key in a plaintext settings file is a leak — neither is a preference."""
+def test_secrets_and_per_run_paths_are_not_saveable():
+    """A key in a plaintext settings file is a leak, and a path that describes
+    one invocation is not a preference."""
     saveable = {s.field for s in config.SETTINGS}
-    assert "auto_approve" not in saveable and "llm_api_key" not in saveable
+    assert "llm_api_key" not in saveable
     assert not saveable & {"project_root", "db_path", "log_path", "mcp_log_path"}
+
+
+def test_auto_approve_is_saveable_and_defaults_to_asking():
+    """It is the one saveable row that turns approval off, so the default it
+    resets to has to be the one that still asks."""
+    assert "auto_approve" in {s.field for s in config.SETTINGS}
+    assert AgentConfig.auto_approve is False
+    assert config.SETTINGS_BY_NAME["auto-approve"].key == "autoApprove"
 
 
 @pytest.mark.parametrize("typed,expected", [
@@ -322,6 +330,25 @@ def test_anything_else_is_not_a_setting(typed):
                                             ("0", False), ("TRUE", True)])
 def test_a_flag_setting_reads_how_it_was_typed(given, expected):
     assert config.SETTINGS_BY_NAME["parse-intent"].parse(given) is expected
+
+
+@pytest.mark.parametrize("given,expected", [("on", True), ("off", False), ("no", False)])
+def test_auto_approve_reads_how_it_was_typed(given, expected):
+    assert config.SETTINGS_BY_NAME["auto-approve"].parse(given) is expected
+
+
+def test_a_saved_auto_approve_is_collected_like_any_other_preference(settings):
+    with open(settings, "w") as f:
+        json.dump({"autoApprove": True}, f)
+    assert config.saved_settings(settings) == {"auto_approve": True}
+
+
+def test_a_junk_auto_approve_does_not_read_as_on(settings):
+    """A hand-edited settings file must not be able to turn approval off by
+    accident — anything unparseable falls back to the default, which asks."""
+    with open(settings, "w") as f:
+        json.dump({"autoApprove": "sometimes"}, f)
+    assert config.saved_settings(settings) == {}
 
 
 def test_an_unrecognized_word_is_not_a_flag():
