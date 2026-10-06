@@ -210,12 +210,15 @@ async def test_approve_auto_approves_when_configured(cfg, mocker):
     ui_mock.assert_not_awaited()
 
 
-async def test_force_approval_overrides_auto_approve(cfg, mocker):
-    """A high-risk intent must still prompt even under --auto-approve."""
+async def test_auto_approve_covers_tools_from_any_mcp_server(cfg, mocker):
+    """Global, not a built-in-tool allowance: the switch is read before the
+    name is looked at, so a tool from a connected MCP server goes through on
+    it exactly like write_file does. It is the only gate in the loop."""
     cfg.auto_approve = True
-    ui_mock = mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock(return_value=False))
-    assert await _approve("run_shell", {}, cfg, None, force_approval=True) is False
-    ui_mock.assert_awaited_once()
+    ui_mock = mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock())
+    for name in ("write_file", "weather:forecast", "github__create_pull_request"):
+        assert await _approve(name, {}, cfg, None) is True
+    ui_mock.assert_not_awaited()
 
 
 async def test_approve_defers_to_the_ui_for_unsafe_tools(cfg, mocker):
@@ -344,14 +347,14 @@ def test_ensure_tool_call_ids_fills_only_missing_ones():
 
 # ---------------- _protected_head_len ----------------
 
-def test_protected_head_covers_the_injected_intent_block():
-    """The regression this exists for: with intent parsing on, the task sits
-    at index 2, so a fixed head of 2 summarized away the task itself."""
+def test_protected_head_covers_a_second_leading_system_block():
+    """The regression this exists for: with project memory in front of it the
+    task sits at index 2, so a fixed head of 2 summarized away the task."""
     m = [{"role": "system"}, {"role": "system"}, {"role": "user"}, {"role": "assistant"}]
     assert _protected_head_len(m) == 3
 
 
-def test_protected_head_without_an_intent_block():
+def test_protected_head_with_one_system_block():
     assert _protected_head_len([{"role": "system"}, {"role": "user"}, {"role": "tool"}]) == 2
 
 
@@ -364,23 +367,23 @@ def test_protected_head_of_system_only_and_empty():
     assert _protected_head_len([]) == 0
 
 
-def test_trim_history_keeps_the_task_behind_an_intent_block():
-    m = ([{"role": "system", "content": "s" * 50}, {"role": "system", "content": "intent" * 20},
+def test_trim_history_keeps_the_task_behind_a_second_system_block():
+    m = ([{"role": "system", "content": "s" * 50}, {"role": "system", "content": "memory" * 20},
           {"role": "user", "content": "THE TASK"}]
          + [{"role": "assistant", "content": "x" * 200} for _ in range(20)])
     out = _trim_history(m, 500)
-    assert [x["content"] for x in out[:3]] == ["s" * 50, "intent" * 20, "THE TASK"]
+    assert [x["content"] for x in out[:3]] == ["s" * 50, "memory" * 20, "THE TASK"]
     assert len(out) < len(m)
 
 
-async def test_compact_keeps_the_task_behind_an_intent_block(cfg, mocker):
+async def test_compact_keeps_the_task_behind_a_second_system_block(cfg, mocker):
     cfg.compact_keep_last = 3
     mocker.patch.object(agent_mod, "chat", mocker.AsyncMock(return_value={"content": "SUM"}))
-    history = ([{"role": "system", "content": "sys"}, {"role": "system", "content": "[Parsed intent]"},
+    history = ([{"role": "system", "content": "sys"}, {"role": "system", "content": "[Project memory]"},
                 {"role": "user", "content": "THE TASK"}]
                + [{"role": "assistant", "content": f"step {i}"} for i in range(20)])
     out = await _compact_messages(history, "model", cfg, mocker.Mock())
-    assert [m["content"] for m in out[:3]] == ["sys", "[Parsed intent]", "THE TASK"]
+    assert [m["content"] for m in out[:3]] == ["sys", "[Project memory]", "THE TASK"]
     assert "SUM" in out[3]["content"]
     assert out[-3:] == history[-3:]
     assert len(out) == 3 + 1 + 3

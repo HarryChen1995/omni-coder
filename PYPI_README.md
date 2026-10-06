@@ -35,9 +35,11 @@ Run `omni --help` for the full option list.
 
 ## ✨ Features
 
-- **Structured intent parsing** — the raw task is classified (bug fix,
-  feature, refactor, risk level, target files) before any action is taken,
-  and high-risk tasks force human approval even under `--auto-approve`.
+- **One approval switch, and it covers everything** — every tool call that
+  isn't already read-only stops and asks, with a diff preview of what it is
+  about to do. `--auto-approve` (or `/auto-approve on`, saved) runs them
+  without asking, and it is global: the built-in write/edit/shell tools and
+  everything a connected MCP server exposes alike.
 - **Talk to a turn that's already running** — the input row stays live during
   a turn, and Enter sends the line *into* it: it becomes a user message in the
   conversation the model is reasoning from, folded in at the next step
@@ -108,8 +110,8 @@ Run `omni --help` for the full option list.
   session still sends what the model saw.
 - **Token counts** — every turn shows what it cost (`Responded (16.0s · ↑ 3.3k
   ↓ 115)`, and live beside the spinner), from the server's own
-  `prompt_tokens` / `completion_tokens`. Intent parsing and history
-  compaction are counted too, and each agent counts only its own.
+  `prompt_tokens` / `completion_tokens`. History compaction is counted too,
+  and each agent counts only its own.
 - **No default model to get wrong** — nothing is compiled in: with no
   `--model` and nothing saved, the agent asks the server which models it has
   and uses the first one, or names `$DEFAULT_LLM_MODEL` if you exported one.
@@ -205,8 +207,8 @@ stdio:
                v
 +-----------------------------+
 |          Agent loop         |
-|  parse intent, call model,  |
-|  approve, execute, persist  |
+|     call model, approve,    |
+|       execute, persist      |
 +-----------------------------+
                |
                v

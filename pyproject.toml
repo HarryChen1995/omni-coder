@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omni-coder"
-version = "0.12.5"
+version = "0.13.0"
 description = "A scoped, MCP-powered coding agent that puts Qwen Coder (or any OpenAI-compatible model) to work in your codebase"
 readme = "PYPI_README.md"
 requires-python = ">=3.10"

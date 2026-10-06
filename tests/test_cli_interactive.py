@@ -446,11 +446,39 @@ def test_config_lists_the_settings_at_the_repl(repl, capsys):
     assert "/max-steps" in out and "/system-prompt" in out
 
 
-def test_a_slash_that_is_not_a_setting_still_falls_through(repl):
-    """The settings dispatch must not swallow everything starting with a
-    slash: anything that isn't a command is still run as a task."""
-    agent_run = repl(["/not-a-setting"])
-    assert agent_run.await_args.args[0] == "/not-a-setting"
+def test_an_unknown_slash_command_is_refused_not_run_as_a_task(repl, capsys):
+    """It used to fall through and be dispatched as the task, so a near miss
+    became a sentence for the agent to act on while the setting it meant
+    never moved — the one failure mode where nothing looks wrong."""
+    agent_run = repl(["/auto-aprove on"])
+    agent_run.assert_not_awaited()
+    err = capsys.readouterr().err
+    assert "/auto-aprove isn't a command" in err and "/auto-approve" in err
+
+
+def test_a_pasted_path_is_still_a_task(repl):
+    """A leading slash is not by itself a command: "/etc/hosts has the wrong
+    entry" is something to go and do."""
+    agent_run = repl(["/etc/hosts has the wrong entry"])
+    assert agent_run.await_args.args[0] == "/etc/hosts has the wrong entry"
+
+
+def test_a_setting_is_reachable_however_its_name_is_spelled(repl, cfg, settings_path):
+    """A hyphen is the separator nobody reaches for when the name reads as
+    two words. All three spellings move the one saved value."""
+    for typed, expected in (("/auto-approve on", True), ("/auto_approve off", False),
+                            ("/auto approve on", True)):
+        repl([typed])
+        assert cfg.auto_approve is expected, typed
+        assert json.loads(settings_path.read_text()) == {"autoApprove": expected}
+
+
+def test_a_task_that_opens_with_a_setting_name_is_not_a_setting(repl, cfg):
+    """Without the leading slash it is prose: "model the login flow" used to
+    set the model to "the login flow" and save it for every later run."""
+    agent_run = repl(["model the login flow in a diagram"])
+    assert agent_run.await_args.args[0] == "model the login flow in a diagram"
+    assert cfg.model == "test-model"
 
 
 def test_header_is_not_redrawn_when_the_session_gets_its_id(repl, mocker):
@@ -695,11 +723,13 @@ def test_prompt_commands_are_registered_for_completion(repl, client, mocker):
     assert "Summarize" in entry and "<path>" in entry and "[style]" in entry
 
 
-def test_unknown_slash_command_is_passed_through_as_a_task(repl, client):
-    """Not every "/..." line is a command — an unmatched one is still a task."""
+def test_a_slash_name_no_prompt_answers_to_is_refused(repl, client, capsys):
+    """Once the MCP prompts have had their look, nothing else can claim the
+    line — so say so rather than handing it to the agent as a task."""
     client.list_prompts.return_value = {}
     agent_run = repl(["/not-a-command at all"])
-    assert agent_run.await_args.args[0] == "/not-a-command at all"
+    agent_run.assert_not_awaited()
+    assert "/not-a-command isn't a command" in capsys.readouterr().err
 
 
 # ---------------- startup wiring ----------------

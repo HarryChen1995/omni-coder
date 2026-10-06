@@ -1360,36 +1360,6 @@ def elapsed_note(label: str, seconds: float, tokens: tuple = None):
     console.print(f"[dim]  {label} ({detail})[/dim]")
 
 
-def intent_panel(intent, existing: dict):
-    risk_color = {"low": "green", "medium": "yellow", "high": "red"}.get(intent.risk_level, "white")
-    files_line = "none specified"
-    if intent.target_files:
-        parts = []
-        for f in intent.target_files:
-            tag = "[green]exists[/green]" if existing.get(f) else "[yellow]new[/yellow]"
-            parts.append(f"{f} ({tag})")
-        files_line = ", ".join(parts)
-    constraints_line = "; ".join(intent.constraints) if intent.constraints else "none stated"
-    confidence = "" if intent.confident else "\n[red]⚠ low confidence — parsing fell back to defaults[/red]"
-
-    body = (
-        f"[bold]type:[/bold] {intent.task_type}    "
-        f"[bold]risk:[/bold] [{risk_color}]{intent.risk_level}[/{risk_color}]\n"
-        f"[bold]summary:[/bold] {intent.summary}\n"
-        f"[bold]files:[/bold] {files_line}\n"
-        f"[bold]constraints:[/bold] {constraints_line}"
-        f"{confidence}"
-    )
-    console.print(Panel(body, title="Parsed Intent", border_style=ACCENT, expand=False))
-
-
-def high_risk_warning():
-    console.print(Panel(
-        "Approval required for ALL write/shell actions this run, even with --auto-approve.",
-        title="⚠ High-risk task detected", border_style="red", expand=False,
-    ))
-
-
 # No variation selectors (U+FE0F) in here. Rich measures "✏️" as two cells,
 # but terminals draw the emoji presentation two columns wide *and* advance the
 # cursor by one — so the glyph swallows the space after it and collides with
@@ -1860,7 +1830,7 @@ def replay_history(records: list, first_index: int = 1) -> list:
         role = message.get("role")
 
         if role == "system":
-            # The system prompt and the intent context blocks were never on
+            # The system prompt and the project-memory block were never on
             # screen in the original session either.
             continue
 
@@ -2380,7 +2350,7 @@ def error(text: str):
 # an ordinary print outside one. Wrapping them here keeps every function above
 # written the same way — print to `console` — with the routing decided once.
 for _name in (
-    "banner", "header", "elapsed_note", "intent_panel", "high_risk_warning",
+    "banner", "header", "elapsed_note",
     "reasoning_full", "call_detail", "assistant_message", "final_result",
     "sessions_table", "resources_table", "resource_content",
     "server_tools_table", "mcp_status", "model_switched", "interrupted",

@@ -17,7 +17,6 @@ from contextlib import nullcontext
 from .llm_client import add_usage, chat, LLMError, message_text
 
 from .config import AgentConfig
-from .intent import extract_intent
 from .mcp_client import MCPToolClient
 from .session_store import SessionStore
 
@@ -129,10 +128,10 @@ def _setup_logger(log_path: str) -> logging.Logger:
     return logger
 
 
-async def _approve(tool_name: str, args: dict, cfg: AgentConfig, client: MCPToolClient, force_approval: bool = False) -> bool:
+async def _approve(tool_name: str, args: dict, cfg: AgentConfig, client: MCPToolClient) -> bool:
     if tool_name in cfg.safe_tools:
         return True
-    if cfg.auto_approve and not force_approval:
+    if cfg.auto_approve:
         return True
     # Both paths below read stdin synchronously, which blocks the event loop
     # until answered — deliberate (approvals are serialized anyway), but it
@@ -257,9 +256,10 @@ def _protected_head_len(messages: list) -> int:
     """How many leading messages compaction must never touch: the whole
     leading run of system messages plus the user task that follows them.
 
-    Not a fixed 2 — _run_loop inserts the parsed-intent block as a second
-    system message, which pushed the actual task to index 2 and made it
-    eligible for summarizing away, exactly the message that must survive."""
+    Not a fixed 2 — project memory rides in as its own system message ahead
+    of the task, and anything that adds another one would otherwise push the
+    task to index 2 and make it eligible for summarizing away, which is
+    exactly the message that must survive."""
     head = 0
     while head < len(messages) and messages[head].get("role") == "system":
         head += 1
@@ -378,7 +378,6 @@ class CodingAgent:
         self.cfg = cfg
         self.logger = _setup_logger(cfg.log_path)
         _quiet_library_logs(cfg.log_path)
-        self.force_approval = False  # set True for the run if intent is high-risk
         self.last_reasoning = ""     # chain of thought from the latest reply, for /reasoning
         self.reasoning_log = []      # every reply's reasoning, for /reasoning <n>
         # Every tool call this session made, with its full arguments and full
@@ -500,8 +499,8 @@ class CodingAgent:
         """Fold one usage block into this agent's running total.
 
         Everything that spends tokens on this agent's behalf goes through
-        here — the turn's own calls, intent parsing, and history compaction —
-        so the number beside the spinner is the whole of what the session has
+        here — the turn's own calls and history compaction — so the number
+        beside the spinner is the whole of what the session has
         cost, not just the visible replies."""
         prompt = int((usage or {}).get("prompt_tokens") or 0)
         completion = int((usage or {}).get("completion_tokens") or 0)
@@ -652,52 +651,6 @@ class CodingAgent:
                          resuming: bool, client: MCPToolClient) -> str:
         tool_schemas = await client.list_llm_tools()
         tool_names = {t["function"]["name"] for t in tool_schemas}
-
-        # Every new instruction gets parsed, including later turns of an
-        # interactive session (which all arrive with resuming=True). Doing
-        # this only on turn 1 meant a "delete the migrations and force-push"
-        # typed at turn 5 was never risk-classified, so --auto-approve sailed
-        # straight past the one gate that exists for it.
-        if task and self.cfg.parse_intent:
-            # Re-evaluated per instruction rather than latched for the
-            # process: a high-risk turn must not leave every later turn
-            # prompting, and a low-risk turn 1 must not disarm turn 5.
-            self.force_approval = False
-            intent_model = self.cfg.intent_model or self.cfg.model
-            spinner = ui.thinking("Parsing intent…") if _HAS_UI else nullcontext()
-            with spinner:
-                intent_usage = {}
-                intent = await extract_intent(task, intent_model, self.cfg.max_retries, self.logger,
-                                               base_url=self.cfg.llm_host, api_key=self.cfg.llm_api_key,
-                                               timeout=self.cfg.llm_timeout_s,
-                                               usage=intent_usage)
-                self._count(intent_usage)
-
-            existing = {f: await client.file_exists(f) for f in intent.target_files}
-            context_block = intent.as_context_block(existing)
-            # Immediately before the instruction it describes — index 1 for a
-            # fresh session, just before the freshly appended task for a
-            # resumed one. Anything already persisted stays put, so the
-            # messages[persisted:] write-out below keeps DB order intact.
-            insert_at = max(
-                (i for i, m in enumerate(messages) if m.get("role") == "user"),
-                default=len(messages),
-            )
-            messages.insert(insert_at, {"role": "system", "content": context_block})
-
-            if _HAS_UI:
-                ui.intent_panel(intent, existing)
-            else:
-                print(f"\n{context_block}\n")
-
-            if intent.risk_level == "high":
-                self.force_approval = True
-                warning = "High-risk intent detected — approval required for all write/shell actions this run, even with --auto-approve."
-                if _HAS_UI:
-                    ui.high_risk_warning()
-                else:
-                    print(f"⚠️  {warning}")
-                self.logger.info(warning)
 
         for m in messages[persisted:]:
             self.store.append_message(session_id, persisted, m)
@@ -868,7 +821,7 @@ class CodingAgent:
             # time in call order; the tool calls that get approved then run
             # concurrently below instead of one after another.
             for c in runnable:
-                c["approved"] = await _approve(c["name"], c["args"], self.cfg, client, self.force_approval)
+                c["approved"] = await _approve(c["name"], c["args"], self.cfg, client)
 
             async def _execute(c):
                 start = time.monotonic()

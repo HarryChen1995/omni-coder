@@ -34,7 +34,9 @@ Examples:
 """
 
 import asyncio
+import difflib
 import os
+import re
 import shlex
 import signal
 from contextlib import nullcontext
@@ -46,8 +48,8 @@ from typer.core import TyperCommand
 
 from .agent import CodingAgent, SYSTEM_PROMPT
 from .config import (
-    AgentConfig, env_setting, find_setting, save_setting, saved_setting,
-    SETTINGS, SETTINGS_BY_NAME,
+    AgentConfig, env_setting, find_setting, is_flag_setting, save_setting,
+    saved_setting, SETTINGS, SETTINGS_BY_NAME,
 )
 from .llm_client import DEFAULT_BASE_URL, LLMError, chat, list_models
 from .mcp_client import (
@@ -120,19 +122,29 @@ _STATIC_COMMANDS = {
 # command here, listed in the completion menu, without a second list to keep
 # in step. /model is the exception already spelled out above: bare it opens
 # the picker rather than reporting a value.
+# "<value>" is no help on a row whose values you do not already know, so each
+# command carries the shape of its own argument: "on|off" where there are two
+# of them, and the setting's own hint everywhere else.
 _STATIC_COMMANDS.update({
-    f"/{setting.name}": f"{setting.summary} — /{setting.name} <value> sets and saves it, "
-                        f"/{setting.name} reset restores the default"
+    f"/{setting.name}": f"{setting.summary} — /{setting.name} "
+                        f"{'on|off' if is_flag_setting(setting) else f'<{setting.hint}>'}"
+                        f", or /{setting.name} reset for the default"
     for setting in SETTINGS if setting.name != "model"
 })
 
-# The flag is spelled --skip-intent-parsing, so that is what gets typed at the
-# prompt too. It is the same preference as /parse-intent read backwards, not a
-# second one: there is one saved value and both spellings move it.
-_STATIC_COMMANDS["/skip-intent-parsing"] = (
-    "the inverse of /parse-intent, under the flag's name — "
-    "/skip-intent-parsing on skips the upfront intent parse"
-)
+# An on/off setting is the one kind whose *values* are worth completing: there
+# are exactly two, and "on or off" is otherwise only discoverable from the
+# error you get for guessing. Typing "/auto" now offers the finished command,
+# value and all, so /auto-approve takes one pick rather than a remembered
+# spelling.
+for _setting in SETTINGS:
+    if not is_flag_setting(_setting):
+        continue
+    _STATIC_COMMANDS[f"/{_setting.name} on"] = f"turn it on — {_setting.summary}"
+    _STATIC_COMMANDS[f"/{_setting.name} off"] = (
+        f"turn it off — {_setting.flag_off or 'back to the default'}")
+    _STATIC_COMMANDS[f"/{_setting.name} toggle"] = "flip it, whichever way it is now"
+del _setting
 
 app = typer.Typer(add_completion=False, help="Coding agent (Qwen Coder or any OpenAI-compatible model)")
 
@@ -162,7 +174,7 @@ def main(
     ),
     llm_timeout: Optional[float] = typer.Option(
         None, "--llm-timeout",
-        help="Per-request timeout (seconds) for calls to the LLM server (chat, intent parsing, "
+        help="Per-request timeout (seconds) for calls to the LLM server (chat, "
              "history compaction). Raise this if you're seeing repeated retries with a slow/large "
              "local model — that's usually a client-side timeout, not the server being unreachable.",
     ),
@@ -188,14 +200,14 @@ def main(
     ),
     auto_approve: bool = typer.Option(
         False, "--auto-approve",
-        help="Skip human approval for write/edit/shell tools. Only use in an "
-             "already-isolated environment (container/VM). Overridden if intent parsing flags "
-             "the task high-risk. This session only — it overrides what /auto-approve saved "
-             "without replacing it. Omit to use the saved value, or off if none is saved.",
+        help="Skip human approval for every tool, MCP servers included. Only use in an "
+             "already-isolated environment (container/VM). This session only — it overrides "
+             "what /auto-approve saved without replacing it. Omit to use the saved value, "
+             "or off if none is saved.",
     ),
     no_auto_approve: bool = typer.Option(
         False, "--no-auto-approve",
-        help="Ask before every write/edit/shell tool for this run, whatever /auto-approve "
+        help="Ask before every tool that isn't already safe for this run, whatever /auto-approve "
              "saved. The other half of --auto-approve: once the preference can be saved, "
              "leaving the flag off stops meaning \"ask me\", and this is how one run puts "
              "the prompts back without clearing the setting.",
@@ -227,13 +239,6 @@ def main(
         AgentConfig.mcp_log_path, "--mcp-log-path",
         help="Where stderr from every stdio-transport MCP server (built-in + custom) is redirected, "
              "instead of interleaving raw subprocess output with the terminal UI.",
-    ),
-    skip_intent_parsing: bool = typer.Option(
-        False, "--skip-intent-parsing",
-        help="Skip the upfront structured-intent parse and go straight into the agent loop.",
-    ),
-    intent_model: Optional[str] = typer.Option(
-        None, "--intent-model", help="Smaller/faster model to use just for intent parsing (defaults to --model)",
     ),
     context_window_budget: Optional[int] = typer.Option(
         None, "--context-window-budget",
@@ -419,10 +424,6 @@ def main(
         "auto_approve": True if auto_approve else (False if no_auto_approve else None),
         "subagent_model": subagent_model,
         "subagent_max_steps": subagent_max_steps,
-        # --skip-intent-parsing is the flag; parse_intent is the preference,
-        # so the flag only speaks when it is actually passed.
-        "parse_intent": False if skip_intent_parsing else None,
-        "intent_model": intent_model,
         "compact_model": compact_model,
         "compact_keep_last": compact_keep_last,
         "context_window_budget": context_window_budget,
@@ -459,8 +460,8 @@ def main(
     # only when the flag isn't what turned it on, because typing
     # --auto-approve is already knowing.
     if preferences["auto_approve"] and not auto_approve:
-        typer.echo("auto-approve is on (saved) — write, edit and shell tools will run without "
-                   "asking. /auto-approve off puts the prompts back.")
+        typer.echo("auto-approve is on (saved) — every tool, MCP servers included, will run "
+                   "without asking. /auto-approve off puts the prompts back.")
 
     if preferences["theme_color"]:
         try:
@@ -953,17 +954,13 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                 if verb == "/config":
                     _config_command(cfg, tui, rest.strip())
                     continue
-                # Every saved preference is dispatched off the registry, which
-                # is also what forgives the underscored spellings: the names
-                # are read off the AgentConfig fields they set, which are
-                # underscored. They land here rather than falling through to
-                # the MCP-prompt lookup below, which would call them unknown.
-                if verb.lstrip("/").lower().replace("_", "-") == "skip-intent-parsing":
-                    _skip_intent_parsing_command(cfg, tui, rest.strip())
-                    continue
-                setting = find_setting(verb)
+                # Every saved preference is dispatched off the registry, so a
+                # new row there is a new command here with no second list to
+                # keep in step — and so all of them forgive the spellings
+                # people actually type (see _split_setting_command).
+                setting, argument = _split_setting_command(task)
                 if setting is not None:
-                    _setting_command(cfg, tui, setting, rest.strip())
+                    _setting_command(cfg, tui, setting, argument)
                     continue
                 if task.startswith("/"):
                     prompt_name, _, rest = task[1:].partition(" ")
@@ -995,6 +992,13 @@ async def _interactive(cfg: AgentConfig, resume: Optional[str], session_name: Op
                             _echo(f"Error resolving prompt {prompt_name!r}: {e}", err=True)
                             continue
                         _echo(f"--- resolved /{prompt_name} ---\n{task}\n")
+                    elif _COMMAND_WORD.match(prompt_name):
+                        # Nothing answers to it, so say so. This used to fall
+                        # through and be dispatched as the task, which is how
+                        # a mistyped command became a sentence for the agent to
+                        # act on while the setting it meant never moved.
+                        _echo(_unknown_command(prompt_name, commands), err=True)
+                        continue
 
                 # Dispatched, not awaited: the input loop has to stay
                 # responsive so main keeps working while you read — or type
@@ -1503,6 +1507,56 @@ def _resolve_preferences(chosen: dict) -> dict:
     return resolved
 
 
+# A slash command's name: one bare word. A path pasted at the prompt starts
+# with "/" too, and "/etc/hosts has the wrong entry" is a task, not a typo.
+_COMMAND_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9_:-]*$")
+
+
+def _split_setting_command(task: str):
+    """`(setting, argument)` for a line naming one, else `(None, "")`.
+
+    Three spellings of every command, because a hyphen is the separator
+    nobody reaches for when the name reads as several words: "/auto-approve
+    on", "/auto_approve on" and "/auto approve on" are one command, and all
+    three now move the setting instead of two of them being sent to the model
+    as a task.
+
+    Longest name first, so "/max-steps 5" is /max-steps with an argument
+    rather than a shorter command that happens to be a prefix of it. The
+    leading "/" is required: without it "model the login flow in a diagram"
+    is a task that quietly sets the model to "the login flow in a diagram"
+    and saves it for every later run."""
+    if not task.startswith("/"):
+        return None, ""
+    words = list(re.finditer(r"\S+", task[1:]))
+    for count in range(len(words), 0, -1):
+        setting = find_setting("-".join(w.group() for w in words[:count]))
+        if setting is not None:
+            return setting, task[1 + words[count - 1].end():].strip()
+    return None, ""
+
+
+def _unknown_command(name: str, commands: dict) -> str:
+    """What to say about "/<name>" when nothing answers to it.
+
+    Worth saying at all: an unrecognized slash command used to fall through
+    and be dispatched as the task, so a near miss became a sentence for the
+    agent to act on — the one failure mode where nothing looks wrong except
+    that the setting never moved."""
+    known = sorted({c.strip().split(" ")[0] for c in commands})
+    # What was typed is usually the start of what was meant ("/auto" for
+    # "/auto-approve"), and a prefix match is a better answer than anything
+    # edit distance comes back with — "/quit" scores well against "/auto"
+    # and helps nobody. Fuzzy matching is the fallback, for transpositions.
+    typed = f"/{name}".lower()
+    close = [c for c in known if c.lower().startswith(typed)]
+    if not close:
+        close = difflib.get_close_matches(typed, known, n=3, cutoff=0.7)
+    hint = f" Did you mean {' or '.join(close[:3])}?" if close else ""
+    return (f"Error: /{name} isn't a command.{hint} "
+            "Type / for the menu, or /config for the settings.")
+
+
 def _setting_command(cfg, tui, setting, argument: str):
     """One saved preference: read it, set it, or put it back to the default.
 
@@ -1522,6 +1576,17 @@ def _setting_command(cfg, tui, setting, argument: str):
         if where:
             where = f"  [{where}]"
         body = f"\n{_preview(current)}\n" if setting.from_file and current else " "
+        if is_flag_setting(setting):
+            # A two-valued setting is told, not described: "<value>" is
+            # the whole of what there was to go on, and knowing it takes
+            # on or off is exactly the thing you came here to find out.
+            other = "off" if current else "on"
+            _echo(f"{setting.name}: {_setting_display(setting, current)}{where} — "
+                  f"{setting.summary}. Type /{setting.name} {other} to turn it "
+                  f"{other}, /{setting.name} toggle to flip it, or "
+                  f"/{setting.name} reset for the default "
+                  f"({_setting_display(setting, default)}).")
+            return
         _echo(f"{setting.name}: {_setting_display(setting, current)}{where} — "
               f"{setting.summary}.{body}"
               f"Set one with /{setting.name} <value> ({setting.hint}), "
@@ -1557,6 +1622,12 @@ def _setting_command(cfg, tui, setting, argument: str):
             _echo(f"Error: {source!r} is empty — use /{setting.name} reset to go back to "
                    "the default.", err=True)
             return
+
+    # "flip it" is the only thing a two-valued setting can be asked for that
+    # isn't already one of its two values, and it saves reading the current
+    # one first just to know which word to type next.
+    if is_flag_setting(setting) and argument.strip().lower() == "toggle":
+        argument = "off" if current else "on"
 
     value = setting.parse(argument)
     if value is None:
@@ -1689,7 +1760,9 @@ def _config_command(cfg, tui, argument: str):
               "Registered MCP servers are untouched.")
         return
     if argument:
-        setting = find_setting(argument)
+        # Spaces for hyphens, so "/config auto approve" reads the same row
+        # "/auto approve" sets — one spelling rule across both commands.
+        setting = find_setting(argument.replace(" ", "-"))
         if setting is None:
             _echo(f"Error: {argument!r} isn't a setting. /config lists them.", err=True)
             return
@@ -1709,35 +1782,6 @@ def _config_command(cfg, tui, argument: str):
 # Named wrappers for the settings that had a command before the registry
 # existed. They are what the REPL and the tests call; the behaviour is the
 # generic one.
-
-def _skip_intent_parsing_command(cfg, tui, argument: str):
-    """/skip-intent-parsing — /parse-intent under the name of the flag.
-
-    --skip-intent-parsing is what the flag is called, so it is what people
-    reach for at the prompt; parse-intent is what the setting is called,
-    because a preference stored as a negative reads as a double negative the
-    moment it is listed. Rather than carry two rows for one value, this
-    translates and hands over, and the confirmation comes back in
-    parse-intent's terms so the two spellings can't drift apart."""
-    setting = SETTINGS_BY_NAME["parse-intent"]
-    text = argument.strip()
-
-    if not text:
-        _echo(f"skip-intent-parsing is /parse-intent inverted: intent parsing is currently "
-              f"{'on, so nothing is skipped' if cfg.parse_intent else 'off, so it is skipped'}. "
-              f"Set it with /skip-intent-parsing on|off, or /skip-intent-parsing reset.")
-        return
-
-    if text.lower() in ("reset", "default", "clear"):
-        return _setting_command(cfg, tui, setting, "reset")
-
-    skip = setting.parse(text)
-    if skip is None:
-        _echo(f"Error: {text!r} isn't usable for /skip-intent-parsing — expected on or off.",
-              err=True)
-        return
-    return _setting_command(cfg, tui, setting, "off" if skip else "on")
-
 
 def _theme_color_command(cfg, tui, argument: str):
     return _setting_command(cfg, tui, SETTINGS_BY_NAME["theme-color"], argument)

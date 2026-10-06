@@ -148,7 +148,7 @@ async def chat(
     it's sent as `Authorization: Bearer <key>`.
 
     Raises LLMError on a non-2xx response, a connection failure, or an
-    unexpected response shape — callers (agent.py, intent.py) already retry
+    unexpected response shape — callers (agent.py) already retry
     on this.
     """
     url = f"{(base_url or DEFAULT_BASE_URL).rstrip('/')}/v1/chat/completions"

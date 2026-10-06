@@ -285,63 +285,6 @@ async def test_plain_text_tool_call_is_recovered(agent, client, mocker):
     client.call_tool.assert_any_await("read_file", {"path": "a.py"})
 
 
-# ---------------- intent parsing ----------------
-
-async def test_intent_block_is_injected_when_enabled(agent, client, mocker):
-    agent.cfg.parse_intent = True
-    from omni.intent import Intent
-    mocker.patch.object(agent_mod, "extract_intent",
-                        mocker.AsyncMock(return_value=Intent(task_type="bugfix", summary="s")))
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    m = replies(mocker, text_reply("fin"))
-    await agent.run("fix it", client=client)
-    assert any("Parsed intent" in str(x.get("content")) for x in m.sent[0])
-
-
-async def test_high_risk_intent_forces_approval(agent, client, mocker):
-    agent.cfg.parse_intent = True
-    agent.cfg.auto_approve = True
-    from omni.intent import Intent
-    mocker.patch.object(agent_mod, "extract_intent",
-                        mocker.AsyncMock(return_value=Intent(risk_level="high")))
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    mocker.patch.object(agent_mod.ui, "high_risk_warning")
-    approval = mocker.patch.object(agent_mod.ui, "request_approval", mocker.AsyncMock(return_value=False))
-    replies(mocker, tool_reply(("write_file", '{"path":"x"}')), text_reply("ok"))
-    await agent.run("delete everything", client=client)
-    assert agent.force_approval is True
-    approval.assert_awaited()          # prompted despite --auto-approve
-
-
-async def test_intent_is_parsed_for_every_new_instruction(agent, client, mocker):
-    """Including later turns of an interactive session, which all arrive as
-    resumes — that's where high-risk detection used to go dark."""
-    agent.cfg.parse_intent = True
-    from omni.intent import Intent
-    extract = mocker.patch.object(agent_mod, "extract_intent",
-                                  mocker.AsyncMock(return_value=Intent()))
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    replies(mocker, text_reply("a"))
-    await agent.run("first", client=client)
-    assert extract.await_count == 1
-    replies(mocker, text_reply("b"))
-    await agent.run("second", resume_session_id=agent.session_id, client=client)
-    assert extract.await_count == 2
-
-
-async def test_intent_parsing_is_skipped_when_resuming_with_no_new_task(agent, client, mocker):
-    agent.cfg.parse_intent = True
-    from omni.intent import Intent
-    extract = mocker.patch.object(agent_mod, "extract_intent",
-                                  mocker.AsyncMock(return_value=Intent()))
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    replies(mocker, text_reply("a"))
-    await agent.run("first", client=client)
-    replies(mocker, text_reply("b"))
-    await agent.run("", resume_session_id=agent.session_id, client=client)
-    assert extract.await_count == 1    # nothing new to parse
-
-
 # ---------------- budget / compaction / limits ----------------
 
 async def test_history_is_compacted_when_over_budget(agent, client, mocker):
@@ -505,48 +448,6 @@ async def test_tool_call_ids_survive_a_resume(agent, client, mocker):
     await agent.run("second", resume_session_id=agent.session_id, client=client)
     call_ids, result_ids = sent_pairs(m.sent[0])
     assert call_ids == result_ids == ["c0"]
-
-
-# ---------------- per-turn intent / force_approval ----------------
-
-async def test_force_approval_is_re_evaluated_every_turn(agent, client, mocker):
-    """Latched for the process, one high-risk turn made every later turn
-    prompt — and a low-risk turn 1 left a high-risk turn 5 ungated."""
-    from omni.intent import Intent
-    agent.cfg.parse_intent = True
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    mocker.patch.object(agent_mod.ui, "high_risk_warning")
-    mocker.patch.object(agent_mod, "extract_intent", mocker.AsyncMock(
-        side_effect=[Intent(risk_level="high"), Intent(risk_level="low")]))
-
-    replies(mocker, text_reply("a"))
-    await agent.run("drop the tables", client=client)
-    assert agent.force_approval is True
-
-    replies(mocker, text_reply("b"))
-    await agent.run("add a docstring", resume_session_id=agent.session_id, client=client)
-    assert agent.force_approval is False
-
-
-async def test_intent_block_is_inserted_before_the_new_instruction(agent, client, mocker):
-    from omni.intent import Intent
-    agent.cfg.parse_intent = True
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-    mocker.patch.object(agent_mod, "extract_intent",
-                        mocker.AsyncMock(return_value=Intent(summary="parsed")))
-    replies(mocker, text_reply("a"))
-    await agent.run("first", client=client)
-    replies(mocker, text_reply("b"))
-    await agent.run("second", resume_session_id=agent.session_id, client=client)
-
-    stored = agent.store.load_messages(agent.session_id)
-    # Turn 1's messages keep their positions; the new block lands directly
-    # before the instruction it describes rather than at index 1, ahead of
-    # history that was already written out.
-    assert [m["role"] for m in stored[:4]] == ["system", "system", "user", "assistant"]
-    at = next(i for i, m in enumerate(stored) if m["content"] == "second")
-    assert stored[at]["role"] == "user"
-    assert stored[at - 1]["role"] == "system" and "Parsed intent" in stored[at - 1]["content"]
 
 
 # ---------------- automatic compaction is persisted ----------------
@@ -753,23 +654,6 @@ async def test_counts_accumulate_across_turns(agent, client, mocker):
     await agent.run("first", client=client)
     await agent.run("second", resume_session_id=agent.session_id, client=client)
     assert agent.tokens == {"prompt": 200, "completion": 20}
-
-
-async def test_intent_parsing_is_counted(agent, client, mocker):
-    """It's a real model call, so it belongs in what the turn cost."""
-    from omni.intent import Intent
-    agent.cfg.parse_intent = True
-    mocker.patch.object(agent_mod.ui, "intent_panel")
-
-    async def fake_intent(*args, **kwargs):
-        if kwargs.get("usage") is not None:
-            kwargs["usage"].update({"prompt_tokens": 300, "completion_tokens": 40})
-        return Intent()
-
-    mocker.patch.object(agent_mod, "extract_intent", fake_intent)
-    mocker.patch.object(agent_mod, "chat", side_effect=usage_reply("done", 1000, 50))
-    await agent.run("t", client=client)
-    assert agent.tokens == {"prompt": 1300, "completion": 90}
 
 
 async def test_compaction_is_counted(agent, client, mocker):

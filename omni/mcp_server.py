@@ -150,10 +150,10 @@ def run_shell(command: str) -> str:
     return impl.run_shell(command)
 
 
-# ---- Internal tools: dry-run previews for the approval UI + existence
-# checks for intent validation. Named with a leading underscore so the
-# client can filter them out of what it hands to the LLM, while still
-# calling them directly for its own approval-flow logic. ----
+# ---- Internal tools: dry-run previews for the approval UI, plus a cheap
+# existence check. Named with a leading underscore so the client can filter
+# them out of what it hands to the LLM, while still calling them directly for
+# its own approval-flow logic. ----
 
 @mcp.tool()
 def _preview_edit(path: str, old_str: str, new_str: str) -> str:
@@ -171,7 +171,7 @@ def _preview_write(path: str, content: str, overwrite: bool = False) -> str:
 
 @mcp.tool()
 def _file_exists(path: str) -> str:
-    """Internal: existence check confined to the project root, for intent validation."""
+    """Internal: existence check confined to the project root."""
     return "true" if impl.file_exists(path) else "false"
 
 

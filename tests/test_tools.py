@@ -76,8 +76,8 @@ def test_every_path_taking_tool_is_scoped(tools):
 
 
 def test_file_exists_returns_false_for_out_of_scope(tools):
-    """file_exists swallows the scope error by design (it validates parsed
-    intent) — but must answer False, never True, for an outside path."""
+    """file_exists swallows the scope error by design — but must answer
+    False, never True, for a path outside the project root."""
     assert tools.file_exists("/etc/passwd") is False
     assert tools.file_exists("hello.py") is True
     assert tools.file_exists("nope.py") is False

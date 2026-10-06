@@ -53,7 +53,6 @@ def cfg(tmp_path, project_root):
         log_path=str(tmp_path / "agent_run.log"),
         db_path=str(tmp_path / "sessions.db"),
         mcp_log_path=str(tmp_path / "mcp_servers.log"),
-        parse_intent=False,
         embedding_model="",
     )
 

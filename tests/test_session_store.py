@@ -2,10 +2,12 @@
 under test here, so mocking it would assert nothing)."""
 
 import sqlite3
+import uuid
 from contextlib import closing
 
 import pytest
 
+from omni import session_store
 from omni.session_store import SessionStore, _now
 
 
@@ -64,10 +66,17 @@ def test_a_name_is_matched_forgivingly(store, typed):
     assert store.resolve_session_id(typed) == sid
 
 
-def test_an_id_is_still_matched_exactly(store):
+def test_an_id_is_still_matched_exactly(store, mocker):
     """An id is copied, never remembered, and a hex blob has no case worth
-    being clever about — a near-miss must not resolve to something."""
+    being clever about — a near-miss must not resolve to something.
+
+    The id is pinned rather than generated: about one uuid4 prefix in forty
+    is all digits, and for those `sid.upper()` *is* `sid`, so the case half
+    of this assertion was a coin flip that lost roughly every fortieth run."""
+    mocker.patch.object(session_store.uuid, "uuid4",
+                        return_value=uuid.UUID("abc12345" + "0" * 24))
     sid = store.create_session("/p", "m", "t")
+    assert sid == "abc12345"
     assert store.resolve_session_id(sid.upper()) is None
     assert store.resolve_session_id(sid[:-1]) is None
 

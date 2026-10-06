@@ -1,7 +1,7 @@
 # 🐙 Omni Coder
 
 [![tests](https://img.shields.io/badge/tests-902%20passed-brightgreen)](#-tests)
-[![coverage](https://img.shields.io/badge/coverage-88%25-brightgreen)](#-tests)
+[![coverage](https://img.shields.io/badge/coverage-90%25-brightgreen)](#-tests)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -303,7 +303,7 @@ is bounded only by you. Tokens are capped separately:
 omni --max-turn-tokens 200000     # or /max-turn-tokens 200000, saved
 ```
 
-It counts everything spent on the turn's behalf — its own calls, intent
+It counts everything spent on the turn's behalf — its own calls and
 parsing, history compaction — and stops the turn when it's spent, saying so
 and how to carry on. **0 is the default and means no cap**, because the models
 this usually drives are local, where a limit nobody asked for is a turn that
@@ -475,38 +475,6 @@ the `--context-window-budget` check, compaction, the resumed-history panel —
 reads a message by its *words*, so an attached image is worth
 `what is this? [1 image]` there rather than a megabyte of base64.
 
-## 🧭 Intent parsing
-
-Before the agent takes any action, the raw task string is parsed by the model
-(in strict JSON mode, no tools) into structured intent:
-
-```json
-{
-  "task_type": "bugfix",
-  "summary": "Fix add() which subtracts instead of adding",
-  "target_files": ["math_utils.py"],
-  "constraints": [],
-  "risk_level": "low"
-}
-```
-
-This gets injected into the conversation as a system message (with each
-target file tagged `exists` or `new` within the project root), so the model
-starts with grounded structure instead of just the raw sentence. Two things
-follow from this automatically:
-
-- **High-risk tasks force approval**, even if you ran with `--auto-approve`.
-  Detected via `risk_level: "high"` (deletion, deploys, migrations, etc.).
-- **Malformed or failed parsing degrades gracefully** — after retries, it
-  falls back to `task_type: "other"` with `confident=False` logged, and the
-  agent still runs on the raw task text rather than blocking.
-
-Skip it with `--skip-intent-parsing` if you want lower latency on simple
-tasks, or point it at a smaller/faster model with `--intent-model`. In the
-REPL the toggle is `/parse-intent on|off`, and `/skip-intent-parsing on|off`
-is the same switch under the flag's name, read backwards — one saved value,
-two spellings.
-
 ## 🧠 Project memory
 
 The agent can remember durable facts about a project across separate runs —
@@ -633,7 +601,7 @@ omni --resume utils-typing                 # resumes and prompts for input
 ```
 Type a task and press enter to run it; the conversation (and the MCP tool
 connection) stays alive between turns, so follow-ups don't pay the cost of
-re-parsing intent or re-spawning the tool server.
+re-spawning the tool server.
 
 The screen is laid out as a transcript above a fixed frame at the bottom:
 
@@ -706,30 +674,39 @@ MCP prompt exposed by a connected server. Special inputs:
   starts that way; `/<setting>` on its own reports it, and `/<setting> reset`
   restores the default. The settings are the ones `/config` lists: `/model`,
   `/llm-host`, `/llm-timeout`, `/max-steps`, `/subagent-model`,
-  `/subagent-max-steps`, `/auto-approve`, `/parse-intent`, `/intent-model`,
-  `/compact-model`,
+  `/subagent-max-steps`, `/auto-approve`, `/compact-model`,
   `/compact-keep-last`, `/context-window-budget`, `/embedding-model`,
   `/max-output-chars`, `/shell-timeout`, `/mcp-connect-timeout`,
   `/system-prompt` and `/theme-color`. Each is the REPL half of the flag of
   the same name: **the flag sets it for one run and is never written back**,
   so trying a model or a colour out can't quietly become every run's setting,
-  while the slash command is the one that remembers. Underscores work too
-  (`/max_steps`, `/system_prompt`). Everything is written to
+  while the slash command is the one that remembers. Underscores and spaces work
+  too (`/max_steps`, `/max steps`), and an on/off setting also takes
+  `toggle`. Everything is written to
   `~/.omni-coder/omni-coder-settings.json`, alongside any MCP servers you've
   registered, which are left untouched. Deliberately *not* saveable:
   `--llm-api-key` (a secret doesn't belong in a plaintext file — use
   `$LLM_API_KEY`) and the per-invocation paths.
 
-  `/auto-approve` is the one to think about before saving. A remembered
-  "never ask me again" outlives the run that wanted it, which is exactly what
-  makes it worth having in a container and worth avoiding on a working tree —
-  so a run that stopped asking because of the settings file says so on its
-  first line, and `--no-auto-approve` overrides it for one run without
-  clearing it. High-risk intent still forces approval either way.
+  `/auto-approve` is the one to think about before saving, and it is
+  **global**: the switch is read before the tool's name is looked at, so it
+  covers every tool in the loop — the built-in write/edit/shell ones and
+  everything a connected MCP server exposes alike. A remembered "never ask me
+  again" outlives the run that wanted it, which is exactly what makes it
+  worth having in a container and worth avoiding on a working tree — so a run
+  that stopped asking because of the settings file says so on its first line,
+  and `--no-auto-approve` overrides it for one run without clearing it.
 
-  `/skip-intent-parsing on|off` is an alias rather than a setting of its own:
-  it writes the same saved value `/parse-intent` does, inverted, so the two
-  spellings can't disagree.
+  Because `<value>` tells you nothing about a row whose values you don't
+  already know, the two-valued settings spell theirs out: typing `/auto-app`
+  offers `/auto-approve on`, `/auto-approve off` and `/auto-approve toggle`
+  in the menu, and `/auto-approve` on its own reports where it stands and
+  names both of the others instead of saying `<value>`.
+
+  A slash command that nothing answers to is **refused**, with the nearest
+  match suggested. It used to fall through and be dispatched as the task, so
+  a near miss (`/auto aprove on`) quietly became a sentence for the agent to
+  act on while the setting it meant never moved.
 
   **Saved means everywhere.** The settings file is per *user*, not per project
   or per session, so anything saved applies to every later run, in every repo,
@@ -783,7 +760,7 @@ MCP prompt exposed by a connected server. Special inputs:
   persisted too, so resuming doesn't reload everything it just summarized
   away. Use `--compact-model`
   to run the summarization call itself through a smaller/faster model
-  than `--model` (same idea as `--intent-model`).
+  than `--model` (same idea as `--compact-model`).
 - `/expand <n>` — reprint one tool call with nothing abbreviated: every
   argument, and the entire result the model was given. The number is the one
   shown next to the call. Clicking the call does the same thing.
@@ -804,14 +781,14 @@ MCP prompt exposed by a connected server. Special inputs:
   the last completed step is already saved.
 - `/exit` or `/quit` (or Ctrl-D, or Ctrl-C at an idle prompt) — leave
 
-A spinner shows while waiting on the model (initial intent parsing and every
+A spinner shows while waiting on the model (every
 turn), including a live retry counter if a call fails transiently and gets
 retried — so a slow or cold-loading model doesn't look like it's hung.
 
 ## 🎨 Terminal UI
 
 `ui.py` renders everything through [rich](https://github.com/Textualize/rich):
-banner + parsed intent as a panel, each step with a colored ✓/✗, approval
+banner as a panel, each step with a colored ✓/✗, approval
 prompts that show the actual diff/command *before* you approve — not just the
 raw args — and the final response rendered as Markdown (headers, lists, code
 blocks) rather than literal text.
@@ -836,7 +813,7 @@ makes the transcript clickable:
 Each turn's line also carries what it cost — `Responded (16.0s · ↑ 3.3k ↓ 115)`
 and, live, next to the spinner — taken from the `prompt_tokens` /
 `completion_tokens` the server reports, so the count is its own rather than a
-guess. Everything that spends tokens on an agent's behalf is counted, intent
+guess. Everything that spends tokens on an agent's behalf is counted,
 parsing and history compaction included, and each agent counts only its own:
 switch to a subagent and the number beside its spinner is what *it* has spent.
 
@@ -949,8 +926,8 @@ MCP session instead of Python function calls directly.
                      v
 +------------------------------------------+
 |                 agent.py                 |
-|    call model, parse intent, approve,    |
-|      execute tools, persist, repeat      |
+|       call model, approve, execute       |
+|          tools, persist, repeat          |
 +------------------------------------------+
                      |
                      v
@@ -1014,7 +991,7 @@ What this buys you:
 - Internal tools (`_preview_edit`, `_preview_write`, `_file_exists`) are
   underscore-prefixed and filtered out of what's shown to the LLM in
   `list_llm_tools()` — the agent still calls them directly for approval
-  previews and intent validation, the model never sees them.
+  previews and existence checks, the model never sees them.
 
 The agent loop is `async` end-to-end (an MCP session requires it); `cli.py`
 runs it via `asyncio.run()`.
@@ -1296,7 +1273,7 @@ omni --embedding-model mxbai-embed-large "task"  # use a remote OpenAI-compatibl
 
 ## 🧪 Tests
 
-977 tests, 88% branch coverage (the badge numbers are the full suite,
+1565 tests, 90% branch coverage (the badge numbers are the full suite,
 `live` tests included). Install the dev extra and run them:
 ```bash
 pip install -e ".[dev]"
@@ -1310,12 +1287,12 @@ Per module (branch coverage, whole suite):
 
 | Module | Cover | Module | Cover |
 |---|---|---|---|
-| `config.py` | 100% | `agent.py` | 94% |
 | `mcp_server.py` | 100% | `mcp_client.py` | 93% |
-| `clipboard.py` | 100% | `tools.py` | 93% |
-| `session_store.py` | 99% | `tui.py` | 87% |
-| `llm_client.py` | 99% | `ui.py` | 85% |
-| `intent.py` | 98% | `cli.py` | 77% |
+| `session_store.py` | 100% | `tools.py` | 93% |
+| `llm_client.py` | 98% | `tui.py` | 92% |
+| `config.py` | 97% | `clipboard.py` | 91% |
+| `session_picker.py` | 95% | `ui.py` | 86% |
+| `agent.py` | 94% | `cli.py` | 85% |
 
 `ui.py` and `tui.py` carry the drawing code, most of which is only exercised
 by rendering it — the numbers there are lower on purpose: the transcript's
@@ -1334,7 +1311,6 @@ file, and `$HOME`, so your real `~/.omni-coder` settings and
 | `test_tools.py` | Path scoping (the security boundary), file IO, ripgrep search, shell policy, and the paths handed to the model |
 | `test_tools_git.py` | Every git tool's argv, exit codes, timeouts, missing binary |
 | `test_session_store.py` | SQLite persistence, resume/rename/delete, compaction rewrites |
-| `test_intent.py` | JSON coercion of malformed model output, retry + fallback |
 | `test_llm_client.py` | Request shaping, auth headers, reasoning-model replies, every error path |
 | `test_mcp_client_pure.py` | Spec parsing, settings file + migration, env-var expansion |
 | `test_mcp_client_class.py` | Tool routing, deferred loading, prompts, resources, restart |
@@ -1366,7 +1342,6 @@ whole suite is green on Windows, macOS and Linux.
 ## 📁 Files
 All modules live under `omni/`:
 - `config.py` — all tunables in one dataclass
-- `intent.py` — parses the freeform task into structured intent (task_type, target_files, constraints, risk_level)
 - `tools.py` — tool implementations, each scoped to `project_root` (used by `mcp_server.py`, not called directly by the agent anymore) — read/write/edit/search/shell, a full git toolset, and `save_memory`
 - `mcp_server.py` — MCP server exposing those tools over stdio
 - `mcp_client.py` — async MCP client the agent uses to reach the server; also merges in any custom MCP servers, and implements deferred tool loading + the `search_tools` tool (semantic ranking via `nomic[local]` or a remote embedding model, falling back to keyword matching)
@@ -1374,7 +1349,7 @@ All modules live under `omni/`:
 - `clipboard.py` — reads an image off the system clipboard (Ctrl+V image paste), per platform, with no hard dependencies
 - `session_store.py` — SQLite persistence for sessions and their full message history (resume/list/interactive mode)
 - `ui.py` — rich terminal rendering (diffs, panels, approval prompts, session tables) — purely presentational
-- `agent.py` — the loop: parse intent, call model, approve, execute via MCP, persist, repeat
+- `agent.py` — the loop: call model, approve, execute via MCP, persist, repeat
 - `cli.py` — command-line entry point (Typer — `omni --help` for auto-generated, always-in-sync docs)
 - `__main__.py` — enables `python -m omni`
 
@@ -1403,4 +1378,4 @@ If you keep seeing "Thinking… (retry N/max_retries)" in the terminal, that's
 usually a client-side request timeout, not the server being down — a large
 local model can easily take longer than the default to respond to an
 agentic tool-calling turn. Raise it with `--llm-timeout <seconds>` (default
-`300`; applies to chat, intent parsing, and history compaction alike).
+`300`; applies to chat and history compaction alike).

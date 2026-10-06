@@ -444,24 +444,6 @@ def test_final_result_renders_real_text(cap):
     assert "note.txt" in flat(cap)
 
 
-def test_intent_panel(cap):
-    from omni.intent import Intent
-    ui.intent_panel(Intent(task_type="bugfix", summary="fix it", target_files=["a.py"],
-                           constraints=["be quick"], risk_level="high"),
-                    {"a.py": True})
-    out = flat(cap)
-    assert "bugfix" in out and "fix it" in out and "high" in out and "a.py" in out
-
-
-def test_intent_panel_flags_low_confidence(cap):
-    from omni.intent import Intent
-    ui.intent_panel(Intent(confident=False), {})
-    assert "low confidence" in flat(cap)
-
-
-def test_high_risk_warning(cap):
-    ui.high_risk_warning()
-    assert "High-risk" in flat(cap) and "auto-approve" in flat(cap)
 
 
 def test_final_result_renders_markdown(cap):
@@ -1258,14 +1240,9 @@ def test_nothing_boxed_spans_a_wide_terminal(mocker, width):
     mocker.patch.object(ui, "console", Console(file=buf, width=width, force_terminal=False,
                                                legacy_windows=False))
     ui.header("sess", "/tmp/p")
-    ui.intent_panel(_intent(), {})
+    ui.cost_report([("main", 1234, 567)])
     longest = max((len(l) for l in buf.getvalue().split("\n")), default=0)
     assert longest <= min(width, 100)
-
-
-def _intent():
-    from omni.intent import Intent
-    return Intent(task_type="feature", summary="s", target_files=[], constraints=[])
 
 
 # ---------------- the bottom frame ----------------
@@ -1300,7 +1277,7 @@ async def test_turn_frame_opens_and_closes(cap):
 
 
 async def test_thinking_outside_a_frame_is_a_standalone_spinner(cap):
-    spinner = ui.thinking("Parsing intent…")
+    spinner = ui.thinking("Compacting history…")
     assert isinstance(spinner, ui._TickingSpinner)
     with spinner:
         spinner.update("still going")
@@ -1372,7 +1349,7 @@ async def test_turn_frame_opens_and_closes(cap):
 
 
 async def test_thinking_outside_a_frame_is_a_standalone_spinner(cap):
-    spinner = ui.thinking("Parsing intent…")
+    spinner = ui.thinking("Compacting history…")
     assert isinstance(spinner, ui._TickingSpinner)
     with spinner:
         spinner.update("still going")

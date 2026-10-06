@@ -83,9 +83,8 @@ class Tools:
         return _truncate("".join(lines), self.cfg.max_output_chars)
 
     def file_exists(self, path: str) -> bool:
-        """Existence check confined to the project root — used to validate
-        parsed intent (e.g. flag target files that don't exist yet) without
-        paying the cost of a full read_file call."""
+        """Existence check confined to the project root — answers "is this a
+        file?" without paying the cost of a full read_file call."""
         try:
             p = _resolve_in_scope(self.cfg.project_root, path)
             return os.path.isfile(p)

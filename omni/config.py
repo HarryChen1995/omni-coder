@@ -214,6 +214,11 @@ class Setting:
     # falls back to something rather than to nothing, and "unset" on its own
     # invites setting it to a value it already behaves as.
     empty: str = "unset"
+    # For an on/off setting: what turning it *off* gets you. `summary` only
+    # ever describes the on state, so without this the menu entry for "off"
+    # has to be the on state read backwards, which is how "/auto-approve off"
+    # ends up described as "stop: run tools without stopping to ask".
+    flag_off: str = ""
 
 
 SETTINGS = (
@@ -231,9 +236,10 @@ SETTINGS = (
     Setting("max-steps", "max_steps", "maxSteps", _whole(1),
             "hard cap on agent loop iterations", "a whole number, at least 1"),
     Setting("auto-approve", "auto_approve", "autoApprove", _flag,
-            "run write/edit/shell tools without stopping to ask",
+            "run every tool without stopping to ask — MCP servers included",
             "on or off",
-            empty="off (every write/edit/shell call asks first)"),
+            empty="off (every call that isn't read-only asks first)",
+            flag_off="ask before every tool that isn't already safe"),
     Setting("subagent-model", "subagent_model", "subagentModel", _text,
             "the model subagents run on (unset = the same one)",
             "a model name, or reset to use the main one",
@@ -241,13 +247,6 @@ SETTINGS = (
     Setting("subagent-max-steps", "subagent_max_steps", "subagentMaxSteps", _whole(1),
             "step cap for one subagent, separate from max-steps",
             "a whole number, at least 1"),
-    Setting("parse-intent", "parse_intent", "parseIntent", _flag,
-            "parse the task into structured intent before acting",
-            "on or off"),
-    Setting("intent-model", "intent_model", "intentModel", _text,
-            "the model intent parsing runs on (unset = the same one)",
-            "a model name, or reset to use the main one",
-            empty="unset (the main model)"),
     Setting("compact-model", "compact_model", "compactModel", _text,
             "the model history compaction runs on (unset = the same one)",
             "a model name, or reset to use the main one",
@@ -296,6 +295,15 @@ def find_setting(name: str) -> Setting:
     at least as likely to be typed."""
     key = (name or "").strip().lower().lstrip("/").replace("_", "-")
     return SETTINGS_BY_NAME.get(key)
+
+
+def is_flag_setting(setting: Setting) -> bool:
+    """Whether this setting is an on/off switch.
+
+    Asked by the REPL, which treats the two-valued settings differently from
+    the rest: there are exactly two values, so both are worth offering in the
+    completion menu and "flip it" is a sensible thing to type."""
+    return setting.parse is _flag
 
 
 def env_setting(setting: Setting):
@@ -362,7 +370,7 @@ class AgentConfig:
         "list_resources", "read_resource",   # MCP Resources capability — read-only
     )
 
-    auto_approve: bool = False        # True = never prompt (use in CI with care)
+    auto_approve: bool = False        # True = never prompt, for any tool (use in CI with care)
     max_steps: int = 100              # hard cap on agent loop iterations
 
     # Project-local file of durable notes (conventions, gotchas, preferences)
@@ -388,17 +396,13 @@ class AgentConfig:
     # Accent colour for the UI, as #rrggbb. Empty = the built-in one.
     theme_color: str = ""
 
-    # Parse the freeform task into structured intent (task_type, target_files,
-    # constraints, risk_level) before the agent starts acting.
-    parse_intent: bool = True
-    intent_model: str = ""            # empty = reuse `model` for intent parsing too
     max_retries: int = 3              # retries per model call on bad/malformed output
-    llm_timeout_s: float = 300.0      # per-request timeout for chat/intent/compaction calls to the LLM server
+    llm_timeout_s: float = 300.0      # per-request timeout for chat/compaction calls to the LLM server
     shell_timeout_s: int = 30
     max_output_chars: int = 8000      # truncate tool output before feeding back to model
     context_window_budget: int = 50_000  # tokens of context before compaction kicks in
     # What one turn may spend before it gives up, counting everything done on
-    # its behalf — its own calls, intent parsing, compaction. 0 is no cap,
+    # its behalf — its own calls, compaction. 0 is no cap,
     # which is the default because a local model costs nothing per token and
     # a limit nobody asked for is a turn that stops for no visible reason.
     # Set it where tokens are billed, and for subagents especially: those run

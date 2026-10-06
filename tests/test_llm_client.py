@@ -82,11 +82,11 @@ def test_normalize_messages_only_touches_tool_calls():
 
 
 def test_normalize_messages_keeps_a_leading_system_block():
-    """The real system prompt (and an intent system message right after it)
+    """The real system prompt (and the project-memory block right after it)
     are at the start, so they stay system."""
     msgs = [
         {"role": "system", "content": "prompt"},
-        {"role": "system", "content": "intent"},
+        {"role": "system", "content": "memory"},
         {"role": "user", "content": "task"},
     ]
     out = _normalize_messages(msgs)

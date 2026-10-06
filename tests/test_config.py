@@ -14,7 +14,6 @@ def test_defaults_are_conservative():
     cfg = AgentConfig()
     assert cfg.model == ""                  # no model name is compiled in; ask the server
     assert cfg.auto_approve is False        # never skip approval unasked
-    assert cfg.parse_intent is True
     assert cfg.project_root == "."
     assert cfg.max_steps == 100
 
@@ -80,7 +79,7 @@ def test_system_prompt_defaults_to_empty_meaning_built_in():
 def test_optional_model_overrides_default_to_empty():
     """Empty means "reuse `model`" for each of these."""
     cfg = AgentConfig()
-    assert cfg.intent_model == "" and cfg.compact_model == ""
+    assert cfg.subagent_model == "" and cfg.compact_model == ""
 
 
 def test_embedding_model_defaults_to_on_device():
@@ -327,14 +326,16 @@ def test_anything_else_is_not_a_setting(typed):
 
 
 @pytest.mark.parametrize("given,expected", [("on", True), ("off", False), ("yes", True),
-                                            ("0", False), ("TRUE", True)])
+                                            ("no", False), ("0", False), ("TRUE", True)])
 def test_a_flag_setting_reads_how_it_was_typed(given, expected):
-    assert config.SETTINGS_BY_NAME["parse-intent"].parse(given) is expected
-
-
-@pytest.mark.parametrize("given,expected", [("on", True), ("off", False), ("no", False)])
-def test_auto_approve_reads_how_it_was_typed(given, expected):
     assert config.SETTINGS_BY_NAME["auto-approve"].parse(given) is expected
+
+
+def test_the_on_off_settings_are_identifiable_as_such():
+    """The REPL asks, so that it can offer both values in the menu rather
+    than the "<value>" that says nothing."""
+    flags = [s.name for s in config.SETTINGS if config.is_flag_setting(s)]
+    assert "auto-approve" in flags and "model" not in flags
 
 
 def test_a_saved_auto_approve_is_collected_like_any_other_preference(settings):
@@ -352,9 +353,9 @@ def test_a_junk_auto_approve_does_not_read_as_on(settings):
 
 
 def test_an_unrecognized_word_is_not_a_flag():
-    """It must not quietly read as False — "parse-intent maybe" would then
-    silently turn intent parsing off."""
-    assert config.SETTINGS_BY_NAME["parse-intent"].parse("maybe") is None
+    """It must not quietly read as False — "/auto-approve maybe" reading as
+    off would be harmless, but the same rule read as on would not."""
+    assert config.SETTINGS_BY_NAME["auto-approve"].parse("maybe") is None
 
 
 def test_the_embedding_backend_can_be_turned_off_by_name():
@@ -372,6 +373,6 @@ def test_a_system_prompt_from_a_file_keeps_its_formatting():
 
 def test_saved_settings_collects_every_usable_value_and_skips_junk(settings):
     with open(settings, "w") as f:
-        json.dump({"maxSteps": 7, "themeColor": "chartreuse", "parseIntent": False,
+        json.dump({"maxSteps": 7, "themeColor": "chartreuse", "autoApprove": True,
                    "mcpServers": {"docs": {}}}, f)
-    assert config.saved_settings(settings) == {"max_steps": 7, "parse_intent": False}
+    assert config.saved_settings(settings) == {"max_steps": 7, "auto_approve": True}
