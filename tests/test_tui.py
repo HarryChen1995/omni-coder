@@ -13,6 +13,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Group
 from rich.text import Text
 
+from omni import tui
 from omni.tui import Block, Transcript
 
 
@@ -196,7 +197,7 @@ def binding(application, key, *, filter_mode=None):
     wanted = {"enter": Keys.ControlM, "c-c": Keys.ControlC, "c-d": Keys.ControlD,
               "y": "y", "n": "n", "pageup": Keys.PageUp,
               "up": Keys.Up, "down": Keys.Down,
-              "c-end": Keys.ControlEnd}[key]
+              "c-end": Keys.ControlEnd, "end": Keys.End, "s-end": Keys.ShiftEnd}[key]
     for b in application._app.key_bindings.bindings:
         if b.keys == (wanted,) and b.filter():
             return b.handler
@@ -1269,7 +1270,7 @@ def test_output_arriving_at_the_bottom_is_not_counted():
 def test_scrolling_up_with_nothing_new_offers_the_jump():
     t = filled()
     t.scroll_by(-5, 10)
-    assert t.jump_hint() == "↓  Jump to bottom  ·  Ctrl+End"
+    assert t.jump_hint() == f"↓  Jump to bottom  ·  {tui.jump_key()}"
 
 
 def test_scrolling_up_with_output_waiting_says_how_much():
@@ -1279,7 +1280,7 @@ def test_scrolling_up_with_output_waiting_says_how_much():
     t.scroll_by(-5, 10)
     for i in range(11):
         t.add(plain(f"new {i}"))
-    assert t.jump_hint() == "↓  New 11 messages  ·  Ctrl+End"
+    assert t.jump_hint() == f"↓  New 11 messages  ·  {tui.jump_key()}"
 
 
 def test_one_waiting_message_is_singular():
@@ -1320,7 +1321,7 @@ def test_expanding_a_block_holds_the_view_and_offers_the_jump():
         t.add(foldable(f"B{i}"))
     t.create_content(60, 10)
     t.toggle_at_row(2)
-    assert not t.follow and t.jump_hint() == "↓  Jump to bottom  ·  Ctrl+End"
+    assert not t.follow and t.jump_hint() == f"↓  Jump to bottom  ·  {tui.jump_key()}"
 
 
 def test_clearing_puts_the_view_back_at_the_bottom():
@@ -1339,6 +1340,108 @@ def test_ctrl_end_jumps_to_the_bottom(app, mocker):
     app.emit(lambda: Text("newest"))
     assert app.pane.transcript.unread == 1
     binding(app, "c-end")(mocker.Mock())
+    assert app.pane.transcript.follow and app.pane.transcript.unread == 0
+
+
+def _scrolled_up_with_unread(app):
+    for i in range(40):
+        app.emit(lambda i=i: Text(f"line {i}"))
+    app.pane.transcript.create_content(60, 10)
+    app.pane.transcript.scroll_by(-8, 10)
+    app.emit(lambda: Text("newest"))
+    assert app.pane.transcript.unread == 1
+
+
+@pytest.mark.parametrize("platform, terminal, key", [
+    ("darwin", "iTerm.app", "Fn+→ or Esc G"),
+    ("darwin", "Apple_Terminal", "Shift+Fn+→ or Esc G"),
+    ("darwin", "", "Fn+→ or Esc G"),
+    ("linux", "", "Ctrl+End"),
+    ("linux", "Apple_Terminal", "Ctrl+End"),   # only a Mac has Terminal.app's quirk
+    ("win32", "", "Ctrl+End"),
+])
+def test_the_indicator_names_a_key_the_platform_can_send(mocker, platform, terminal, key):
+    mocker.patch.object(tui.sys, "platform", platform)
+    mocker.patch.dict(tui.os.environ, {"TERM_PROGRAM": terminal})
+    assert tui.jump_key() == key
+    t = filled()
+    t.scroll_by(-5, 10)
+    assert t.jump_hint() == f"↓  Jump to bottom  ·  {key}"
+    t.add(plain("newest"))
+    assert t.jump_hint() == f"↓  New 1 message  ·  {key}"
+
+
+@pytest.mark.parametrize("platform, terminal, key", [
+    ("darwin", "Apple_Terminal", "Shift+Fn+→ or Esc G"),
+    ("linux", "", "Ctrl+End"),
+    ("win32", "", "Ctrl+End"),
+])
+def test_the_chip_on_screen_shows_the_platforms_key(app, mocker, platform, terminal, key):
+    """What is actually drawn above the frame, not just the hint string."""
+    mocker.patch.object(tui.sys, "platform", platform)
+    mocker.patch.dict(tui.os.environ, {"TERM_PROGRAM": terminal})
+    _scrolled_up_with_unread(app)
+    style, text, _handler = app._jump_line()[0]
+    assert style == "class:frame.chip"
+    assert text == f" ↓  New 1 message  ·  {key} "
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_every_jump_key_is_bound_on_every_platform(app, mocker, platform):
+    """The bindings don't branch on the platform — a Mac user on an external
+    keyboard has Ctrl+End, and End works on Linux too — so whichever key the
+    indicator names, it and the others all work."""
+    from prompt_toolkit.keys import Keys
+    mocker.patch.object(tui.sys, "platform", platform)
+    bound = {b.keys for b in app._app.key_bindings.bindings}
+    assert {(Keys.ControlEnd,), (Keys.End,), (Keys.ShiftEnd,),
+            (Keys.Escape, "g")} <= bound
+
+
+def test_end_on_an_empty_line_jumps_to_the_bottom(app, mocker):
+    """A Mac laptop has no End key and macOS takes Fn+Ctrl+→, so plain End
+    (Fn+→) has to do it there — on an empty line it has nothing to move."""
+    _scrolled_up_with_unread(app)
+    binding(app, "end")(mocker.Mock())
+    assert app.pane.transcript.follow and app.pane.transcript.unread == 0
+
+
+def test_shift_end_on_an_empty_line_jumps_to_the_bottom(app, mocker):
+    """What Terminal.app sends for Shift+Fn+→, the one Fn+→ it passes on."""
+    _scrolled_up_with_unread(app)
+    binding(app, "s-end")(mocker.Mock())
+    assert app.pane.transcript.follow and app.pane.transcript.unread == 0
+
+
+@pytest.mark.parametrize("key", ["end", "s-end"])
+def test_end_mid_line_moves_the_cursor_not_the_view(app, key):
+    """With the cursor inside typed text End still means end-of-line, so the
+    binding steps aside for prompt_toolkit's own."""
+    app._buffer.text = "half typed"
+    app._buffer.cursor_position = 3
+    with pytest.raises(AssertionError):
+        binding(app, key)
+
+
+@pytest.mark.parametrize("key", ["end", "s-end"])
+def test_end_at_the_end_of_typed_text_jumps(app, mocker, key):
+    """A second press, once the first has put the cursor at the end: there is
+    nothing left on the line for End to do, so it jumps — and the chip's key
+    works whether or not something is typed."""
+    _scrolled_up_with_unread(app)
+    app._buffer.text = "half typed"
+    app._buffer.cursor_position = len("half typed")
+    binding(app, key)(mocker.Mock())
+    assert app.pane.transcript.follow and app.pane.transcript.unread == 0
+    assert app._buffer.text == "half typed"     # the draft is left alone
+
+
+def test_esc_g_jumps_to_the_bottom(app, mocker):
+    from prompt_toolkit.keys import Keys
+    _scrolled_up_with_unread(app)
+    handler = next(b.handler for b in app._app.key_bindings.bindings
+                   if b.keys == (Keys.Escape, "g"))
+    handler(mocker.Mock())
     assert app.pane.transcript.follow and app.pane.transcript.unread == 0
 
 

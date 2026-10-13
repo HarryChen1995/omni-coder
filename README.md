@@ -879,7 +879,30 @@ stays put, and a chip above the frame says what is waiting:
 ```
 
 With nothing new it reads `↓  Jump to bottom  ·  Ctrl+End` instead. Either way
-**Ctrl+End** (or a click on the chip) goes back, and the chip disappears once
+a click on the chip goes back, or any of these keys:
+
+| Key | Where it works |
+|---|---|
+| **Ctrl+End** | Linux and Windows terminals, and a Mac with an external keyboard that has an End key |
+| **End** (**Fn+→** on a Mac laptop; **Shift+Fn+→** in Terminal.app) | Anywhere, once the cursor is at the end of the input line — always true on an empty line; with the cursor mid-text the first press moves it to the end as usual and the second jumps |
+| **Esc** then **G** | Any keyboard, any terminal |
+
+The chip names the key for where you are:
+
+| Environment | Chip |
+|---|---|
+| Linux, Windows | `↓  Jump to bottom  ·  Ctrl+End` |
+| macOS (iTerm2, Ghostty, kitty, WezTerm, VS Code, …) | `↓  Jump to bottom  ·  Fn+→ or Esc G` |
+| macOS Terminal.app | `↓  Jump to bottom  ·  Shift+Fn+→ or Esc G` |
+
+On macOS it names Fn+→ rather than Ctrl+End: a Mac laptop has no End
+key, and Fn+Ctrl+→ is caught by macOS (switching Spaces) or by Terminal.app
+(scrolling its own buffer) before omni-coder ever sees it. In Terminal.app
+plain Fn+→ is caught too, so use **Shift+Fn+→**, which Terminal.app passes
+through as End, or Esc G. iTerm2, Ghostty, kitty, WezTerm and the VS Code
+terminal pass Fn+→ through as is.
+
+The chip disappears once
 you are there — an indicator pointing at where you already are is one more
 thing on screen that never changes. Each agent keeps its own scroll position,
 so reading back through one is not undone by another producing output.

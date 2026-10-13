@@ -31,6 +31,24 @@ def no_model_discovery(mocker):
     return stub
 
 
+@pytest.fixture(autouse=True)
+def no_model_listing(mocker):
+    """Nor does any test ask one for its model list.
+
+    Interactive startup fills the "/model <name>" completions from the
+    server, so every test that started the REPL used to open a real
+    connection to localhost:11434. Refused, that costs nothing; but where the
+    connect hangs instead — a sandbox, a firewall that drops rather than
+    rejects, an Ollama that is up but stuck — each test sat out list_models'
+    15 s timeout, and test_cli_interactive and test_end_to_end ran for many
+    minutes and looked hung. "This server has no /v1/models" is the answer
+    the REPL already copes with. Tests that want models patch it again."""
+    from omni import cli
+    from omni.llm_client import LLMError
+    return mocker.patch.object(
+        cli, "list_models", mocker.AsyncMock(side_effect=LLMError("no model server in tests")))
+
+
 @pytest.fixture
 def project_root(tmp_path):
     """An isolated directory to act as --project-root."""

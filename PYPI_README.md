@@ -76,7 +76,8 @@ Run `omni --help` for the full option list.
 - **A clickable transcript** — tool calls and reasoning blocks show
   abbreviated, and clicking the `▸` opens one in place: every argument and
   the whole result, or the entire chain of thought. Click again to close;
-  the wheel and PageUp/PageDown scroll. `/expand <n>` and `/reasoning [n]`
+  the wheel and PageUp/PageDown scroll, and Ctrl+End (Fn+→ on a Mac, Shift+Fn+→
+  in Terminal.app, or Esc G anywhere) jumps back to the newest output. `/expand <n>` and `/reasoning [n]`
   do the same from the keyboard. The transcript is written out on exit, so
   it stays in your scrollback. `ctrl+s` hands the mouse back to the terminal
   when you want to select and copy by hand; `/copy` takes the whole

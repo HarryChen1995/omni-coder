@@ -27,6 +27,7 @@ straight to the terminal there.
 import asyncio
 import contextvars
 import io
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -54,6 +55,23 @@ from . import clipboard
 # ui.py, bound on first use. Imported lazily rather than at module scope so
 # the two can reference each other without an import cycle.
 _ui = None
+
+
+def jump_key(platform: str = None, terminal: str = None) -> str:
+    """The jump-to-bottom key the indicator advertises. A Mac laptop has no
+    End key and macOS keeps Fn+Ctrl+→ for itself, so there it names Fn+→
+    (End, once the cursor is at the end of the input line) instead — see
+    TuiApp._build_keys. Terminal.app keeps plain Fn+→ for its own scrollback
+    too and only passes Shift+Fn+→ through — and whether that arrives as End
+    depends on the Terminal.app profile, so a Mac also gets Esc G, which
+    works on any keyboard. Linux and Windows terminals deliver Ctrl+End as
+    is."""
+    platform = platform or sys.platform
+    if platform != "darwin":
+        return "Ctrl+End"
+    terminal = terminal if terminal is not None else os.environ.get("TERM_PROGRAM", "")
+    key = "Shift+Fn+→" if terminal == "Apple_Terminal" else "Fn+→"
+    return f"{key} or Esc G"
 
 
 def _bind_ui(module=None):
@@ -229,8 +247,8 @@ class Transcript(UIControl):
             return ""
         if self.unread:
             plural = "" if self.unread == 1 else "s"
-            return f"↓  New {self.unread} message{plural}  ·  Ctrl+End"
-        return "↓  Jump to bottom  ·  Ctrl+End"
+            return f"↓  New {self.unread} message{plural}  ·  {jump_key()}"
+        return f"↓  Jump to bottom  ·  {jump_key()}"
 
     # ---- clicking ----
 
@@ -1160,13 +1178,24 @@ class TuiApp:
         def _previous_pane(event):
             self.cycle(-1)
 
-        @keys.add("c-end")
         def _jump_to_bottom(event):
             """Back to the newest output, and everything it passed counts as
             read. Ctrl+End because that is what it means in every editor and
-            pager, and End alone belongs to the input line."""
+            pager, and End alone belongs to the input line — except when the
+            cursor is already at its end (always, on an empty line), where
+            End has nothing left to move. That is the one a Mac laptop can
+            reliably send: it has no End key, and Fn+Ctrl+→ is taken by macOS
+            (Spaces) or Terminal.app (its own scrollback) before it gets here. Terminal.app sends Shift+Fn+→
+            as Shift+End or End depending on its profile, so both count.
+            Esc G works on any keyboard."""
             self.pane.transcript.scroll_to_bottom()
             self.invalidate()
+
+        keys.add("c-end")(_jump_to_bottom)
+        at_line_end = Condition(lambda: self._buffer.document.is_cursor_at_the_end)
+        keys.add("end", filter=at_line_end)(_jump_to_bottom)
+        keys.add("s-end", filter=at_line_end)(_jump_to_bottom)
+        keys.add("escape", "g")(_jump_to_bottom)
 
         # Keyboard scrolling, for the same reasons a pager has it.
         @keys.add("pageup")
@@ -1178,10 +1207,6 @@ class TuiApp:
         def _page_down(event):
             height = self.pane.transcript._last_height
             self.pane.transcript.scroll_by(height - 1, height)
-
-        @keys.add("escape", "g")
-        def _to_bottom(event):
-            self.pane.transcript.scroll_to_bottom()
 
         @keys.add("c-s")
         def _toggle_selection(event):
